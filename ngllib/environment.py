@@ -19,7 +19,7 @@ import os
 """--------------------------------"""
 
 class Environment:
-    def __init__(self, headless:bool=False, config_path:str='config.json', verbose:bool=False, start_url:str=None, reward_function:'function'=None):
+    def __init__(self, headless:bool=False, config_path:str=None, verbose:bool=False, start_url:str=None, reward_function:'function'=None):
         """
         Args:
             headless: Whether to run the Neuroglancer viewer in headless mode. If True, nothing will be displayed. May slightly alter the behavior of neuroglancer but will increase performance.
@@ -64,6 +64,27 @@ class Environment:
         """
 
         chrome_options = Options()
+
+        
+        # Make manual border adjustments
+        if platform.system() == "Darwin":  # macOS
+
+            pass
+            
+        elif platform.system() == "Windows":
+
+            chrome_border_height = 95
+            chrome_border_width = 16
+            chrome_options.add_argument("--force-device-scale-factor=1")
+
+            window_height += chrome_border_height
+            window_width += chrome_border_width
+
+        elif platform.system() == "Linux":
+            
+            pass
+
+
         if headless:
             chrome_options.add_argument("--headless")
             #chrome_options.add_argument("--disable-gpu") provokes WebGL error
@@ -84,6 +105,7 @@ class Environment:
             chrome_options: The Chrome options to use.
         """
 
+        # Utilize correct driver
         if platform.system() == "Darwin":  # macOS
 
             chrome_driver_path = self.config['driver_path_mac']
@@ -93,9 +115,6 @@ class Environment:
 
             chrome_driver_path = self.config['driver_path_win']
             chrome_service = Service(chrome_driver_path)
-            chrome_border_height = 95
-            chrome_border_width = 16
-            chrome_options.add_argument("--force-device-scale-factor=1")
 
         elif platform.system() == "Linux":
             chrome_driver_path = self.config['driver_path_linux']
