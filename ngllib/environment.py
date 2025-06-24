@@ -28,6 +28,7 @@ class Environment:
             reward_function: Alternative reward function to use. If None, the default reward function will be used (see docs for more details).
             start_url: The URL to start the session on. If not specified, the default Neuroglancer session will be used.
         """
+        self.options = {}
         self.headless = headless
         self.verbose = verbose
         self.compute_reward = reward_function or self.compute_default_reward
