@@ -123,18 +123,19 @@ class Environment:
             chrome_options.binary_location = self.config['chrome_binary_path_linux']
         return chrome_service
     
-    def start_session(self, start_url:str=None, **options:dict)-> None:
+    def start_session(self, start_url:str=None, **options:dict, login:bool=False)-> None:
         """
         Starts the Neuroglancer session, logging into Google and then opening Neuroglancer.
         Args:
             start_url: The URL to start the session on. If not specified, the default Neuroglancer session will be used.
             **options: Additional options to pass to the session. May include image_path, euler_angles, resize, add_mouse, fast (see docs for more info and default behavior).
+            login: Whether to log into Google before starting the session.
         """
 
         self.options = options
 
-        self.driver.get("https://accounts.google.com/Login")
-        self.google_login()
+        if login:
+            self.google_login()
         self.start_neuroglancer_session(url=start_url)
 
     def end_session(self)-> None:
