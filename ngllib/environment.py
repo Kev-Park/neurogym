@@ -123,7 +123,7 @@ class Environment:
             chrome_options.binary_location = self.config['chrome_binary_path_linux']
         return chrome_service
     
-    def start_session(self, start_url:str=None, **options:dict, login:bool=False)-> None:
+    def start_session(self, start_url:str=None, login:bool=False, **options:dict)-> None:
         """
         Starts the Neuroglancer session, logging into Google and then opening Neuroglancer.
         Args:
