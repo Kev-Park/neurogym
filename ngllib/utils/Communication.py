@@ -12,7 +12,7 @@ class CommunicationProtocol(ABC):
     @abstractmethod
     def __init__(self):
         """
-        Initialize the communication medium with necessary parameters (file paths, socket ports, etc.)
+        Initialize the communication medium.
         """
 
     @abstractmethod
@@ -46,6 +46,11 @@ class CommunicationProtocol(ABC):
 class FilesystemProtocol(CommunicationProtocol):
     """
     Communication protocol that uses the filesystem to exchange information between the NGLClient and NGLServer.
+
+    Args:
+    - action_file_path: The directory path where action files will be stored.
+    - observation_file_path: The directory path where observation files will be stored.
+    - timeout: The maximum number of attempts to read from the files.
     """
 
     def __init__(self, action_file_path:str, observation_file_path:str, timeout=50):
@@ -138,6 +143,9 @@ class FilesystemProtocol(CommunicationProtocol):
 class NGLClient:
     """
     Class for sending actions and requesting observations from Neuroglancer across different processes.
+
+    Args:
+    - protocol: An instance of a CommunicationProtocol subclass.
     """
 
     _id = 1
@@ -159,6 +167,10 @@ class NGLClient:
 class NGLServer:
     """
     Class for receiving actions and sending observations from Neuroglancer across different processes.
+
+    Args:
+        protocol: An instance of a CommunicationProtocol subclass.
+        environment: An Environment instance.
     """
 
     _id = 1
