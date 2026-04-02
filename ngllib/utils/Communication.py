@@ -86,7 +86,6 @@ class FilesystemProtocol(CommunicationProtocol):
             file.write(msgpack.packb(actions, use_bin_type=True))
         os.rename(action_file, os.path.join(self.action_path, f"{id}_0"))
 
-        print("wrote action")
 
     def read_actions(self,id):
         """
@@ -100,7 +99,7 @@ class FilesystemProtocol(CommunicationProtocol):
                 with open(action_file, "rb") as file:
                     actions = msgpack.unpackb(file.read(), raw=False)
                 os.rename(action_file, os.path.join(self.action_path, f"{id}_1"))
-                print("read action")
+
                 return actions
             except:
                 tries += 1
@@ -115,7 +114,6 @@ class FilesystemProtocol(CommunicationProtocol):
         with open(observation_file, "wb") as file:
             pickle.dump(observations, file, protocol=pickle.HIGHEST_PROTOCOL)
         os.rename(observation_file, os.path.join(self.observation_path, f"{id}_0"))
-        print("wrote observation")
 
     def read_observations(self, id):
         """
@@ -129,7 +127,6 @@ class FilesystemProtocol(CommunicationProtocol):
                 with open(observation_file, "rb") as file:
                     observations = pickle.load(file)
                 os.rename(observation_file, os.path.join(self.observation_path, f"{id}_1"))
-                print("read observation")
                 return observations
             except:
                 tries += 1
@@ -175,7 +172,6 @@ class NGLServer:
 
     def process_actions(self):
         actions = self.protocol.read_actions(self.id)
-        print("received actions, stepping")
         return self.protocol.write_observations(self.environment.step(actions), self.id)
 
     def start_session(self, **options:dict):
