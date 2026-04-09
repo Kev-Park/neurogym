@@ -220,23 +220,3 @@ class NGLServer:
 
 
 
-
-
-
-# TO-DO
-
-class NGLServerManager:
-    """
-    Class for managing and coordinating multiple NGLServer instances.
-    """
-
-    def __init__(self):
-        pass
-
-class NGLClientManager:
-    """
-    Class for managing and coordinating multiple NGLClient instances.
-    """
-
-    def __init__(self):
-        pass
