@@ -140,6 +140,22 @@ class FilesystemProtocol(CommunicationProtocol):
                 tries += 1
         raise TimeoutError(f"No observations received for ID {id} after {self.timeout} attempts.")
 
+    def read_observations_silent(self, id):
+        """
+        Check for first observation from the observation file without renaming.
+        """
+        tries = 0
+        observation_file = os.path.join(self.observation_path, f"{id}_0")
+
+        while tries < self.timeout:
+            try:
+                with open(observation_file, "rb") as file:
+                    observations = pickle.load(file)
+                return observations
+            except:
+                tries += 1
+        raise TimeoutError(f"No observations received for ID {id} after {self.timeout} attempts.")
+
 class NGLClient:
     """
     Class for sending actions and requesting observations from Neuroglancer across different processes.
@@ -163,6 +179,9 @@ class NGLClient:
         self.protocol.write_actions(actions,self.id)
         
         return self.protocol.read_observations(self.id)
+
+    def get_initial(self):
+        return self.protocol.read_observations_silent(self.id)
 
 class NGLServer:
     """
@@ -190,9 +209,14 @@ class NGLServer:
         print("received actions, stepping")
         return self.protocol.write_observations(self.environment.step(actions), self.id)
 
-    def start_session(self, **options:dict):
-        self.environment.start_session(**options)
+    def start_session(self, start_url=None, **options:dict):
+        self.environment.start_session(start_url=start_url,**options)
 
+        # Get initial state and write to file
+        state, json_state = self.environment.prepare_state()
+        initial = [state, 0, False, json_state]
+
+        self.protocol.write_observations(initial, self.id)
 
 
 
@@ -201,7 +225,7 @@ class NGLServer:
 
 # TO-DO
 
-class NGLServerManger:
+class NGLServerManager:
     """
     Class for managing and coordinating multiple NGLServer instances.
     """
