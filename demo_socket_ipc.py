@@ -34,9 +34,17 @@ class MockEnvironment:
     def __init__(self):
         self.position = [100.0, 200.0, 300.0]
         self.step_count = 0
+        # These must exist before start_session because NGLServer reads them
+        # to send the initial observation.
+        self.prev_state = (self.position[:], None)
+        self.prev_json = {"position": self.position[:]}
 
     def start_session(self, **options):
         print("[MockEnv] Session started with options:", options)
+        # Refresh prev_state/prev_json so the initial observation reflects
+        # the starting state.
+        self.prev_state = (self.position[:], None)
+        self.prev_json = {"position": self.position[:]}
 
     def step(self, actions):
         """Apply actions and return (state, reward, done, info)."""
@@ -53,6 +61,9 @@ class MockEnvironment:
         reward = actions[11] if len(actions) >= 12 else 0  # reward = dz
         done = self.step_count >= 5
         info = {"step": self.step_count}
+
+        self.prev_state = state
+        self.prev_json = {"position": self.position[:]}
 
         print(f"[MockEnv] Step {self.step_count}: pos={self.position}, reward={reward}, done={done}")
         return state, reward, done, info
@@ -92,6 +103,13 @@ def run_client(host, port, num_steps):
     protocol = SocketProtocol(host=host, port=port, is_server=False, timeout=30)
     client = NGLClient(protocol=protocol)
 
+    # Receive the initial observation BEFORE any actions are sent.
+    # This is how an RL policy would work in practice: look at the state,
+    # then decide on an action.
+    initial_obs = client.get_initial_observation()
+    state, reward, done, info = initial_obs
+    print(f"[Client] Initial observation: pos={state[0]}")
+
     actions = [
         # Move in +z
         [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 50, 0, 0, 0, 0, 0],
@@ -106,6 +124,7 @@ def run_client(host, port, num_steps):
     ]
 
     for i in range(num_steps):
+        # In a real RL loop, `action` would come from policy(state).
         action = actions[i % len(actions)]
         print(f"[Client] Sending action {i + 1}: delta_pos=({action[9]}, {action[10]}, {action[11]})")
         observation = client.send_actions(action)

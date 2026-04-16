@@ -360,7 +360,17 @@ class NGLClient:
 
         self.protocol.clear_observations(self.id)
 
+    def get_initial_observation(self):
+        """Read the initial observation sent by the server before any actions.
+
+        This must be called once before the main action loop so the policy
+        has an observation to base its first action on. Returns the same
+        format as send_actions() — (state, reward, done, info).
+        """
+        return self.protocol.read_observations(self.id)
+
     def send_actions(self, actions: list):
+        """Send an action to the server and block until the next observation arrives."""
         self.protocol.write_actions(actions, self.id)
 
         return self.protocol.read_observations(self.id)
@@ -393,7 +403,20 @@ class NGLServer:
         return self.protocol.write_observations(self.environment.step(actions), self.id)
 
     def start_session(self, **options: dict):
+        """Start the Neuroglancer session and send the initial observation.
+
+        Sending the initial observation first (before waiting for any action)
+        is required so the client's policy has something to base its first
+        action on. Subsequent observations are sent in response to actions
+        via process_actions().
+        """
         self.environment.start_session(**options)
+
+        # Send initial observation in the same 4-tuple format as env.step()
+        # so the client sees a consistent shape: (state, reward, done, info).
+        initial_obs = (self.environment.prev_state, 0.0, False, self.environment.prev_json)
+        self.protocol.write_observations(initial_obs, self.id)
+        print("sent initial observation")
 
 
 # ---------------------------------------------------------------------------
