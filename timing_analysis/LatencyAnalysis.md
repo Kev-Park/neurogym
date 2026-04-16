@@ -81,4 +81,63 @@ The `FilesystemProtocol` introduces a **~30 ms (1.4x) overhead** per step relati
 
 # Cross-Node Latency Analysis
 
-TODO
+The same-node tests above run both processes on a single machine with local GPFS access. In a real training setup, the RL model (client) runs on a GPU compute node while the Neuroglancer environment (server) runs on a separate node. To measure the additional cost of cross-node GPFS I/O, we run two more settings where the client is submitted to a compute node via `sbatch` and the server remains on the login node.
+
+## Setup
+
+| Setting | Protocol | Processes | Topology |
+|---------|----------|-----------|----------|
+| Naive file IPC | Direct `pickle` + `os.remove`, no atomic rename | 2 | Cross-node |
+| Communication IPC | `FilesystemProtocol` (msgpack/pickle + `os.rename`) | 2 | Cross-node |
+
+- **Naive**: Client and server exchange data via raw `pickle.dump`/`pickle.load` on shared files, polling with `os.path.exists` and deleting after read. No atomicity guarantees -- read/write conflicts are caught by `try/except` and retried with a 1 ms sleep.
+- **Communication**: Uses the full `FilesystemProtocol` with atomic `os.rename` for safe handoff. Client-side polling augmented with `time.sleep(0.001)` to handle cross-node GPFS visibility delays (the built-in busy-poll has no sleep and exhausts retries before the server can respond).
+
+## Results
+
+### Naive File IPC (cross-node)
+
+| Metric | Value |
+|--------|-------|
+| Mean | 118.79 ms |
+| Std | 5.49 ms |
+| Median | 119.04 ms |
+| Min | 107.29 ms |
+| Max | 127.04 ms |
+
+### Communication IPC (cross-node)
+
+| Metric | Value |
+|--------|-------|
+| Mean | 131.18 ms |
+| Std | 9.42 ms |
+| Median | 133.76 ms |
+| Min | 110.98 ms |
+| Max | 143.15 ms |
+
+## Full Comparison
+
+| # | Setting | Mean | Std | Overhead vs Direct |
+|---|---------|------|-----|--------------------|
+| 1 | Direct (1 process, same node) | 75.05 ms | 6.32 ms | -- (baseline) |
+| 2 | Naive file IPC (2 processes, cross-node) | 118.79 ms | 5.49 ms | +43.74 ms (1.58x) |
+| 3 | Communication IPC (2 processes, same node) | 104.81 ms | 9.42 ms | +29.76 ms (1.40x) |
+| 4 | Communication IPC (2 processes, cross-node) | 131.18 ms | 9.42 ms | +56.13 ms (1.75x) |
+
+## Analysis
+
+**Cross-node GPFS cost (setting 3 vs 4):** Moving the Communication IPC from same-node to cross-node adds ~26 ms. This is the pure network + GPFS metadata propagation overhead -- the time for a file written on one node to become visible and readable on another.
+
+**Communication protocol cost (setting 2 vs 4):** Naive is ~12 ms faster than Communication on the same cross-node topology. The difference comes from the protocol's extra work per round-trip: msgpack encoding for actions, and two `os.rename` operations (atomic swap pattern) instead of a single `os.remove`. On GPFS, rename is a heavier metadata operation than remove.
+
+**Naive variance:** Naive shows the lowest std (5.49 ms) despite lacking atomicity, because in a sequential two-party exchange there is no true concurrent access -- the client only reads after the server finishes writing, and vice versa. Read/write conflicts would appear under higher concurrency or GPFS cache inconsistency, but were not observed in this 10-round test.
+
+**Total overhead budget:** In the realistic cross-node Communication setting (#4), the ~56 ms overhead (1.75x) decomposes roughly as:
+
+| Component | Estimated Cost |
+|-----------|---------------|
+| Serialization (msgpack + pickle + depickle) | ~15-20 ms |
+| GPFS cross-node file visibility (2 round-trips) | ~25-30 ms |
+| Polling + `os.rename` metadata operations | ~5-10 ms |
+
+The env.step() Chrome rendering (~75 ms) remains the dominant cost. The total per-step latency of ~131 ms supports ~7.6 steps/second, which is sufficient for RL training loops where model inference adds further per-step time.
