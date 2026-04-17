@@ -103,7 +103,6 @@ class FilesystemProtocol(CommunicationProtocol):
             file.write(msgpack.packb(actions, use_bin_type=True))
         os.rename(action_file, os.path.join(self.action_path, f"{id}_0"))
 
-        print("wrote action")
 
     def read_actions(self, id):
         """
@@ -117,7 +116,6 @@ class FilesystemProtocol(CommunicationProtocol):
                 with open(action_file, "rb") as file:
                     actions = msgpack.unpackb(file.read(), raw=False)
                 os.rename(action_file, os.path.join(self.action_path, f"{id}_1"))
-                print("read action")
                 return actions
             except:
                 tries += 1
@@ -132,7 +130,6 @@ class FilesystemProtocol(CommunicationProtocol):
         with open(observation_file, "wb") as file:
             pickle.dump(observations, file, protocol=pickle.HIGHEST_PROTOCOL)
         os.rename(observation_file, os.path.join(self.observation_path, f"{id}_0"))
-        print("wrote observation")
 
     def read_observations(self, id):
         """
@@ -146,7 +143,6 @@ class FilesystemProtocol(CommunicationProtocol):
                 with open(observation_file, "rb") as file:
                     observations = pickle.load(file)
                 os.rename(observation_file, os.path.join(self.observation_path, f"{id}_1"))
-                print("read observation")
                 return observations
             except:
                 tries += 1
@@ -192,24 +188,28 @@ def _recv_message(sock: socket.socket) -> bytes:
     Raises ``ConnectionError`` if the peer closes the connection mid-message.
     """
     # Read the 4-byte length header
-    header = b""
-    while len(header) < 4:
-        chunk = sock.recv(4 - len(header))
-        if not chunk:
+    header = bytearray(4)
+    view = memoryview(header)
+    received = 0
+    while received < 4:
+        n = sock.recv_into(view[received:])
+        if not n:
             raise ConnectionError("Connection closed while reading message header")
-        header += chunk
+        received += n
 
     (length,) = struct.unpack("!I", header)
 
-    # Read exactly `length` bytes of payload
-    payload = b""
-    while len(payload) < length:
-        chunk = sock.recv(length - len(payload))
-        if not chunk:
+    # Read exactly `length` bytes of payload into a pre-allocated buffer
+    payload = bytearray(length)
+    view = memoryview(payload)
+    received = 0
+    while received < length:
+        n = sock.recv_into(view[received:])
+        if not n:
             raise ConnectionError("Connection closed while reading message payload")
-        payload += chunk
+        received += n
 
-    return payload
+    return bytes(payload)
 
 
 class SocketProtocol(CommunicationProtocol):
@@ -317,14 +317,12 @@ class SocketProtocol(CommunicationProtocol):
         conn = self._get_conn(id)
         data = msgpack.packb(actions, use_bin_type=True)
         _send_message(conn, data)
-        print("wrote action")
 
     def read_actions(self, id):
         """Block until an action message arrives, deserialize and return it."""
         conn = self._get_conn(id)
         data = _recv_message(conn)
         actions = msgpack.unpackb(data, raw=False)
-        print("read action")
         return actions
 
     def write_observations(self, observations, id):
@@ -332,14 +330,12 @@ class SocketProtocol(CommunicationProtocol):
         conn = self._get_conn(id)
         data = pickle.dumps(observations, protocol=pickle.HIGHEST_PROTOCOL)
         _send_message(conn, data)
-        print("wrote observation")
 
     def read_observations(self, id):
         """Block until an observation message arrives, deserialize and return it."""
         conn = self._get_conn(id)
         data = _recv_message(conn)
         observations = pickle.loads(data)
-        print("read observation")
         return observations
 
     def read_observations_silent(self, id):
@@ -366,7 +362,6 @@ class SocketProtocol(CommunicationProtocol):
             except OSError:
                 pass
             self._server_socket = None
-        print("[SocketProtocol] Closed all connections.")
 
 
 class NGLClient:
@@ -420,7 +415,6 @@ class NGLServer:
 
     def process_actions(self):
         actions = self.protocol.read_actions(self.id)
-        print("received actions, stepping")
         return self.protocol.write_observations(self.environment.step(actions), self.id)
 
     def start_session(self, start_url=None, **options:dict):

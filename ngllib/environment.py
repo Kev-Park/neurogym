@@ -15,6 +15,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from .utils.MouseActionHandler import MouseActionHandler
+import numpy as np
 import os
 """--------------------------------"""
 
@@ -261,7 +262,7 @@ class Environment:
         else:
             raise Exception("Driver not initialized. Please start the session first.")
 
-    def get_screenshot(self, save_path: str = None, resize:bool=False, mouse_x:int=None, mouse_y:int=None, fast:bool=True)-> Image.Image:
+    def get_screenshot(self, save_path: str = None, resize:bool=False, mouse_x:int=None, mouse_y:int=None, fast:bool=True)-> np.ndarray:
         """
             Get a screenshot of the current page.
             Args:
@@ -271,7 +272,7 @@ class Environment:
                 mouse_y: Y coordinate of the mouse. -> Optional, if not specified, the mouse position is not added to the image.
                 fast: Boolean to use the fast method to get the screenshot. If False, the slow method is used (default Selenium method).
         Returns:
-            Image.Image, the screenshot of the current page as a PIL Image object.
+            np.ndarray, the screenshot of the current page as an RGB numpy array (H, W, 3).
         """
 
         if fast:
@@ -290,7 +291,7 @@ class Environment:
         if save_path:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             image.save(save_path, format='PNG')
-        return image
+        return np.asarray(image.convert("RGB"))
 
     def get_JSON_state(self)-> dict:
         """Parse the URL to get the JSON state
@@ -521,13 +522,13 @@ class Environment:
 
         return reward, False
 
-    def prepare_state(self)->tuple[tuple[list, PIL.Image.Image], dict]:
+    def prepare_state(self)->tuple[tuple[list, np.ndarray], dict]:
         """
-            Core function. Returns a list for the state and the current image as a PIL image (default from ChromeNGL class)
+            Core function. Returns a list for the state and the current image as a numpy array.
 
             Returns:
                 pos_state: List of position, crossSectionScale, projectionOrientation, projectionScale
-                curr_image: PIL image of the current state
+                curr_image: RGB numpy array (H, W, 3) of the current state
                 json_state: JSON state of the current state as a dictionary
         """
 
