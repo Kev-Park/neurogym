@@ -48,6 +48,14 @@ class CommunicationProtocol(ABC):
         """
         pass
 
+    @abstractmethod
+    def read_observations_silent(self):
+        """
+        Read the first observation without consuming it (filesystem) or
+        equivalently just read it (socket).
+        """
+        pass
+
 
 class FilesystemProtocol(CommunicationProtocol):
     """
@@ -334,6 +342,14 @@ class SocketProtocol(CommunicationProtocol):
         print("read observation")
         return observations
 
+    def read_observations_silent(self, id):
+        """Read observation — identical to read_observations for sockets.
+
+        Sockets have no file to leave in place, so the \"silent\" distinction
+        that the filesystem protocol needs does not apply here.
+        """
+        return self.read_observations(id)
+
     # -- Cleanup --------------------------------------------------------------
 
     def close(self):
@@ -371,15 +387,6 @@ class NGLClient:
         NGLClient._id += 1
 
         self.protocol.clear_observations(self.id)
-
-    def get_initial_observation(self):
-        """Read the initial observation sent by the server before any actions.
-
-        This must be called once before the main action loop so the policy
-        has an observation to base its first action on. Returns the same
-        format as send_actions() — (state, reward, done, info).
-        """
-        return self.protocol.read_observations(self.id)
 
     def send_actions(self, actions: list):
         """Send an action to the server and block until the next observation arrives."""
