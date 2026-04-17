@@ -418,24 +418,17 @@ class NGLServer:
         return self.protocol.write_observations(self.environment.step(actions), self.id)
 
     def start_session(self, start_url=None, **options:dict):
+        # Accept the client connection early so it doesn't time out
+        # while we do the slow environment startup + screenshot.
+        self.protocol._get_conn(self.id)
+
         self.environment.start_session(start_url=start_url,**options)
 
-        # Get initial state and write to file
-        print("[NGLServer] prepare_state...", flush=True)
+        # Get initial state and send to client
         state, json_state = self.environment.prepare_state()
-        print(f"[NGLServer] prepare_state done, image type={type(state[1])}, shape={getattr(state[1], 'shape', 'N/A')}", flush=True)
         initial = [state, 0, False, json_state]
 
-        print("[NGLServer] pickling observations...", flush=True)
-        try:
-            data = pickle.dumps(initial, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"[NGLServer] pickle done, {len(data)} bytes", flush=True)
-        except Exception as e:
-            print(f"[NGLServer] pickle FAILED: {e}", flush=True)
-            raise
-        print("[NGLServer] write_observations...", flush=True)
         self.protocol.write_observations(initial, self.id)
-        print("[NGLServer] write_observations done", flush=True)
 
 
 
