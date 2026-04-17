@@ -188,28 +188,24 @@ def _recv_message(sock: socket.socket) -> bytes:
     Raises ``ConnectionError`` if the peer closes the connection mid-message.
     """
     # Read the 4-byte length header
-    header = bytearray(4)
-    view = memoryview(header)
-    received = 0
-    while received < 4:
-        n = sock.recv_into(view[received:])
-        if not n:
+    header = b""
+    while len(header) < 4:
+        chunk = sock.recv(4 - len(header))
+        if not chunk:
             raise ConnectionError("Connection closed while reading message header")
-        received += n
+        header += chunk
 
     (length,) = struct.unpack("!I", header)
 
-    # Read exactly `length` bytes of payload into a pre-allocated buffer
-    payload = bytearray(length)
-    view = memoryview(payload)
-    received = 0
-    while received < length:
-        n = sock.recv_into(view[received:])
-        if not n:
+    # Read exactly `length` bytes of payload
+    payload = b""
+    while len(payload) < length:
+        chunk = sock.recv(length - len(payload))
+        if not chunk:
             raise ConnectionError("Connection closed while reading message payload")
-        received += n
+        payload += chunk
 
-    return bytes(payload)
+    return payload
 
 
 class SocketProtocol(CommunicationProtocol):
@@ -418,13 +414,9 @@ class NGLServer:
         return self.protocol.write_observations(self.environment.step(actions), self.id)
 
     def start_session(self, start_url=None, **options:dict):
-        # Accept the client connection early so it doesn't time out
-        # while we do the slow environment startup + screenshot.
-        self.protocol._get_conn(self.id)
-
         self.environment.start_session(start_url=start_url,**options)
 
-        # Get initial state and send to client
+        # Get initial state and write to client
         state, json_state = self.environment.prepare_state()
         initial = [state, 0, False, json_state]
 
