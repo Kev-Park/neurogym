@@ -144,6 +144,22 @@ class FilesystemProtocol(CommunicationProtocol):
                 tries += 1
         raise TimeoutError(f"No observations received for ID {id} after {self.timeout} attempts.")
 
+     def read_observations_silent(self, id):
+        """
+        Check for first observation from the observation file without renaming.
+        """
+        tries = 0
+        observation_file = os.path.join(self.observation_path, f"{id}_0")
+
+        while tries < self.timeout:
+            try:
+                with open(observation_file, "rb") as file:
+                    observations = pickle.load(file)
+                return observations
+            except:
+                tries += 1
+        raise TimeoutError(f"No observations received for ID {id} after {self.timeout} attempts.")
+        
 
 # ---------------------------------------------------------------------------
 # Socket-based IPC
@@ -337,10 +353,6 @@ class SocketProtocol(CommunicationProtocol):
         print("[SocketProtocol] Closed all connections.")
 
 
-# ---------------------------------------------------------------------------
-# NGLClient / NGLServer (unchanged from original)
-# ---------------------------------------------------------------------------
-
 class NGLClient:
     """
     Class for sending actions and requesting observations from Neuroglancer across different processes.
@@ -375,6 +387,8 @@ class NGLClient:
 
         return self.protocol.read_observations(self.id)
 
+    def get_initial(self):
+        return self.protocol.read_observations_silent(self.id)
 
 class NGLServer:
     """
@@ -402,40 +416,14 @@ class NGLServer:
         print("received actions, stepping")
         return self.protocol.write_observations(self.environment.step(actions), self.id)
 
-    def start_session(self, **options: dict):
-        """Start the Neuroglancer session and send the initial observation.
+    def start_session(self, start_url=None, **options:dict):
+        self.environment.start_session(start_url=start_url,**options)
 
-        Sending the initial observation first (before waiting for any action)
-        is required so the client's policy has something to base its first
-        action on. Subsequent observations are sent in response to actions
-        via process_actions().
-        """
-        self.environment.start_session(**options)
+        # Get initial state and write to file
+        state, json_state = self.environment.prepare_state()
+        initial = [state, 0, False, json_state]
 
-        # Send initial observation in the same 4-tuple format as env.step()
-        # so the client sees a consistent shape: (state, reward, done, info).
-        initial_obs = (self.environment.prev_state, 0.0, False, self.environment.prev_json)
-        self.protocol.write_observations(initial_obs, self.id)
-        print("sent initial observation")
+        self.protocol.write_observations(initial, self.id)
 
 
-# ---------------------------------------------------------------------------
-# Manager stubs (TO-DO: stretch goal)
-# ---------------------------------------------------------------------------
 
-class NGLServerManager:
-    """
-    Class for managing and coordinating multiple NGLServer instances.
-    """
-
-    def __init__(self):
-        pass
-
-
-class NGLClientManager:
-    """
-    Class for managing and coordinating multiple NGLClient instances.
-    """
-
-    def __init__(self):
-        pass
