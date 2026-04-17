@@ -15,12 +15,11 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from .utils.MouseActionHandler import MouseActionHandler
-from .ipc import IPCChannel
 import os
 """--------------------------------"""
 
 class Environment:
-    def __init__(self, headless:bool=False, config_path:str=None, verbose:bool=False, start_url:str=None, reward_function:'function'=None, ipc_dir:str=None):
+    def __init__(self, headless:bool=False, config_path:str=None, verbose:bool=False, start_url:str=None, reward_function:'function'=None):
         """
         Args:
             headless: Whether to run the Neuroglancer viewer in headless mode. If True, nothing will be displayed. May slightly alter the behavior of neuroglancer but will increase performance.
@@ -28,13 +27,11 @@ class Environment:
             config_path: Path to the config file.
             reward_function: Alternative reward function to use. If None, the default reward function will be used (see docs for more details).
             start_url: The URL to start the session on. If not specified, the default Neuroglancer session will be used.
-            ipc_dir: Directory for IPC communication. If set, enables filesystem-based IPC so a separate controller process can send actions and receive states.
         """
         self.options = {}
         self.headless = headless
         self.verbose = verbose
         self.compute_reward = reward_function or self.compute_default_reward
-        self.ipc = IPCChannel(ipc_dir) if ipc_dir else None
 
         # Load configuration information
         with open(config_path, 'r') as f:
@@ -507,69 +504,7 @@ class Environment:
         self.prev_state = state
         self.prev_json = json_state
 
-        # Write state to IPC if enabled
-        if self.ipc:
-            pos_state, image = state
-            self.ipc.write_state(pos_state, image)
-            self.ipc.signal("state_ready")
-
         return state, reward, done, json_state
-
-    def step_ipc(self, timeout:float=None)->tuple[list, float, bool, dict]:
-        """Wait for an action from the controller process via IPC, execute it, and write back the state.
-
-        Args:
-            timeout: Max seconds to wait for an action. None = wait forever.
-        Returns:
-            Same as step(): (state, reward, done, json_state), or None if timed out.
-        """
-        if not self.ipc:
-            raise RuntimeError("IPC not enabled. Pass ipc_dir to Environment()")
-
-        start = time.time()
-        while True:
-            if self.ipc.check_signal("action_ready"):
-                action = self.ipc.read_action()
-                if action is not None:
-                    return self.step(action)
-            if timeout is not None and (time.time() - start) > timeout:
-                return None
-            time.sleep(0.001)
-
-    def run_ipc_loop(self, max_steps:int=None)->None:
-        """Run the environment as an IPC server: repeatedly wait for actions from the controller and respond with states.
-
-        Args:
-            max_steps: Max number of steps to run. None = run forever until 'stop' signal.
-        """
-        if not self.ipc:
-            raise RuntimeError("IPC not enabled. Pass ipc_dir to Environment()")
-
-        # Write initial state so the controller can start
-        pos_state, image = self.prev_state
-        self.ipc.write_state(pos_state, image)
-        self.ipc.signal("state_ready")
-
-        step_count = 0
-        if self.verbose:
-            print("IPC loop started. Waiting for actions...")
-
-        while True:
-            if self.ipc.check_signal("stop"):
-                if self.verbose:
-                    print("Stop signal received.")
-                break
-
-            result = self.step_ipc(timeout=1.0)
-            if result is not None:
-                step_count += 1
-                if self.verbose:
-                    state, reward, done, _ = result
-                    print(f"IPC step {step_count}: reward={reward}, done={done}")
-                if result[2]:  # done
-                    break
-                if max_steps and step_count >= max_steps:
-                    break
 
     def compute_default_reward(self, state:list, action:list, prev_state:list)->tuple[float, bool]:
         """
