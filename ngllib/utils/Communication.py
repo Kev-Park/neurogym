@@ -386,7 +386,28 @@ class NGLClient:
         return self.protocol.read_observations(self.id)
 
     def get_initial(self):
-        return self.protocol.read_observations_silent(self.id)
+        """Get the first observation, retrying if the connection drops.
+
+        Through SSH tunnels the local connect() can succeed even when the
+        server at the far end isn't up yet — the tunnel port is open but
+        the forwarded connection gets refused remotely, which shows up as
+        a closed socket on our end.  Retry until the server is truly ready.
+        """
+        deadline = time.time() + self.protocol.timeout
+        while True:
+            try:
+                return self.protocol.read_observations_silent(self.id)
+            except (ConnectionError, OSError):
+                if time.time() > deadline:
+                    raise
+                # Tear down the dead socket so _get_conn reconnects
+                conn = self.protocol._connections.pop(self.id, None)
+                if conn:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                time.sleep(1)
 
 class NGLServer:
     """
