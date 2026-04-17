@@ -41,4 +41,4 @@ for i in range(10):
     print(f"Step {i}: pos={[round(p,1) for p in pos_state[0]]}, reward={reward}")
 
 env.end_session()
-print(f"Done! Screenshots saved to screenshots/")
+print(f"Done! Screenshots saved to screenshots")

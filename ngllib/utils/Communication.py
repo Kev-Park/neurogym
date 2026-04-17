@@ -144,7 +144,7 @@ class FilesystemProtocol(CommunicationProtocol):
                 tries += 1
         raise TimeoutError(f"No observations received for ID {id} after {self.timeout} attempts.")
 
-     def read_observations_silent(self, id):
+    def read_observations_silent(self, id):
         """
         Check for first observation from the observation file without renaming.
         """
