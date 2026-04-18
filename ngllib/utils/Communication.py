@@ -385,6 +385,12 @@ class NGLClient:
 
         return self.protocol.read_observations(self.id)
 
+    def send_reset(self):
+        """Tell the server to reset the environment and return the initial observation."""
+        self.protocol.write_actions({"cmd": "reset"}, self.id)
+
+        return self.protocol.read_observations(self.id)
+
     def get_initial(self):
         """Get the first observation, retrying if the connection drops.
 
@@ -432,6 +438,14 @@ class NGLServer:
 
     def process_actions(self):
         actions = self.protocol.read_actions(self.id)
+
+        # Detect if a reset command is sent instead of normal actions
+        if isinstance(actions, dict) and actions.get("cmd") == "reset":
+            self.environment.reset()
+            state, json_state = self.environment.prepare_state()
+            return self.protocol.write_observations(
+                [state, 0, False, json_state], self.id)
+
         return self.protocol.write_observations(self.environment.step(actions), self.id)
 
     def start_session(self, start_url=None, **options:dict):
@@ -442,6 +456,7 @@ class NGLServer:
         initial = [state, 0, False, json_state]
 
         self.protocol.write_observations(initial, self.id)
+
 
 
 
