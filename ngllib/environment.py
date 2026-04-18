@@ -554,6 +554,16 @@ class Environment:
             curr_image = self.get_screenshot(image_path, resize=resize, mouse_x=self.mouse_x, mouse_y=self.mouse_y, fast=fast)
         else:
             curr_image = self.get_screenshot(image_path, resize=resize, fast=fast)
+        left_pane = self.options.get('left_pane', True)
+        right_pane = self.options.get('right_pane', True)
+        if not left_pane and not right_pane:
+            raise ValueError("At least one of 'left_pane' or 'right_pane' must be True")
+        if not left_pane or not right_pane:
+            mid = curr_image.shape[1] // 2
+            if not left_pane:
+                curr_image = curr_image[:, mid:]
+            else:
+                curr_image = curr_image[:, :mid]
         if euler_angles:
             projectionOrientationEuler = quaternion_to_euler(projectionOrientation)
             pos_state = [position, crossSectionScale, projectionOrientationEuler, projectionScale]
