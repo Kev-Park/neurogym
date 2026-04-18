@@ -194,8 +194,16 @@ class Environment:
                 break
             time.sleep(1)
 
-        # Wait for initial tile rendering
-        time.sleep(10)
+        # Wait for all chunks to load and rendering to complete
+        for _ in range(200):
+            try:
+                ready = self.driver.execute_script(
+                    "return window.viewer && viewer.isReady()")
+                if ready:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.05)
 
         if self.verbose:
             print(f"Neuroglancer session started. Navigated to URL given.")
