@@ -4,12 +4,7 @@
     "google_email_address": "pnirlagent@gmail.com",
     "google_password": "secret-password",
 
-    "driver_path_mac": "chromedrivers/chromedriver-mac-arm64/133/chromedriver",
-    "driver_path_win": "K:/Coding Projects/chromedrivers/chromedriver-win64/chromedriver.exe",
-    "driver_path_linux": "/scratch/gpfs/PMITTAL/peiyang/px4668/IntroToRL/neurogym/chrome-install/chromedriver-linux64/chromedriver",
-    "chrome_binary_path_linux": "/scratch/gpfs/PMITTAL/peiyang/px4668/IntroToRL/neurogym/chrome-install/chrome-linux64/chrome",
-
-    "window_width": 1800,
+"window_width": 1800,
     "window_height": 900,
 
     "model_image_width": 960,

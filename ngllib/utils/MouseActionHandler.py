@@ -1,12 +1,8 @@
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 import time
 
 class MouseActionHandler:
-    def __init__(self, driver):
-        self.driver = driver
-        self.actions = ActionChains(driver)
+    def __init__(self, page):
+        self.page = page
 
     def keys_pressed(self, keysPressed):
         """Handles key states (Shift, Ctrl, Alt)"""
@@ -83,7 +79,7 @@ class MouseActionHandler:
                 window.dispatchEvent(altUp);
             """
         return key_up_script
-    
+
     def execute_click(self, x: float, y: float, action: str, keysPressed:str = "None", grid_size: float = 25):
         """Perform a mouse action on the neuroglancer viewer
         Args:
@@ -93,13 +89,10 @@ class MouseActionHandler:
         keysPressed: str: keys pressed during the action, separated by commas
         """
         keys = []
-        element = self.driver.find_element(By.CLASS_NAME, 'neuroglancer-layer-group-viewer')
-        element_rect = element.rect
+        element_rect = self.page.locator('.neuroglancer-layer-group-viewer').bounding_box()
         clamped_x = max(0, min(x, element_rect['width'] - 1))
         clamped_y = max(0, min(y, element_rect['height'] - 1))
 
-        #self.add_visual_marker(clamped_x, clamped_y, element_rect)
-        
         key_down_script = self.keys_pressed(keys)
         key_up_script = self.clear_keys_pressed(keysPressed)
 
@@ -127,7 +120,7 @@ class MouseActionHandler:
                         clientY: targetY,
                         button: {2 if action == 'right_click' else 0}
                     }});
-                    
+
                     childElement.dispatchEvent(mousedownEvent);
 
                     var mainEvent = new MouseEvent(eventType, {{
@@ -138,7 +131,7 @@ class MouseActionHandler:
                         clientY: targetY,
                         button: {2 if action == 'right_click' else 0}
                     }});
-                    
+
                     childElement.dispatchEvent(mainEvent);
 
                     var mouseupEvent = new MouseEvent('mouseup', {{
@@ -149,7 +142,7 @@ class MouseActionHandler:
                         clientY: targetY,
                         button: {2 if action == 'right_click' else 0}
                     }});
-                    
+
                     childElement.dispatchEvent(mouseupEvent);
                 }} else {{
                     console.error("No child element found at the specified position or the child is outside the target area.");
@@ -157,11 +150,7 @@ class MouseActionHandler:
             }}
         """
 
-        self.driver.execute_script(js_action_script)
-        # if keysPressed != "None":
-        #     # ugh, this should not be necessary, but without it we lose dispatching consistency on left clicks that has a timeout to check for another one to produce double_click
-        #     time.sleep(0.2)
-        #     self.driver.execute_script(key_up_script)
+        self.page.evaluate(f"() => {{\n{js_action_script}\n}}")
 
     def add_visual_marker(self, clamped_x, clamped_y, element_rect):
         js_marker_script = f"""
@@ -180,4 +169,4 @@ class MouseActionHandler:
             marker.className = 'selenium-pointer';
             document.body.appendChild(marker);
         """
-        self.driver.execute_script(js_marker_script)
+        self.page.evaluate(f"() => {{\n{js_marker_script}\n}}")

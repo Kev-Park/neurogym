@@ -4,16 +4,10 @@ Standalone full Neuroglancer environment. Handles sending actions, getting state
 
 """------------Imports-------------"""
 from .utils.utils import parse_action
-import time, json, copy, os, argparse, PIL, platform, base64, io, urllib
+import time, json, copy, os, argparse, PIL, io, urllib
 from PIL import Image, ImageDraw
 from .utils.maths import quaternion_to_euler, euler_to_quaternion
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from playwright.sync_api import sync_playwright
 from .utils.MouseActionHandler import MouseActionHandler
 import numpy as np
 import os
@@ -45,87 +39,31 @@ class Environment:
         self.window_width = self.config['window_width']
         self.window_height = self.config['window_height']
 
-        # Initialize Chrome
-        self.chrome_options = self.initialize_chrome_options(headless=self.headless, window_width=self.window_width, window_height=self.window_height)
-        self.chrome_service = self.initialize_chrome_service(self.chrome_options) # will initialize the service based on platform
-
         try:
-            self.driver = webdriver.Chrome(service=self.chrome_service, options=self.chrome_options)
-            self.action_handler = MouseActionHandler(self.driver)
-        except Exception:
-            raise Exception(f"Error initializing Chrome using Chromedriver. Validate the path to the driver in config.json or use default paths.")
+            self._playwright = sync_playwright().start()
+            self.browser = self._playwright.chromium.launch(
+                headless=self.headless,
+                args=self._build_launch_args(),
+            )
+            self.page = self.browser.new_page(viewport={"width": self.window_width, "height": self.window_height})
+            self.action_handler = MouseActionHandler(self.page)
+        except Exception as e:
+            raise Exception(f"Error launching Playwright Chromium: {e}. Ensure 'playwright install chromium' has been run.")
 
-    def initialize_chrome_options(self, headless:bool, window_width:int, window_height:int)->Options:
-        """
-        Initializes the Chrome options for the Neuroglancer viewer.
-
-        Args:
-            headless: Whether to run the Neuroglancer viewer in headless mode. If True, nothing will be displayed. May slightly alter the behavior of neuroglancer but will increase performance.
-            window_width: The width of the Chrome window.
-            window_height: The height of the Chrome window.
-        """
-
-        chrome_options = Options()
-
-        
-        # Make manual border adjustments
-        if platform.system() == "Darwin":  # macOS
-
-            pass
-            
-        elif platform.system() == "Windows":
-
-            chrome_border_height = 95
-            chrome_border_width = 16
-            chrome_options.add_argument("--force-device-scale-factor=1")
-
-            window_height += chrome_border_height
-            window_width += chrome_border_width
-
-        elif platform.system() == "Linux":
-            
-            pass
-
-
-        if headless:
-            chrome_options.add_argument("--headless=new")
-            chrome_options.add_argument("--enable-logging")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--use-gl=angle")
-            chrome_options.add_argument("--use-angle=vulkan")
-            chrome_options.add_argument("--enable-features=Vulkan")
-            chrome_options.add_argument("--enable-unsafe-swiftshader")
-
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_experimental_option("useAutomationExtension", False)
-        chrome_options.add_experimental_option("excludeSwitches",["enable-automation"])  
-        chrome_options.add_argument(f"--window-size={window_width},{window_height}")   
-        return chrome_options
-    
-    def initialize_chrome_service(self, chrome_options:Options)->None:
-        """
-        Returns the Chrome service for the Neuroglancer viewer based on platform with input options.
-        Args:
-            chrome_options: The Chrome options to use.
-        """
-
-        # Utilize correct driver
-        if platform.system() == "Darwin":  # macOS
-
-            chrome_driver_path = self.config['driver_path_mac']
-            chrome_service = Service(chrome_driver_path)
-            
-        elif platform.system() == "Windows":
-
-            chrome_driver_path = self.config['driver_path_win']
-            chrome_service = Service(chrome_driver_path)
-
-        elif platform.system() == "Linux":
-            chrome_driver_path = self.config['driver_path_linux']
-            chrome_service = Service(chrome_driver_path)
-            chrome_options.binary_location = self.config['chrome_binary_path_linux']
-        return chrome_service
+    def _build_launch_args(self) -> list:
+        args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        if self.headless:
+            args += [
+                "--use-gl=angle",
+                "--use-angle=vulkan",
+                "--enable-features=Vulkan",
+                "--enable-unsafe-swiftshader",
+            ]
+        return args
     
     def start_session(self, start_url:str=None, login:bool=False, **options:dict)-> None:
         """
@@ -144,31 +82,27 @@ class Environment:
 
     def end_session(self)-> None:
         """
-        Ends the Neuroglancer session by closing the Chrome window and quitting the driver.
+        Ends the Neuroglancer session by closing the browser.
         """
 
-        self.driver.close()
-        self.driver.quit()
+        self.page.close()
+        self.browser.close()
+        self._playwright.stop()
 
     def google_login(self)-> None:
-        """ 
+        """
         Logs into Google account using the mail address and password provided in the constructor. This is highly dependent on the Chrome versions and their updates; if this function returns errors please contact (see docs for emails).
         """
         try:
-            self.driver.get('https://accounts.google.com/Login')
-            email_input = WebDriverWait(self.driver, 20).until(
-                EC.element_to_be_clickable((By.ID, "identifierId"))
-            )
-            email_input.send_keys(self.config['google_email_address'])
-            email_input.send_keys(Keys.RETURN)
-            password_input = WebDriverWait(self.driver, 20).until(
-                EC.element_to_be_clickable((By.XPATH, "//input[@type='password']"))
-            )
-            password_input.send_keys(self.config['google_password'])
-            password_input.send_keys(Keys.RETURN)
+            self.page.goto('https://accounts.google.com/Login')
+            self.page.locator('#identifierId').fill(self.config['google_email_address'])
+            self.page.locator('#identifierId').press('Enter')
+            self.page.locator('input[type="password"]').wait_for(state='visible', timeout=20000)
+            self.page.locator('input[type="password"]').fill(self.config['google_password'])
+            self.page.locator('input[type="password"]').press('Enter')
             if self.verbose:
                 print("Login attempted. Waiting for confirmation...")
-            WebDriverWait(self.driver, 20).until(EC.url_contains("myaccount.google.com"))
+            self.page.wait_for_url('**myaccount.google.com**', timeout=20000)
             if self.verbose:
                 print("Login successful!")
         except Exception as e:
@@ -197,8 +131,8 @@ class Environment:
         # Wait for all chunks to load and rendering to complete
         for _ in range(200):
             try:
-                ready = self.driver.execute_script(
-                    "return window.viewer && viewer.isReady()")
+                ready = self.page.evaluate(
+                    "() => !!(window.viewer && window.viewer.isReady && window.viewer.isReady())")
                 if ready:
                     break
             except Exception:
@@ -215,81 +149,68 @@ class Environment:
         Args:
             start_url: The URL to start the session on. If not specified, the default graphene session will be used.
         Returns:
-            None, session is started in place on the driver instance.
+            None, session is started in place on the page instance.
         """
         try:
             if start_url is None:
                 start_url = self.config['default_middle_auth_start_url']
-            self.driver.get(start_url)
-            wait = WebDriverWait(self.driver, 10)
-            login_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//ul[@id='statusContainerModal']//button[text()='Login']")))
-            login_button.click()
-            main_window = self.driver.current_window_handle
-            WebDriverWait(self.driver, 10).until(lambda d: len(d.window_handles) > 1)
-            for handle in self.driver.window_handles:
-                if handle != main_window:
-                    self.driver.switch_to.window(handle)
-                    break
-            pni_rlagent = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'PNI RLAgent')]"))
-            )
-            pni_rlagent.click()
+            self.page.goto(start_url)
+            login_button = self.page.locator('ul#statusContainerModal button:text-is("Login")')
+            login_button.wait_for(state='visible', timeout=10000)
+            with self.page.context.expect_page() as popup_info:
+                login_button.click()
+            popup = popup_info.value
+            popup.wait_for_load_state()
+            popup.get_by_text('PNI RLAgent').click()
             time.sleep(1)
             if self.headless:
-                continue_button = WebDriverWait(self.driver, 10).until(
-                    EC.element_to_be_clickable((By.ID, "submit_approve_access"))
-                )
+                popup.locator('#submit_approve_access').click()
             else:
-                continue_button = WebDriverWait(self.driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Continue')]"))
-                )
-            continue_button.click()
-            self.driver.switch_to.window(main_window)
+                popup.get_by_text('Continue').click()
+            popup.close()
         except Exception as e:
             if self.verbose:
                 print("An error occurred:", e)
 
     def refresh(self)-> None:
         """Refreshes the current page. Useful to force rendering of neurons."""
-        self.driver.refresh()
+        self.page.reload()
         if self.verbose:
             print("Page refreshed.")
 
     def get_url(self)-> str:
         """Returns the current Neuroglancer URL."""
-        return self.driver.current_url
-    
+        return self.page.url
+
     def change_url(self, user_url: str)-> None:
         """Changes the URL of the Neuroglancer viewer to user_url.
         Args:
             user_url: The URL to change to.
         """
 
-        if self.driver:
-            self.driver.get(user_url)  
+        if self.page:
+            self.page.goto(user_url)
         else:
-            raise Exception("Driver not initialized. Please start the session first.")
+            raise Exception("Page not initialized. Please start the session first.")
 
     def get_screenshot(self, save_path: str = None, resize:bool=False, mouse_x:int=None, mouse_y:int=None, fast:bool=True)-> np.ndarray:
         """
             Get a screenshot of the current page.
             Args:
                 save_path: Path to save the image. If not specified, the image is not saved.
-                resize: Boolean to resize the image. Normally we want to resize the image later on before training.
+                resize: Boolean to resize the image.
                 mouse_x: X coordinate of the mouse. -> Optional, if not specified, the mouse position is not added to the image.
                 mouse_y: Y coordinate of the mouse. -> Optional, if not specified, the mouse position is not added to the image.
-                fast: Boolean to use the fast method to get the screenshot. If False, the slow method is used (default Selenium method).
+                fast: If True, captures as JPEG (quality 85). If False, captures as PNG.
         Returns:
             np.ndarray, the screenshot of the current page as an RGB numpy array (H, W, 3).
         """
 
         if fast:
-            screenshot_raw = self.driver.execute_cdp_cmd("Page.captureScreenshot", {"format": "jpeg", "quality": 85})
-            screenshot_bytes = base64.b64decode(screenshot_raw["data"])
-            image = Image.open(io.BytesIO(screenshot_bytes))
+            screenshot_bytes = self.page.screenshot(type="jpeg", quality=85)
         else:
-            screenshot = self.driver.get_screenshot_as_png()
-            image = Image.open(io.BytesIO(screenshot))
+            screenshot_bytes = self.page.screenshot()
+        image = Image.open(io.BytesIO(screenshot_bytes))
         if resize:
             image = image.resize((self.resize_width, self.resize_height))
         if mouse_x is not None and mouse_y is not None:
@@ -303,21 +224,15 @@ class Environment:
 
     def get_JSON_state(self)-> dict:
         """Parse the URL to get the JSON state
-        
+
         Returns:
             dict: The JSON state of the Neuroglancer viewer.
         """
 
-        script = """
-        if (window.viewer && window.viewer.state) {
-            return JSON.stringify(viewer.state);
-        } else {
-            return null;
-        }
-        """
         try:
-            state = self.driver.execute_script(script)
-            return state
+            return self.page.evaluate(
+                "() => (window.viewer && window.viewer.state) ? JSON.stringify(window.viewer.state) : null"
+            )
         except Exception as e:
             if self.verbose:
                 print("An error occurred:", e)
@@ -366,7 +281,7 @@ class Environment:
                 height: The height of the viewport.
         """
 
-        self.driver.set_window_size(width, height)
+        self.page.set_viewport_size({"width": width, "height": height})
     
 
 

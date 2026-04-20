@@ -1,33 +1,28 @@
 # Neurogym
 
-## 1. Chrome & ChromeDriver Installation
+## 1. Playwright & Chromium Installation
 
-Install Chrome for Testing and the matching ChromeDriver.
+Install Playwright and let it download its own Chromium — no sudo or manual ChromeDriver setup required.
 
 ```bash
-mkdir -p chrome-install && cd chrome-install
-
-# Check latest stable version
-curl -s https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json | python3 -m json.tool | head -10
-
-# Download Chrome + ChromeDriver
-VERSION="147.0.7727.50"
-curl -O "https://storage.googleapis.com/chrome-for-testing-public/${VERSION}/linux64/chrome-linux64.zip"
-curl -O "https://storage.googleapis.com/chrome-for-testing-public/${VERSION}/linux64/chromedriver-linux64.zip"
-
-
-unzip chrome-linux64.zip && unzip chromedriver-linux64.zip
-chmod +x chrome-linux64/chrome chromedriver-linux64/chromedriver
+pip install playwright
+playwright install chromium
 ```
 
-Then update `config.json` with the correct paths:
+On PEP 668 / externally-managed clusters (where pip warns about system packages):
 
-```json
-{
-    "driver_path_linux": "/path/to/chrome-install/chromedriver-linux64/chromedriver",
-    "chrome_binary_path_linux": "/path/to/chrome-install/chrome-linux64/chrome"
-}
+```bash
+pip install playwright --break-system-packages
+playwright install chromium
 ```
+
+Chromium is downloaded to `~/.cache/ms-playwright/` (~450 MB). To redirect to scratch storage:
+
+```bash
+PLAYWRIGHT_BROWSERS_PATH=/path/to/scratch playwright install chromium
+```
+
+No changes to `config.json` are needed for browser paths.
 
 ## 2. Screenshot Rendering
 
