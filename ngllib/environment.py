@@ -218,7 +218,9 @@ class Environment:
             #mouse_y += self.values.neuroglancer_margin_top # TODO: Make it clear how this counted. Account for the fact we record mouse position from top left of canva and not top left of window
             draw.ellipse((mouse_x - 5, mouse_y - 5, mouse_x + 5, mouse_y + 5), fill='red', outline='red')
         if save_path:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            dir_name = os.path.dirname(save_path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
             image.save(save_path, format='PNG')
         return np.asarray(image.convert("RGB"))
 
