@@ -458,12 +458,6 @@ class NGLServer:
     def start_session(self, start_url=None, **options:dict):
         self.environment.start_session(start_url=start_url,**options)
 
-        # Get initial state and write to client
-        state, json_state = self.environment.prepare_state()
-        initial = [state, 0, False, json_state]
-
-        self.protocol.write_observations(initial, self.id)
-
 
 
 
