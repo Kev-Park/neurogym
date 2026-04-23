@@ -25,28 +25,28 @@ Measures the full round-trip: file write + busy-poll + env.step() + pickle seria
 
 | Metric | Value |
 |--------|-------|
-| Mean | 132.07 ms |
-| Std | 11.98 ms |
-| Median | 137.40 ms |
-| Min | 103.60 ms |
-| Max | 144.50 ms |
+| Mean | 75.05 ms |
+| Std | 6.32 ms |
+| Median | 72.52 ms |
+| Min | 69.55 ms |
+| Max | 91.89 ms |
 
 ### Communication IPC
 
 | Metric | Value |
 |--------|-------|
-| Mean | 150.62 ms |
-| Std | 11.02 ms |
-| Median | 152.67 ms |
-| Min | 136.90 ms |
-| Max | 171.10 ms |
+| Mean | 104.81 ms |
+| Std | 9.42 ms |
+| Median | 104.71 ms |
+| Min | 89.59 ms |
+| Max | 122.16 ms |
 
 ### Overhead
 
 | Metric | Value |
 |--------|-------|
-| IPC overhead (mean) | +18.54 ms |
-| Ratio | 1.14x |
+| IPC overhead (mean) | +29.76 ms |
+| Ratio | 1.40x |
 
 ## Analysis
 
@@ -56,32 +56,32 @@ Each direct `env.step()` call involves three Selenium operations:
 
 1. `driver.get(new_url)` -- navigate Chrome to the new JSON-encoded Neuroglancer URL
 2. `driver.execute_script(...)` -- read `viewer.state` from the page
-3. `driver.execute_cdp_cmd("Page.captureScreenshot", ...)` -- capture a JPEG screenshot via CDP, then decode into a numpy array
+3. `driver.execute_cdp_cmd("Page.captureScreenshot", ...)` -- capture a JPEG screenshot via CDP
 
-These account for the ~132 ms baseline. The IPC path adds ~19 ms on top, which breaks down into:
+These account for the ~75 ms baseline. The IPC path adds ~30 ms on top, which breaks down into:
 
 | Source | Estimated Cost |
 |--------|---------------|
 | `msgpack.packb` (action serialization) + file write + `os.rename` | ~1-2 ms |
-| Server-side busy-poll latency (`read_actions`) | ~1-3 ms |
-| `pickle.dump` (observation serialization, numpy array) | ~3-5 ms |
-| Client-side busy-poll latency (`read_observations`) | ~1-3 ms |
-| `pickle.load` (observation deserialization) | ~3-5 ms |
-| GPFS filesystem overhead (4 file operations per round-trip) | ~3-5 ms |
+| Server-side busy-poll latency (`read_actions`) | ~1-5 ms |
+| `pickle.dump` (observation serialization, includes PIL Image) | ~5-10 ms |
+| Client-side busy-poll latency (`read_observations`) | ~1-5 ms |
+| `pickle.load` (observation deserialization) | ~5-10 ms |
+| GPFS filesystem overhead (4 file operations per round-trip) | ~5-10 ms |
 
-The observation payload is dominated by the screenshot (H×W×3 RGB numpy array from the ~1800×900 frame), making pickle serialization/deserialization the largest component of the IPC cost. The raw contiguous buffer of a numpy array pickles efficiently.
+The observation payload is significantly larger than the action payload because it contains a full PIL Image (~1800x900 JPEG decoded into memory), making pickle serialization/deserialization the dominant IPC cost.
 
 ### Variance
 
-Both tests show moderate variance (std ~11-12 ms). Chrome's rendering pipeline (`--headless=new` with Vulkan/ANGLE) has a somewhat non-deterministic first-paint time per navigation, which dominates the jitter. IPC variance (11.02 ms) is slightly *lower* than direct (11.98 ms) -- the filesystem round-trip is deterministic, so the IPC test inherits its jitter almost entirely from the Chrome step underneath it.
+Both tests show low variance (std ~6-9 ms), confirming that the measurements are stable. The slightly higher variance in the IPC test is expected due to GPFS I/O jitter and busy-poll scheduling non-determinism.
 
 ### Conclusion
 
-The `FilesystemProtocol` introduces a **~19 ms (1.14x) overhead** per step relative to direct in-process calls. Since `env.step()` is dominated by Chrome rendering (~132 ms), the IPC layer accounts for only ~12% of total loop time -- confirming the multi-process architecture is a cheap way to separate the Chrome environment from the RL controller, a requirement for scaling to multiple agents or running the model on a different node.
+The `FilesystemProtocol` introduces a **~30 ms (1.4x) overhead** per step relative to direct in-process calls. Given that a single `env.step()` is dominated by Chrome rendering (~75 ms), the IPC cost is a minor fraction of the total loop time. This overhead is acceptable for the multi-process architecture, which enables separating the Chrome environment from the RL controller -- a requirement for scaling to multiple agents or running the model on a different node.
 
 # Cross-Node Latency Analysis
 
-The same-node tests above run both processes on a single machine with local GPFS access. In a real training setup, the RL model (client) runs on a GPU compute node while the Neuroglancer environment (server) runs on a separate node. To measure the additional cost of cross-node GPFS I/O, we run two more settings where the client is submitted to a compute node via `sbatch` and the server remains on the login node (della-gpu).
+The same-node tests above run both processes on a single machine with local GPFS access. In a real training setup, the RL model (client) runs on a GPU compute node while the Neuroglancer environment (server) runs on a separate node. To measure the additional cost of cross-node GPFS I/O, we run two more settings where the client is submitted to a compute node via `sbatch` and the server remains on the login node.
 
 ## Setup
 
@@ -97,76 +97,47 @@ The same-node tests above run both processes on a single machine with local GPFS
 
 ### Naive File IPC (cross-node)
 
-Client on della-h12n8.
-
 | Metric | Value |
 |--------|-------|
-| Mean | 161.41 ms |
-| Std | 12.97 ms |
-| Median | 161.10 ms |
-| Min | 132.56 ms |
-| Max | 178.72 ms |
-| Read/write conflicts | 0 |
+| Mean | 118.79 ms |
+| Std | 5.49 ms |
+| Median | 119.04 ms |
+| Min | 107.29 ms |
+| Max | 127.04 ms |
 
 ### Communication IPC (cross-node)
 
-Client on della-h17n13.
-
 | Metric | Value |
 |--------|-------|
-| Mean | 159.17 ms |
-| Std | 10.18 ms |
-| Median | 160.51 ms |
-| Min | 140.01 ms |
-| Max | 172.89 ms |
+| Mean | 131.18 ms |
+| Std | 9.42 ms |
+| Median | 133.76 ms |
+| Min | 110.98 ms |
+| Max | 143.15 ms |
 
 ## Full Comparison
 
 | # | Setting | Mean | Std | Overhead vs Direct |
 |---|---------|------|-----|--------------------|
-| 1 | Direct (1 process, same node) | 132.07 ms | 11.98 ms | -- (baseline) |
-| 2 | Communication IPC (2 processes, same node) | 150.62 ms | 11.02 ms | +18.54 ms (1.14x) |
-| 3 | Naive file IPC (2 processes, cross-node) | 161.41 ms | 12.97 ms | +29.34 ms (1.22x) |
-| 4 | Communication IPC (2 processes, cross-node) | 159.17 ms | 10.18 ms | +27.10 ms (1.21x) |
+| 1 | Direct (1 process, same node) | 75.05 ms | 6.32 ms | -- (baseline) |
+| 2 | Naive file IPC (2 processes, cross-node) | 118.79 ms | 5.49 ms | +43.74 ms (1.58x) |
+| 3 | Communication IPC (2 processes, same node) | 104.81 ms | 9.42 ms | +29.76 ms (1.40x) |
+| 4 | Communication IPC (2 processes, cross-node) | 131.18 ms | 9.42 ms | +56.13 ms (1.75x) |
 
 ## Analysis
 
-**Cross-node GPFS cost (setting 2 vs 4):** Moving the Communication IPC from same-node to cross-node adds ~9 ms. This is the pure network + GPFS metadata propagation overhead -- the time for a file written on one node to become visible and readable on another.
+**Cross-node GPFS cost (setting 3 vs 4):** Moving the Communication IPC from same-node to cross-node adds ~26 ms. This is the pure network + GPFS metadata propagation overhead -- the time for a file written on one node to become visible and readable on another.
 
-**Communication vs Naive on cross-node (setting 3 vs 4):** Communication is effectively the same speed as Naive (159.17 ms vs 161.41 ms, a 2 ms gap that is within measurement noise, and in the opposite direction from what you might expect given the protocol's extra work). **The Communication protocol no longer adds meaningful latency over the raw-pickle approach, even on GPFS.**
+**Communication protocol cost (setting 2 vs 4):** Naive is ~12 ms faster than Communication on the same cross-node topology. The difference comes from the protocol's extra work per round-trip: msgpack encoding for actions, and two `os.rename` operations (atomic swap pattern) instead of a single `os.remove`. On GPFS, rename is a heavier metadata operation than remove.
 
-This is a notable change from earlier runs (when observations were PIL Images and Communication was ~12 ms slower than Naive), and the reason is almost entirely the screenshot format change. The observation payload is dominated by the Neuroglancer frame; with the upstream refactor it is now a raw `numpy.ndarray` instead of a `PIL.Image`, and that shifts the per-step cost structure:
+**Naive variance:** Naive shows the lowest std (5.49 ms) despite lacking atomicity, because in a sequential two-party exchange there is no true concurrent access -- the client only reads after the server finishes writing, and vice versa. Read/write conflicts would appear under higher concurrency or GPFS cache inconsistency, but were not observed in this 10-round test.
 
-| Cost component | Old (PIL) | New (numpy) | Why it changed |
-|---|---|---|---|
-| `pickle.dump` (observation) | ~5-10 ms | ~3-5 ms | PIL's `__reduce__` goes through `tobytes()` + re-encodes mode/palette/info; numpy dumps the raw contiguous buffer plus a small header. |
-| `pickle.load` (observation) | ~5-10 ms | ~3-5 ms | Same reason in reverse -- PIL rebuilds an `Image` object; numpy restores a buffer view. |
-| `msgpack.packb` (action, 17 floats) | ~0.5 ms | ~0.5 ms | Unchanged. |
-| `os.rename` vs `os.remove` (metadata op) | ~3-8 ms delta on GPFS | ~3-8 ms delta on GPFS | Unchanged. |
-
-Previously the serialization itself was ~15-20 ms per round-trip, so the extra rename on top of that was clearly visible. Now serialization has shrunk to ~6-10 ms, which leaves the per-round-trip budget dominated by the Chrome step (~132 ms) and cross-node GPFS visibility (~10-15 ms). The `os.rename` vs `os.remove` delta gets drowned out by the variance of those larger terms -- under measurement noise, Communication and Naive are indistinguishable in mean latency.
-
-A secondary factor: `NGLServer.process_actions()` was simplified in the upstream sync (fewer `print` calls per step, and `start_session` now waits for `viewer.isReady()` at startup so per-step calls don't pay for warm-up rendering). Some of the old Communication overhead was log I/O, not protocol work.
-
-**Atomicity comes essentially for free now.** The Naive protocol only "wins" by skipping atomic rename and never retrying on torn reads. In our first Naive run we observed 1 read/write conflict in 10 rounds, adding ~30 ms of jitter to that round; the second run saw 0. Since Communication is now no slower in the mean, there is no performance reason to prefer Naive -- its lack of atomicity is pure risk with no payoff.
-
-**Naive variance (12.97 ms) is now slightly higher than Communication (10.18 ms):** the opposite of the earlier result. This is consistent with the conflict behavior -- even without a caught conflict in run 2, the lack of atomic handoff leaves more room for GPFS cache-visibility jitter than the rename-based swap.
-
-**Total overhead budget:** In the realistic cross-node Communication setting (#4), the ~27 ms overhead (1.21x) decomposes roughly as:
+**Total overhead budget:** In the realistic cross-node Communication setting (#4), the ~56 ms overhead (1.75x) decomposes roughly as:
 
 | Component | Estimated Cost |
 |-----------|---------------|
-| Serialization (msgpack + pickle + unpickle, numpy observation) | ~6-10 ms |
-| GPFS cross-node file visibility (2 round-trips) | ~10-15 ms |
-| Polling + `os.rename` metadata operations | ~3-5 ms |
+| Serialization (msgpack + pickle + depickle) | ~15-20 ms |
+| GPFS cross-node file visibility (2 round-trips) | ~25-30 ms |
+| Polling + `os.rename` metadata operations | ~5-10 ms |
 
-The `env.step()` Chrome rendering (~132 ms) remains the dominant cost. The total per-step latency of ~159 ms supports ~6.3 steps/second, which is sufficient for RL training loops where model inference adds further per-step time.
-
-## Potential Optimizations
-
-If the overhead becomes a concern at scale:
-
-1. **Sockets instead of filesystem** -- The upstream repo already includes a `SocketProtocol` class (TCP, length-prefixed msgpack/pickle). Swapping in sockets would eliminate GPFS metadata round-trips and is the natural next step once multiple agents are run.
-2. **Shared memory (same-node only)** -- For same-node multi-process setups, `multiprocessing.shared_memory` would eliminate the ~4 ms local filesystem round-trip; not applicable cross-node.
-3. **Add `time.sleep()` to all polling loops** -- The current busy-poll burns CPU cycles; a 1 ms sleep (already present on the cross-node client) reduces CPU usage with negligible latency increase.
-4. **Compress the screenshot before serialization** -- The numpy buffer is still ~4.9 MB for a 1800×900 RGB frame. Sending JPEG bytes (and decoding on the client only when actually needed by the model) would cut serialization cost further, but this only helps if the model does not need every pixel every step.
+The env.step() Chrome rendering (~75 ms) remains the dominant cost. The total per-step latency of ~131 ms supports ~7.6 steps/second, which is sufficient for RL training loops where model inference adds further per-step time.
