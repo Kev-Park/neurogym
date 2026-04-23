@@ -58,9 +58,8 @@ class Environment:
         ]
         if self.headless:
             args += [
-                "--use-gl=angle",
-                "--use-angle=vulkan",
-                "--enable-features=Vulkan",
+                "--disable-gpu",
+                "--use-gl=swiftshader",
                 "--enable-unsafe-swiftshader",
             ]
         return args
