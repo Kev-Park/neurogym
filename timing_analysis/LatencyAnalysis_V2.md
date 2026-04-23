@@ -161,12 +161,3 @@ A secondary factor: `NGLServer.process_actions()` was simplified in the upstream
 | Polling + `os.rename` metadata operations | ~3-5 ms |
 
 The `env.step()` Chrome rendering (~132 ms) remains the dominant cost. The total per-step latency of ~159 ms supports ~6.3 steps/second, which is sufficient for RL training loops where model inference adds further per-step time.
-
-## Potential Optimizations
-
-If the overhead becomes a concern at scale:
-
-1. **Sockets instead of filesystem** -- The upstream repo already includes a `SocketProtocol` class (TCP, length-prefixed msgpack/pickle). Swapping in sockets would eliminate GPFS metadata round-trips and is the natural next step once multiple agents are run.
-2. **Shared memory (same-node only)** -- For same-node multi-process setups, `multiprocessing.shared_memory` would eliminate the ~4 ms local filesystem round-trip; not applicable cross-node.
-3. **Add `time.sleep()` to all polling loops** -- The current busy-poll burns CPU cycles; a 1 ms sleep (already present on the cross-node client) reduces CPU usage with negligible latency increase.
-4. **Compress the screenshot before serialization** -- The numpy buffer is still ~4.9 MB for a 1800×900 RGB frame. Sending JPEG bytes (and decoding on the client only when actually needed by the model) would cut serialization cost further, but this only helps if the model does not need every pixel every step.
