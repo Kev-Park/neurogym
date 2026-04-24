@@ -4,6 +4,7 @@ Standalone full Neuroglancer environment. Handles sending actions, getting state
 
 """------------Imports-------------"""
 from .utils.utils import parse_action
+import platform
 import time, json, copy, os, argparse, PIL, io, urllib
 from PIL import Image, ImageDraw
 from .utils.maths import quaternion_to_euler, euler_to_quaternion
@@ -39,6 +40,34 @@ class Environment:
         self.window_width = self.config['window_width']
         self.window_height = self.config['window_height']
 
+        self._renderer = "gpu"
+        self._playwright = None
+        self.browser = None
+        self.page = None
+        self.action_handler = None
+
+    def _build_launch_args(self) -> list:
+        args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        if self.headless:
+            if self._renderer == "cpu":
+                args += ["--use-gl=swiftshader", "--enable-unsafe-swiftshader"]
+            else:  # "gpu" — auto-detect OS
+                os_name = platform.system()
+                if os_name == "Darwin":
+                    args += ["--use-gl=angle", "--use-angle=metal"]
+                elif os_name == "Windows":
+                    args += ["--use-gl=angle", "--use-angle=d3d11"]
+                else:  # Linux
+                    args += ["--use-gl=angle", "--use-angle=vulkan", "--enable-features=Vulkan", "--enable-unsafe-swiftshader"]
+        return args
+
+    def _ensure_browser_launched(self) -> None:
+        if self.browser is not None:
+            return
         try:
             self._playwright = sync_playwright().start()
             self.browser = self._playwright.chromium.launch(
@@ -50,29 +79,19 @@ class Environment:
         except Exception as e:
             raise Exception(f"Error launching Playwright Chromium: {e}. Ensure 'playwright install chromium' has been run.")
 
-    def _build_launch_args(self) -> list:
-        args = [
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ]
-        if self.headless:
-            args += [
-                "--disable-gpu",
-                "--use-gl=swiftshader",
-                "--enable-unsafe-swiftshader",
-            ]
-        return args
-    
-    def start_session(self, start_url:str=None, login:bool=False, **options:dict)-> None:
+    def start_session(self, start_url:str=None, login:bool=False, renderer:str="gpu", **options:dict)-> None:
         """
         Starts the Neuroglancer session, logging into Google and then opening Neuroglancer.
         Args:
             start_url: The URL to start the session on. If not specified, the default Neuroglancer session will be used.
+            renderer: GL backend to use when headless. "gpu" (default) auto-selects the best GPU backend for
+                the current OS (Vulkan on Linux, Metal on macOS, D3D11 on Windows). Pass "cpu" to use
+                SwiftShader (software rendering, works everywhere but slower).
             **options: Additional options to pass to the session. May include image_path, euler_angles, resize, add_mouse, fast (see docs for more info and default behavior).
             login: Whether to log into Google before starting the session.
         """
-
+        self._renderer = renderer
+        self._ensure_browser_launched()
         self.options = options
 
         if login:
@@ -83,10 +102,16 @@ class Environment:
         """
         Ends the Neuroglancer session by closing the browser.
         """
-
-        self.page.close()
-        self.browser.close()
-        self._playwright.stop()
+        if self.page is not None:
+            self.page.close()
+        if self.browser is not None:
+            self.browser.close()
+        if self._playwright is not None:
+            self._playwright.stop()
+        self.page = None
+        self.browser = None
+        self._playwright = None
+        self.action_handler = None
 
     def google_login(self)-> None:
         """
@@ -113,6 +138,7 @@ class Environment:
         Args:
             url: The URL to start the session on. If not specified, the default Neuroglancer session will be used.
         """
+        self._ensure_browser_launched()
         if self.verbose:
             print("Starting Neuroglancer session...")
         if url is not None:
