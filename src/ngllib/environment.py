@@ -1,0 +1,625 @@
+"""Gymnasium-compliant RL environment driving Neuroglancer via Playwright."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import io
+import json
+import logging
+import platform
+import sys
+import time
+import urllib.parse
+from typing import Any, Callable, Literal
+
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+from PIL import Image
+from playwright.sync_api import sync_playwright
+
+from .errors import BrowserError, ProviderError
+from .providers import NglState, StateProvider
+from .utils.geom import euler_to_quaternion, quaternion_to_euler
+from .utils.MouseActionHandler import MouseActionHandler
+
+logger = logging.getLogger(__name__)
+
+# Public type aliases for the factory signatures.
+RewardFactory = Callable[[dict[str, Any]], Callable[..., float]]
+TerminationFactory = Callable[[dict[str, Any]], Callable[..., bool]]
+
+
+def _noop_reward_factory(task_info: dict[str, Any]):
+    return lambda obs, action, prev_obs, terminated: 0.0
+
+
+def _noop_termination_factory(task_info: dict[str, Any]):
+    return lambda obs, action, prev_obs: False
+
+
+class Environment(gym.Env):
+    """RL environment that drives a headless Neuroglancer viewer.
+
+    Browser launches lazily on the first `reset()`; `__init__` only builds
+    spaces and loads config.
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        *,
+        # --- Browser & rendering -------------------------------------------------
+        headless: bool = True,
+        renderer: Literal["gpu", "cpu"] = "gpu",
+        window_size: tuple[int, int] = (1800, 900),
+        image_size: tuple[int, int] | None = None,
+        screenshot_format: Literal["jpeg", "png"] = "jpeg",
+        draw_mouse: bool = False,
+        left_pane: bool = False,
+        right_pane: bool = True,
+        # --- Obs/action representation (locks spaces at construction) ------------
+        orientation: Literal["quaternion", "euler"] = "quaternion",
+        # --- Task hooks ----------------------------------------------------------
+        reset_state_provider: StateProvider | None = None,
+        reward_factory: RewardFactory | None = None,
+        termination_factory: TerminationFactory | None = None,
+        # --- Self-healing (sensible-on defaults; None / 0 disables) --------------
+        retry_on_reset: int = 3,
+        browser_restart_every: int | None = 90,
+        # --- Deployment defaults -------------------------------------------------
+        config_path: str | None = None,
+        verbose: bool = False,
+    ):
+        super().__init__()
+
+        if not (left_pane or right_pane):
+            raise ValueError("At least one of `left_pane` or `right_pane` must be True.")
+        if orientation not in ("quaternion", "euler"):
+            raise ValueError(
+                f"`orientation` must be 'quaternion' or 'euler'; got {orientation!r}"
+            )
+        if renderer not in ("gpu", "cpu"):
+            raise ValueError(f"`renderer` must be 'gpu' or 'cpu'; got {renderer!r}")
+        if screenshot_format not in ("jpeg", "png"):
+            raise ValueError(
+                f"`screenshot_format` must be 'jpeg' or 'png'; got {screenshot_format!r}"
+            )
+
+        # Store config
+        self.headless = headless
+        self.renderer = renderer
+        self.window_size = window_size
+        self.image_size = image_size
+        self.screenshot_format = screenshot_format
+        self.draw_mouse = draw_mouse
+        self.left_pane = left_pane
+        self.right_pane = right_pane
+        self.orientation = orientation
+        self.verbose = verbose
+        self.retry_on_reset = retry_on_reset
+        self.browser_restart_every = browser_restart_every
+
+        self.config = self._load_config(config_path)
+        self._image_shape = self._compute_image_shape(
+            window_size, left_pane, right_pane, image_size
+        )
+
+        # Task hooks (default no-ops if unspecified)
+        self._reset_state_provider = reset_state_provider
+        self._reward_factory = reward_factory or _noop_reward_factory
+        self._termination_factory = termination_factory or _noop_termination_factory
+
+        # Spaces — locked at construction by orientation + image_shape
+        self.observation_space = self._build_observation_space()
+        self.action_space = self._build_action_space()
+
+        # Browser state (lazy — launched on first reset)
+        self._playwright = None
+        self.browser = None
+        self.page = None
+        self._action_handler: MouseActionHandler | None = None
+
+        # Episode state
+        self._rng: np.random.Generator = np.random.default_rng()
+        self._episode_count = 0
+        self._prev_obs: dict[str, Any] | None = None
+        self._prev_json: dict[str, Any] | None = None
+        self._task_info: dict[str, Any] = {}
+        self._reward_fn: Callable | None = None
+        self._terminated_fn: Callable | None = None
+
+    # =========================================================================
+    # Gymnasium public API
+    # =========================================================================
+
+    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        super().reset(seed=seed)
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        self._episode_count += 1
+        options = options or {}
+
+        if (
+            self.browser_restart_every is not None
+            and self._episode_count > 1
+            and (self._episode_count - 1) % self.browser_restart_every == 0
+        ):
+            self._restart_browser()
+
+        self._ensure_browser_launched()
+        start_state, task_info = self._resolve_reset_state(options)
+
+        try:
+            self._reward_fn = self._reward_factory(task_info)
+            self._terminated_fn = self._termination_factory(task_info)
+        except Exception as e:
+            raise ProviderError(f"factory raised at reset: {e}") from e
+        self._task_info = task_info
+
+        self._navigate_with_retry(start_state)
+
+        obs, json_state = self._gather_observation()
+        self._prev_obs = obs
+        self._prev_json = json_state
+
+        info = {
+            "task_info": task_info,
+            "json_state": json_state,
+            "step": 0,
+        }
+        return obs, info
+
+    def step(self, action):
+        self._apply_actions(action)
+        obs, json_state = self._gather_observation()
+
+        # Termination runs first so the reward fn can read `terminated` for terminal bonuses.
+        try:
+            terminated = bool(self._terminated_fn(obs, action, self._prev_obs))
+        except Exception as e:
+            raise ProviderError(f"termination_function raised: {e}") from e
+        try:
+            reward = float(self._reward_fn(obs, action, self._prev_obs, terminated))
+        except Exception as e:
+            raise ProviderError(f"reward_function raised: {e}") from e
+
+        truncated = False  # TimeLimit wrapper handles step-count truncation.
+
+        info = {
+            "task_info": self._task_info,
+            "json_state": json_state,
+        }
+
+        self._prev_obs = obs
+        self._prev_json = json_state
+        return obs, reward, terminated, truncated, info
+
+    def close(self):
+        """Tear down the browser. Idempotent."""
+        try:
+            if self.page is not None:
+                self.page.close()
+        except Exception:
+            pass
+        try:
+            if self.browser is not None:
+                self.browser.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright is not None:
+                self._playwright.stop()
+        except Exception:
+            pass
+        self.page = None
+        self.browser = None
+        self._playwright = None
+        self._action_handler = None
+
+    # =========================================================================
+    # Internal: config & space construction
+    # =========================================================================
+
+    @staticmethod
+    def _load_config(config_path: str | None) -> dict[str, Any]:
+        if config_path is None:
+            from importlib.resources import files
+            return json.loads(files("ngllib").joinpath("config.json").read_text())
+        with open(config_path) as f:
+            return json.load(f)
+
+    @staticmethod
+    def _compute_image_shape(
+        window_size: tuple[int, int],
+        left_pane: bool,
+        right_pane: bool,
+        image_size: tuple[int, int] | None,
+    ) -> tuple[int, int, int]:
+        # numpy shape: (H, W, C). image_size kwarg is (W, H) for user-friendliness.
+        if image_size is not None:
+            iw, ih = image_size
+            return (ih, iw, 3)
+        W, H = window_size
+        if left_pane and right_pane:
+            return (H, W, 3)
+        return (H, W // 2, 3)  # single-pane crop
+
+    def _build_observation_space(self) -> spaces.Dict:
+        orient_dim = 3 if self.orientation == "euler" else 4
+        return spaces.Dict(
+            {
+                "position": spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
+                ),
+                "xs_scale": spaces.Box(
+                    low=0.0, high=np.inf, shape=(1,), dtype=np.float32
+                ),
+                "orientation": spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(orient_dim,), dtype=np.float32
+                ),
+                "proj_scale": spaces.Box(
+                    low=0.0, high=np.inf, shape=(1,), dtype=np.float32
+                ),
+                "image": spaces.Box(
+                    low=0, high=255, shape=self._image_shape, dtype=np.uint8
+                ),
+            }
+        )
+
+    def _build_action_space(self) -> spaces.Dict:
+        W, H = self.window_size
+        orient_dim = 3 if self.orientation == "euler" else 4
+        return spaces.Dict(
+            {
+                "action_type": spaces.Discrete(4),  # 0=left, 1=right, 2=double, 3=edit_state
+                "mouse_xy": spaces.Box(
+                    low=np.array([0, 0], dtype=np.float32),
+                    high=np.array([W, H], dtype=np.float32),
+                    dtype=np.float32,
+                ),
+                "modifiers": spaces.MultiBinary(3),  # [shift, ctrl, alt]
+                "delta_pos": spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
+                ),
+                "delta_xs_scale": spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32
+                ),
+                "delta_orient": spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(orient_dim,), dtype=np.float32
+                ),
+                "delta_proj_scale": spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32
+                ),
+            }
+        )
+
+    # =========================================================================
+    # Internal: browser lifecycle
+    # =========================================================================
+
+    def _build_launch_args(self) -> list[str]:
+        args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        if self.headless:
+            if self.renderer == "cpu":
+                args += ["--use-gl=swiftshader", "--enable-unsafe-swiftshader"]
+            else:  # "gpu" — auto-select per OS
+                os_name = platform.system()
+                if os_name == "Darwin":
+                    args += ["--use-gl=angle", "--use-angle=metal"]
+                elif os_name == "Windows":
+                    args += ["--use-gl=angle", "--use-angle=d3d11"]
+                else:  # Linux
+                    args += [
+                        "--use-gl=angle",
+                        "--use-angle=vulkan",
+                        "--enable-features=Vulkan",
+                        "--enable-unsafe-swiftshader",
+                    ]
+        return args
+
+    def _ensure_browser_launched(self) -> None:
+        if self.browser is not None:
+            return
+        # Playwright subprocess-spawns Chromium via asyncio, which on Windows
+        # requires WindowsProactorEventLoopPolicy. IPython 7+ swaps in the
+        # Selector policy globally; restore Proactor here when that's happened.
+        if sys.platform == "win32":
+            current = asyncio.get_event_loop_policy()
+            if not isinstance(current, asyncio.WindowsProactorEventLoopPolicy):
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        try:
+            self._playwright = sync_playwright().start()
+            W, H = self.window_size
+            self.browser = self._playwright.chromium.launch(
+                headless=self.headless,
+                args=self._build_launch_args(),
+            )
+            self.page = self.browser.new_page(viewport={"width": W, "height": H})
+            self._action_handler = MouseActionHandler(self.page)
+        except Exception as e:
+            detail = str(e) or repr(e)
+            raise BrowserError(
+                f"failed to launch Chromium: {type(e).__name__}: {detail}. "
+                "Ensure 'playwright install chromium' has been run in this venv."
+            ) from e
+
+    def _restart_browser(self) -> None:
+        logger.info("periodic browser restart at episode %d", self._episode_count)
+        self.close()
+        self._ensure_browser_launched()
+
+    # =========================================================================
+    # Internal: reset / state navigation
+    # =========================================================================
+
+    def _resolve_reset_state(
+        self, options: dict[str, Any]
+    ) -> tuple[NglState | str | None, dict[str, Any]]:
+        """Implement the three reset-override forms."""
+        if "state" in options:
+            start_state = options["state"]
+            if "task_info" in options:
+                task_info = options["task_info"]
+            elif self._reset_state_provider is not None:
+                try:
+                    task_info = self._reset_state_provider.task_info_from_state(start_state)
+                except Exception as e:
+                    raise ProviderError(
+                        f"provider.task_info_from_state raised: {e}"
+                    ) from e
+            else:
+                task_info = {}
+            return start_state, task_info
+
+        if self._reset_state_provider is not None:
+            try:
+                start_state, task_info = self._reset_state_provider(self._rng, options)
+            except Exception as e:
+                raise ProviderError(f"reset_state_provider raised: {e}") from e
+            return start_state, task_info
+
+        # No provider, no override: use the default URL from config.
+        return None, {}
+
+    def _navigate_with_retry(self, start_state) -> None:
+        """Navigate with retry per self-healing config. Restarts the browser between attempts."""
+        last_err: Exception | None = None
+        for attempt in range(max(1, self.retry_on_reset + 1)):
+            try:
+                self._navigate(start_state)
+                return
+            except BrowserError:
+                # Launch failures aren't retryable through restart.
+                raise
+            except Exception as e:
+                last_err = e
+                logger.warning("reset attempt %d failed: %s", attempt + 1, e)
+                if attempt < self.retry_on_reset:
+                    try:
+                        self._restart_browser()
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+        raise BrowserError(
+            f"reset failed after {self.retry_on_reset + 1} attempts: {last_err}"
+        )
+
+    def _navigate(self, start_state) -> None:
+        """Resolve start_state to a URL, navigate, and wait for viewer ready."""
+        if start_state is None:
+            url = self.config.get("default_ngl_start_url")
+            if not url:
+                raise ProviderError(
+                    "No start state provided and config has no 'default_ngl_start_url'"
+                )
+        elif isinstance(start_state, str):
+            url = start_state
+        elif isinstance(start_state, dict):
+            url = self._state_dict_to_url(start_state)
+        else:
+            raise ProviderError(
+                "start_state must be None, a URL str, or an NglState dict; "
+                f"got {type(start_state).__name__}"
+            )
+
+        if self.verbose:
+            print(f"Navigating to: {url[:120]}{'...' if len(url) > 120 else ''}")
+        self.page.goto(url)
+
+        # Wait for viewer to initialize.
+        for _ in range(60):
+            if self._get_json_state_raw() is not None:
+                break
+            time.sleep(1)
+        # Wait for chunks to load + rendering to complete.
+        for _ in range(200):
+            try:
+                ready = self.page.evaluate(
+                    "() => !!(window.viewer && window.viewer.isReady && window.viewer.isReady())"
+                )
+                if ready:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+    def _state_dict_to_url(self, state: NglState) -> str:
+        """Overlay NglState onto the default URL's parsed state. Use `state["extra"]`
+        for fields not first-class above; pass a URL string to bypass merging."""
+        base_url = self.config.get("default_ngl_start_url", "")
+        if "#!" in base_url:
+            prefix, encoded = base_url.split("#!", 1)
+            try:
+                base_state = json.loads(urllib.parse.unquote(encoded))
+            except Exception:
+                base_state = {}
+        else:
+            prefix = "https://neuroglancer-demo.appspot.com/"
+            base_state = {}
+
+        merged = copy.deepcopy(base_state)
+        if "extra" in state and isinstance(state["extra"], dict):
+            merged.update(state["extra"])
+        if "position" in state:
+            merged["position"] = list(state["position"])
+        if "crossSectionScale" in state:
+            merged["crossSectionScale"] = float(state["crossSectionScale"])
+        if "projectionOrientation" in state:
+            merged["projectionOrientation"] = list(state["projectionOrientation"])
+        if "projectionScale" in state:
+            merged["projectionScale"] = float(state["projectionScale"])
+        if "segments" in state and "layers" in merged:
+            for layer in merged["layers"]:
+                if layer.get("type") == "segmentation":
+                    layer["segments"] = list(state["segments"])
+                    break
+
+        return prefix + "#!" + urllib.parse.quote(json.dumps(merged))
+
+    # =========================================================================
+    # Internal: observation construction
+    # =========================================================================
+
+    def _gather_observation(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        json_state = self._get_json_state()
+        image = self._get_screenshot()
+        image = self._crop_panes(image)
+        if self.image_size is not None:
+            image = self._resize_image(image, self.image_size)
+
+        position = np.asarray(json_state["position"], dtype=np.float32)
+        xs_scale = np.asarray([json_state["crossSectionScale"]], dtype=np.float32)
+        orient_raw = json_state.get("projectionOrientation", [0.0, 0.0, 0.0, 1.0])
+        if self.orientation == "euler":
+            orient = np.asarray(quaternion_to_euler(orient_raw), dtype=np.float32)
+        else:
+            orient = np.asarray(orient_raw, dtype=np.float32)
+        proj_scale = np.asarray([json_state["projectionScale"]], dtype=np.float32)
+
+        obs = {
+            "position": position,
+            "xs_scale": xs_scale,
+            "orientation": orient,
+            "proj_scale": proj_scale,
+            "image": image,
+        }
+        return obs, json_state
+
+    def _crop_panes(self, image: np.ndarray) -> np.ndarray:
+        if self.left_pane and self.right_pane:
+            return image
+        mid = image.shape[1] // 2
+        return image[:, mid:] if self.right_pane else image[:, :mid]
+
+    @staticmethod
+    def _resize_image(image: np.ndarray, target_wh: tuple[int, int]) -> np.ndarray:
+        pil = Image.fromarray(image)
+        pil = pil.resize(target_wh)
+        return np.asarray(pil)
+
+    def _get_json_state_raw(self) -> str | None:
+        try:
+            return self.page.evaluate(
+                "() => (window.viewer && window.viewer.state) ? "
+                "JSON.stringify(window.viewer.state) : null"
+            )
+        except Exception:
+            return None
+
+    def _get_json_state(self) -> dict[str, Any]:
+        raw = self._get_json_state_raw()
+        if raw is None:
+            raise BrowserError("could not read Neuroglancer viewer state from page")
+        state = json.loads(raw)
+        if "projectionOrientation" not in state:
+            state["projectionOrientation"] = [0.0, 0.0, 0.0, 1.0]
+        return state
+
+    def _get_screenshot(self) -> np.ndarray:
+        if self.screenshot_format == "jpeg":
+            data = self.page.screenshot(type="jpeg", quality=85)
+        else:
+            data = self.page.screenshot()
+        pil = Image.open(io.BytesIO(data)).convert("RGB")
+        return np.asarray(pil)
+
+    # =========================================================================
+    # Internal: action application
+    # =========================================================================
+
+    def _apply_actions(self, action: dict[str, Any]) -> None:
+        action_type = int(action["action_type"])
+        if action_type in (0, 1, 2):
+            self._apply_click(action_type, action)
+        elif action_type == 3:
+            self._apply_state_edit(action)
+        else:
+            raise ValueError(
+                f"action_type must be 0, 1, 2, or 3; got {action_type}"
+            )
+
+    def _apply_click(self, action_type: int, action: dict[str, Any]) -> None:
+        x, y = (float(v) for v in action["mouse_xy"])
+        key_pressed = self._modifiers_to_str(action["modifiers"])
+        kind = {0: "left_click", 1: "right_click", 2: "double_click"}[action_type]
+        if self.verbose:
+            print(f"Click ({kind}) at ({x:.1f}, {y:.1f}) modifiers={key_pressed!r}")
+        self._action_handler.execute_click(x, y, kind, key_pressed)
+
+    def _apply_state_edit(self, action: dict[str, Any]) -> None:
+        if self._prev_json is None:
+            return  # haven't gathered initial state yet (shouldn't happen post-reset)
+        new_state = copy.deepcopy(self._prev_json)
+
+        dpos = action["delta_pos"]
+        new_state["position"][0] += float(dpos[0])
+        new_state["position"][1] += float(dpos[1])
+        new_state["position"][2] += float(dpos[2])
+        new_state["crossSectionScale"] += float(action["delta_xs_scale"][0])
+
+        d = action["delta_orient"]
+        if self.orientation == "euler":
+            old_euler = quaternion_to_euler(new_state["projectionOrientation"])
+            new_euler = [
+                old_euler[0] + float(d[0]),
+                old_euler[1] + float(d[1]),
+                old_euler[2] + float(d[2]),
+            ]
+            new_state["projectionOrientation"] = euler_to_quaternion(new_euler)
+        else:
+            for i in range(4):
+                new_state["projectionOrientation"][i] += float(d[i])
+
+        new_state["projectionScale"] = min(
+            500_000,
+            new_state["projectionScale"] + float(action["delta_proj_scale"][0]),
+        )
+
+        self._change_json_state_url(new_state)
+
+        if self.verbose:
+            print(f"State edit applied: pos={new_state['position']}")
+
+    @staticmethod
+    def _modifiers_to_str(modifiers) -> str:
+        parts = []
+        if int(modifiers[0]):
+            parts.append("Shift")
+        if int(modifiers[1]):
+            parts.append("Ctrl")
+        if int(modifiers[2]):
+            parts.append("Alt")
+        return ", ".join(parts)
+
+    def _change_json_state_url(self, new_state: dict[str, Any]) -> None:
+        serialized = json.dumps(new_state)
+        encoded = urllib.parse.quote(serialized)
+        url = f"https://neuroglancer-demo.appspot.com/#!{encoded}"
+        self.page.goto(url)

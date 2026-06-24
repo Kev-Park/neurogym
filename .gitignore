@@ -1,2 +1,38 @@
-ngllib.egg-info/
+# Python bytecode / caches
 **/__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv (library: lockfile is not committed)
+uv.lock
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+
+# Claude Code workspace
+.claude/
+
+screenshots/
+screenshots_remote/
+
+# Untracked planning / design docs (kept out of the published repo by design)
+revamp.md
