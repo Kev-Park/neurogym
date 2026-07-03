@@ -127,6 +127,7 @@ class Environment(gym.Env):
         # Episode state
         self._rng: np.random.Generator = np.random.default_rng()
         self._episode_count = 0
+        self._needs_browser_restart = False  # set on step-time observation failure
         self._prev_obs: dict[str, Any] | None = None
         self._prev_json: dict[str, Any] | None = None
         self._task_info: dict[str, Any] = {}
@@ -144,11 +145,12 @@ class Environment(gym.Env):
         self._episode_count += 1
         options = options or {}
 
-        if (
+        if self._needs_browser_restart or (
             self.browser_restart_every is not None
             and self._episode_count > 1
             and (self._episode_count - 1) % self.browser_restart_every == 0
         ):
+            self._needs_browser_restart = False
             self._restart_browser()
 
         self._ensure_browser_launched()
@@ -178,7 +180,14 @@ class Environment(gym.Env):
 
     def step(self, action):
         self._apply_actions(action)
-        obs, json_state = self._gather_observation()
+        try:
+            obs, json_state = self._gather_observation()
+        except BrowserError:
+            # A persistently sick browser (viewer losing state fields) isn't
+            # healed by context recycling — escalate to a full browser restart
+            # on the next reset(), then re-raise for episode-level handling.
+            self._needs_browser_restart = True
+            raise
 
         # Termination runs first so the reward fn can read `terminated` for terminal bonuses.
         try:
