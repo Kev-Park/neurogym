@@ -69,6 +69,7 @@ class Environment(gym.Env):
         # --- Self-healing (sensible-on defaults; None / 0 disables) --------------
         retry_on_reset: int = 3,
         browser_restart_every: int | None = 90,
+        fresh_context_every_reset: bool = True,
         # --- Deployment defaults -------------------------------------------------
         config_path: str | None = None,
         verbose: bool = False,
@@ -101,6 +102,7 @@ class Environment(gym.Env):
         self.verbose = verbose
         self.retry_on_reset = retry_on_reset
         self.browser_restart_every = browser_restart_every
+        self.fresh_context_every_reset = fresh_context_every_reset
 
         self.config = self._load_config(config_path)
         self._image_shape = self._compute_image_shape(
@@ -150,6 +152,8 @@ class Environment(gym.Env):
             self._restart_browser()
 
         self._ensure_browser_launched()
+        if self.fresh_context_every_reset:
+            self._recycle_context()
         start_state, task_info = self._resolve_reset_state(options)
 
         try:
@@ -355,6 +359,32 @@ class Environment(gym.Env):
         self.close()
         self._ensure_browser_launched()
 
+    def _recycle_context(self) -> None:
+        """Fresh BrowserContext + Page (and HTTP-cache clear) for the episode.
+
+        Page-level state (JS heap, WebGL contexts, caches) accumulates across
+        episodes and steadily degrades step throughput on long runs; recycling
+        the context every reset keeps it flat. The periodic full browser
+        restart still handles browser-process-level leaks.
+        """
+        W, H = self.window_size
+        old = self.page.context if self.page is not None else None
+        context = self.browser.new_context(viewport={"width": W, "height": H})
+        page = context.new_page()
+        try:  # chromium-only CDP call; harmless to skip on failure
+            cdp = context.new_cdp_session(page)
+            cdp.send("Network.clearBrowserCache")
+            cdp.detach()
+        except Exception:
+            pass
+        self.page = page
+        self._action_handler = MouseActionHandler(page)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+
     # =========================================================================
     # Internal: reset / state navigation
     # =========================================================================
@@ -487,8 +517,21 @@ class Environment(gym.Env):
     # Internal: observation construction
     # =========================================================================
 
+    _REQUIRED_STATE_FIELDS = ("position", "crossSectionScale", "projectionScale")
+
     def _gather_observation(self) -> tuple[dict[str, Any], dict[str, Any]]:
         json_state = self._get_json_state()
+        # The viewer JSON can transiently omit fields mid-update (observed:
+        # `position` missing for a frame after an action). Re-read briefly
+        # before failing with a typed error instead of a raw KeyError.
+        for _ in range(3):
+            if all(k in json_state for k in self._REQUIRED_STATE_FIELDS):
+                break
+            time.sleep(0.1)
+            json_state = self._get_json_state()
+        else:
+            missing = sorted(set(self._REQUIRED_STATE_FIELDS) - set(json_state))
+            raise BrowserError(f"viewer state missing fields after retries: {missing}")
         image = self._get_screenshot()
         image = self._crop_panes(image)
         if self.image_size is not None:
