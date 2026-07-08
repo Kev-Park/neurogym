@@ -7,14 +7,17 @@ import copy
 import io
 import json
 import logging
+import os
 import platform
 import sys
+import threading
 import time
 import urllib.parse
 from typing import Any, Callable, Literal
 
 import gymnasium as gym
 import numpy as np
+import psutil
 from gymnasium import spaces
 from PIL import Image
 from playwright.sync_api import sync_playwright
@@ -29,6 +32,31 @@ logger = logging.getLogger(__name__)
 # Public type aliases for the factory signatures.
 RewardFactory = Callable[[dict[str, Any]], Callable[..., float]]
 TerminationFactory = Callable[[dict[str, Any]], Callable[..., bool]]
+
+
+class _BrowserWatchdog:
+    """Kills the browser process if a Playwright call hangs past `timeout_s`.
+
+    Playwright's sync API is thread-affine, so a hung call can't be cancelled
+    in-thread; killing Chrome from a timer thread makes the blocked call raise
+    immediately (legacy-proven). No-op when `timeout_s` is falsy.
+    """
+
+    def __init__(self, timeout_s: float | None, kill_fn: Callable[[], None]):
+        self.fired = False
+        self._timer: threading.Timer | None = None
+        if timeout_s:
+            def _fire():
+                self.fired = True
+                kill_fn()
+
+            self._timer = threading.Timer(timeout_s, _fire)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def cancel(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
 
 
 def _noop_reward_factory(task_info: dict[str, Any]):
@@ -70,6 +98,8 @@ class Environment(gym.Env):
         retry_on_reset: int = 3,
         browser_restart_every: int | None = 90,
         fresh_context_every_reset: bool = True,
+        step_timeout_s: float | None = 30.0,
+        reset_timeout_s: float | None = 240.0,
         # --- Deployment defaults -------------------------------------------------
         config_path: str | None = None,
         verbose: bool = False,
@@ -103,6 +133,9 @@ class Environment(gym.Env):
         self.retry_on_reset = retry_on_reset
         self.browser_restart_every = browser_restart_every
         self.fresh_context_every_reset = fresh_context_every_reset
+        self.step_timeout_s = step_timeout_s
+        self.reset_timeout_s = reset_timeout_s
+        self._chrome_pid: int | None = None
 
         self.config = self._load_config(config_path)
         self._image_shape = self._compute_image_shape(
@@ -179,8 +212,9 @@ class Environment(gym.Env):
         return obs, info
 
     def step(self, action):
-        self._apply_actions(action)
+        wd = self._watchdog(self.step_timeout_s)
         try:
+            self._apply_actions(action)
             obs, json_state = self._gather_observation()
         except BrowserError:
             # A persistently sick browser (viewer losing state fields) isn't
@@ -188,6 +222,14 @@ class Environment(gym.Env):
             # on the next reset(), then re-raise for episode-level handling.
             self._needs_browser_restart = True
             raise
+        except Exception as e:
+            if wd.fired:
+                raise BrowserError(
+                    f"step hung >{self.step_timeout_s}s; browser killed by watchdog: {e}"
+                ) from e
+            raise
+        finally:
+            wd.cancel()
 
         # Termination runs first so the reward fn can read `terminated` for terminal bonuses.
         try:
@@ -231,6 +273,7 @@ class Environment(gym.Env):
         self.browser = None
         self._playwright = None
         self._action_handler = None
+        self._chrome_pid = None
 
     # =========================================================================
     # Internal: config & space construction
@@ -348,6 +391,7 @@ class Environment(gym.Env):
             if not isinstance(current, asyncio.WindowsProactorEventLoopPolicy):
                 asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         try:
+            pre_launch = time.time()
             self._playwright = sync_playwright().start()
             W, H = self.window_size
             self.browser = self._playwright.chromium.launch(
@@ -356,6 +400,9 @@ class Environment(gym.Env):
             )
             self.page = self.browser.new_page(viewport={"width": W, "height": H})
             self._action_handler = MouseActionHandler(self.page)
+            # Playwright doesn't expose the browser process; find it for the
+            # hang watchdog (kill target). Best-effort — None disables watchdog.
+            self._chrome_pid = self._find_chrome_pid(pre_launch)
         except Exception as e:
             detail = str(e) or repr(e)
             raise BrowserError(
@@ -367,6 +414,39 @@ class Environment(gym.Env):
         logger.info("periodic browser restart at episode %d", self._episode_count)
         self.close()
         self._ensure_browser_launched()
+
+    @staticmethod
+    def _find_chrome_pid(pre_launch: float) -> int | None:
+        try:
+            for child in psutil.Process(os.getpid()).children(recursive=True):
+                try:
+                    name = child.name().lower()
+                    if ("chrome" in name or "chromium" in name) and (
+                        child.create_time() >= pre_launch - 1.0
+                    ):
+                        return child.pid
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception:
+            pass
+        return None
+
+    def _kill_chrome(self) -> None:
+        """Watchdog target: kill the browser so a blocked Playwright call raises."""
+        self._needs_browser_restart = True
+        pid = self._chrome_pid
+        if pid is None:
+            return
+        try:
+            psutil.Process(pid).kill()
+            logger.warning("watchdog killed hung Chrome (pid %d)", pid)
+        except psutil.NoSuchProcess:
+            pass
+
+    def _watchdog(self, timeout_s: float | None) -> _BrowserWatchdog:
+        return _BrowserWatchdog(
+            timeout_s if self._chrome_pid is not None else None, self._kill_chrome
+        )
 
     def _recycle_context(self) -> None:
         """Fresh BrowserContext + Page (and HTTP-cache clear) for the episode.
@@ -451,7 +531,26 @@ class Environment(gym.Env):
         )
 
     def _navigate(self, start_state) -> None:
-        """Resolve start_state to a URL, navigate, and wait for viewer ready."""
+        """Resolve start_state to a URL, navigate, and wait for viewer ready.
+
+        Guarded by the reset watchdog: a hung navigation gets its Chrome
+        killed, raising here as a retryable error so `_navigate_with_retry`
+        restarts the browser and tries again (NOT BrowserError — that aborts
+        the retry loop by design).
+        """
+        wd = self._watchdog(self.reset_timeout_s)
+        try:
+            self._navigate_inner(start_state)
+        except Exception as e:
+            if wd.fired:
+                raise RuntimeError(
+                    f"navigation hung >{self.reset_timeout_s}s; browser killed by watchdog: {e}"
+                ) from e
+            raise
+        finally:
+            wd.cancel()
+
+    def _navigate_inner(self, start_state) -> None:
         if start_state is None:
             url = self.config.get("default_ngl_start_url")
             if not url:

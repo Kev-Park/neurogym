@@ -27,6 +27,7 @@ dependencies = [
     "msgpack",
     "Pillow",
     "gymnasium>=1.0",
+    "psutil",
 ]
 
 [project.urls]
