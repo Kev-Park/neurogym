@@ -100,6 +100,9 @@ class Environment(gym.Env):
         fresh_context_every_reset: bool = True,
         step_timeout_s: float | None = 30.0,
         reset_timeout_s: float | None = 240.0,
+        state_ready_timeout_s: float = 2.0,
+        restart_after_consecutive_failures: int = 3,
+        nav_timeout_ms: int = 90_000,
         # --- Deployment defaults -------------------------------------------------
         config_path: str | None = None,
         verbose: bool = False,
@@ -135,7 +138,11 @@ class Environment(gym.Env):
         self.fresh_context_every_reset = fresh_context_every_reset
         self.step_timeout_s = step_timeout_s
         self.reset_timeout_s = reset_timeout_s
+        self.state_ready_timeout_s = state_ready_timeout_s
+        self.restart_after_consecutive_failures = restart_after_consecutive_failures
+        self.nav_timeout_ms = nav_timeout_ms
         self._chrome_pid: int | None = None
+        self._consecutive_step_failures = 0
 
         self.config = self._load_config(config_path)
         self._image_shape = self._compute_image_shape(
@@ -217,19 +224,28 @@ class Environment(gym.Env):
             self._apply_actions(action)
             obs, json_state = self._gather_observation()
         except BrowserError:
-            # A persistently sick browser (viewer losing state fields) isn't
-            # healed by context recycling — escalate to a full browser restart
-            # on the next reset(), then re-raise for episode-level handling.
-            self._needs_browser_restart = True
+            # Transient viewer-state races are common under GPU contention (a
+            # slow render not settled when we read state). A SINGLE failure just
+            # truncates the episode; only a browser that fails repeatedly is
+            # genuinely sick, so escalate to a full restart only after N
+            # consecutive failures. (Escalating on every miss caused a
+            # restart-storm that tanked throughput at high M — 2026-07-09.)
+            self._consecutive_step_failures += 1
+            if self._consecutive_step_failures >= self.restart_after_consecutive_failures:
+                self._needs_browser_restart = True
             raise
         except Exception as e:
             if wd.fired:
+                self._consecutive_step_failures += 1
+                if self._consecutive_step_failures >= self.restart_after_consecutive_failures:
+                    self._needs_browser_restart = True
                 raise BrowserError(
                     f"step hung >{self.step_timeout_s}s; browser killed by watchdog: {e}"
                 ) from e
             raise
         finally:
             wd.cancel()
+        self._consecutive_step_failures = 0  # a clean step ends the streak
 
         # Termination runs first so the reward fn can read `terminated` for terminal bonuses.
         try:
@@ -569,7 +585,10 @@ class Environment(gym.Env):
 
         if self.verbose:
             print(f"Navigating to: {url[:120]}{'...' if len(url) > 120 else ''}")
-        self.page.goto(url)
+        # Longer than Playwright's 30s default: a cold start with many browsers
+        # sharing a node/GPU can legitimately take >30s to load Neuroglancer
+        # (thundering-herd on first reset). The reset watchdog bounds true hangs.
+        self.page.goto(url, timeout=self.nav_timeout_ms)
 
         # Wait for viewer to initialize.
         for _ in range(60):
@@ -629,17 +648,19 @@ class Environment(gym.Env):
 
     def _gather_observation(self) -> tuple[dict[str, Any], dict[str, Any]]:
         json_state = self._get_json_state()
-        # The viewer JSON can transiently omit fields mid-update (observed:
-        # `position` missing for a frame after an action). Re-read briefly
-        # before failing with a typed error instead of a raw KeyError.
-        for _ in range(3):
-            if all(k in json_state for k in self._REQUIRED_STATE_FIELDS):
-                break
-            time.sleep(0.1)
+        # The viewer JSON transiently omits fields mid-update (the render hasn't
+        # settled when we read state). This scales with GPU contention (more
+        # browsers/GPU = slower renders = more misses), so poll up to
+        # state_ready_timeout_s for the fields to appear before giving up —
+        # resolving the race in-place is far cheaper than truncating the episode.
+        poll = 0.1
+        deadline = time.monotonic() + self.state_ready_timeout_s
+        while not all(k in json_state for k in self._REQUIRED_STATE_FIELDS):
+            if time.monotonic() >= deadline:
+                missing = sorted(set(self._REQUIRED_STATE_FIELDS) - set(json_state))
+                raise BrowserError(f"viewer state missing fields after retries: {missing}")
+            time.sleep(poll)
             json_state = self._get_json_state()
-        else:
-            missing = sorted(set(self._REQUIRED_STATE_FIELDS) - set(json_state))
-            raise BrowserError(f"viewer state missing fields after retries: {missing}")
         image = self._get_screenshot()
         image = self._crop_panes(image)
         if self.image_size is not None:
