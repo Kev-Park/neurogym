@@ -381,15 +381,13 @@ class Environment(gym.Env):
         if self.headless:
             # Compositor throttling dominates step latency: after an action the
             # browser waits for a vsync/frame-rate-limited frame before the
-            # screenshot can capture the new state. Removing the throttle and
-            # forcing all compositor stages before draw cut the action->obs step
-            # ~33% (133->89ms, measured 2026-07-10) and yield a guaranteed-
-            # complete frame (fewer viewer-state races). Offscreen render, so
-            # vsync/frame-rate caps serve no purpose.
+            # screenshot can capture the new state. Disabling both removes that
+            # wait (offscreen render has no use for vsync/fps caps). NOT using
+            # --run-all-compositor-stages-before-draw: it sped things up too but
+            # intermittently DEADLOCKS page.screenshot (30s timeout) in headless.
             args += [
                 "--disable-gpu-vsync",
                 "--disable-frame-rate-limit",
-                "--run-all-compositor-stages-before-draw",
             ]
             if self.renderer == "cpu":
                 args += ["--use-gl=swiftshader", "--enable-unsafe-swiftshader"]
