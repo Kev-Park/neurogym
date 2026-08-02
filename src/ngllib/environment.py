@@ -103,6 +103,7 @@ class Environment(gym.Env):
         state_ready_timeout_s: float = 2.0,
         restart_after_consecutive_failures: int = 3,
         nav_timeout_ms: int = 90_000,
+        recovery_mode: Literal["escalate", "in_place"] = "escalate",
         # --- Deployment defaults -------------------------------------------------
         config_path: str | None = None,
         verbose: bool = False,
@@ -120,6 +121,10 @@ class Environment(gym.Env):
         if screenshot_format not in ("jpeg", "png"):
             raise ValueError(
                 f"`screenshot_format` must be 'jpeg' or 'png'; got {screenshot_format!r}"
+            )
+        if recovery_mode not in ("escalate", "in_place"):
+            raise ValueError(
+                f"`recovery_mode` must be 'escalate' or 'in_place'; got {recovery_mode!r}"
             )
 
         # Store config
@@ -141,6 +146,7 @@ class Environment(gym.Env):
         self.state_ready_timeout_s = state_ready_timeout_s
         self.restart_after_consecutive_failures = restart_after_consecutive_failures
         self.nav_timeout_ms = nav_timeout_ms
+        self.recovery_mode = recovery_mode
         self._chrome_pid: int | None = None
         self._consecutive_step_failures = 0
 
@@ -231,7 +237,16 @@ class Environment(gym.Env):
             # consecutive failures. (Escalating on every miss caused a
             # restart-storm that tanked throughput at high M — 2026-07-09.)
             self._consecutive_step_failures += 1
-            if self._consecutive_step_failures >= self.restart_after_consecutive_failures:
+            if (
+                self.recovery_mode == "escalate"
+                and self._consecutive_step_failures
+                >= self.restart_after_consecutive_failures
+            ):
+                # 'in_place' skips the full-browser-restart escalation: the browser
+                # is still alive (a watchdog KILL takes the wd.fired path below and
+                # forces a restart regardless), so the cheap per-reset context
+                # recycle (fresh_context_every_reset) recovers without a cold
+                # relaunch storm.
                 self._needs_browser_restart = True
             raise
         except Exception as e:
@@ -548,9 +563,22 @@ class Environment(gym.Env):
                 logger.warning("reset attempt %d failed: %s", attempt + 1, e)
                 if attempt < self.retry_on_reset:
                     try:
-                        self._restart_browser()
+                        if self.recovery_mode == "in_place":
+                            # Cheap recovery at the source (legacy-style): a fresh
+                            # BrowserContext on the SAME Chrome, not a full browser
+                            # relaunch. A cold Chromium restart under many-browser
+                            # load is what turns one glitch into a restart-storm
+                            # straggler; recycling the context settles in ~seconds.
+                            self._recycle_context()
+                        else:
+                            self._restart_browser()
                     except Exception:
-                        pass
+                        # If the cheap recycle can't run (e.g. the browser process
+                        # is actually dead), fall back to a full restart.
+                        try:
+                            self._restart_browser()
+                        except Exception:
+                            pass
                     time.sleep(0.5)
         raise BrowserError(
             f"reset failed after {self.retry_on_reset + 1} attempts: {last_err}"
