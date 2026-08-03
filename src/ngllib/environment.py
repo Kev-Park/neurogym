@@ -180,6 +180,41 @@ class Environment(gym.Env):
         self._reward_fn: Callable | None = None
         self._terminated_fn: Callable | None = None
 
+        # --- Optional event instrumentation (storm-precursor analysis) --------
+        # Zero behavioral effect; JSONL emitted only when NGLLIB_EVENT_LOG is set
+        # (path template may contain '{pid}'). Captures per-reset + per-glitch
+        # context (reason, phase timings, browser age, settle polls) so we can
+        # reconstruct what triggers the FIRST reset before a storm.
+        self._event_log_path = os.environ.get("NGLLIB_EVENT_LOG")
+        self._evt_fh = None
+        self._evt_host: str | None = None
+        self._ep_steps = 0             # steps completed in the current episode
+        self._ep_terminated = False    # did the last step self-terminate (success)?
+        self._last_step_glitched = False
+        self._last_settle_polls = 0    # state-settle poll iterations in last gather
+        self._last_nav_attempts = 1    # navigate attempts used in last reset
+
+    def _emit(self, evt: str, **fields) -> None:
+        """Append one JSONL event when NGLLIB_EVENT_LOG is set; else no-op."""
+        if not self._event_log_path:
+            return
+        try:
+            if self._evt_fh is None:
+                import socket
+                self._evt_host = socket.gethostname()
+                self._evt_fh = open(
+                    self._event_log_path.format(pid=os.getpid(), host=self._evt_host),
+                    "a", buffering=1,
+                )
+            rec = {
+                "evt": evt, "ts": time.time(), "mono": time.monotonic(),
+                "pid": os.getpid(), "host": self._evt_host,
+                "episode": self._episode_count, **fields,
+            }
+            self._evt_fh.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass  # instrumentation must never break the env
+
     # =========================================================================
     # Gymnasium public API
     # =========================================================================
@@ -188,8 +223,13 @@ class Environment(gym.Env):
         super().reset(seed=seed)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
+        # Ending-episode stats (for reset-reason attribution) BEFORE the bump.
+        _prev_steps, _prev_term = self._ep_steps, self._ep_terminated
+        _prev_glitched, _first = self._last_step_glitched, self._episode_count == 0
         self._episode_count += 1
         options = options or {}
+        _t0 = time.monotonic()
+        _restarted = False
 
         if self._needs_browser_restart or (
             self.browser_restart_every is not None
@@ -198,6 +238,7 @@ class Environment(gym.Env):
         ):
             self._needs_browser_restart = False
             self._restart_browser()
+            _restarted = True
 
         self._ensure_browser_launched()
         if self.fresh_context_every_reset:
@@ -211,11 +252,28 @@ class Environment(gym.Env):
             raise ProviderError(f"factory raised at reset: {e}") from e
         self._task_info = task_info
 
+        _tn = time.monotonic()
         self._navigate_with_retry(start_state)
+        _navigate_ms = (time.monotonic() - _tn) * 1000.0
 
+        _tg = time.monotonic()
         obs, json_state = self._gather_observation()
+        _gather_ms = (time.monotonic() - _tg) * 1000.0
         self._prev_obs = obs
         self._prev_json = json_state
+
+        self._emit(
+            "reset", total_ms=(time.monotonic() - _t0) * 1000.0,
+            navigate_ms=_navigate_ms, gather_ms=_gather_ms,
+            nav_attempts=self._last_nav_attempts, settle_polls=self._last_settle_polls,
+            restarted=_restarted, first=_first,
+            prev_steps=_prev_steps, prev_terminated=_prev_term, prev_glitched=_prev_glitched,
+            segment=(task_info.get("segment_id") if isinstance(task_info, dict) else None),
+        )
+        # Start counters for the new episode.
+        self._ep_steps = 0
+        self._ep_terminated = False
+        self._last_step_glitched = False
 
         info = {
             "task_info": task_info,
@@ -229,7 +287,7 @@ class Environment(gym.Env):
         try:
             self._apply_actions(action)
             obs, json_state = self._gather_observation()
-        except BrowserError:
+        except BrowserError as e:
             # Transient viewer-state races are common under GPU contention (a
             # slow render not settled when we read state). A SINGLE failure just
             # truncates the episode; only a browser that fails repeatedly is
@@ -237,6 +295,10 @@ class Environment(gym.Env):
             # consecutive failures. (Escalating on every miss caused a
             # restart-storm that tanked throughput at high M — 2026-07-09.)
             self._consecutive_step_failures += 1
+            self._last_step_glitched = True
+            self._emit("glitch", phase="step", step_idx=self._ep_steps,
+                       consecutive=self._consecutive_step_failures,
+                       settle_polls=self._last_settle_polls, signature=str(e)[:140])
             if (
                 self.recovery_mode == "escalate"
                 and self._consecutive_step_failures
@@ -252,6 +314,10 @@ class Environment(gym.Env):
         except Exception as e:
             if wd.fired:
                 self._consecutive_step_failures += 1
+                self._last_step_glitched = True
+                self._emit("glitch", phase="step", step_idx=self._ep_steps,
+                           consecutive=self._consecutive_step_failures,
+                           signature=f"watchdog hang >{self.step_timeout_s}s: {str(e)[:100]}")
                 if self._consecutive_step_failures >= self.restart_after_consecutive_failures:
                     self._needs_browser_restart = True
                 raise BrowserError(
@@ -281,6 +347,8 @@ class Environment(gym.Env):
 
         self._prev_obs = obs
         self._prev_json = json_state
+        self._ep_steps += 1
+        self._ep_terminated = terminated
         return obs, reward, terminated, truncated, info
 
     def close(self):
@@ -554,12 +622,16 @@ class Environment(gym.Env):
         for attempt in range(max(1, self.retry_on_reset + 1)):
             try:
                 self._navigate(start_state)
+                self._last_nav_attempts = attempt + 1
                 return
             except BrowserError:
                 # Launch failures aren't retryable through restart.
                 raise
             except Exception as e:
                 last_err = e
+                self._last_nav_attempts = attempt + 1
+                self._emit("glitch", phase="reset", attempt=attempt + 1,
+                           settle_polls=self._last_settle_polls, signature=str(e)[:140])
                 logger.warning("reset attempt %d failed: %s", attempt + 1, e)
                 if attempt < self.retry_on_reset:
                     try:
@@ -692,13 +764,17 @@ class Environment(gym.Env):
         # state_ready_timeout_s for the fields to appear before giving up —
         # resolving the race in-place is far cheaper than truncating the episode.
         poll = 0.1
+        polls = 0
         deadline = time.monotonic() + self.state_ready_timeout_s
         while not all(k in json_state for k in self._REQUIRED_STATE_FIELDS):
             if time.monotonic() >= deadline:
+                self._last_settle_polls = polls
                 missing = sorted(set(self._REQUIRED_STATE_FIELDS) - set(json_state))
                 raise BrowserError(f"viewer state missing fields after retries: {missing}")
             time.sleep(poll)
+            polls += 1
             json_state = self._get_json_state()
+        self._last_settle_polls = polls
         image = self._get_screenshot()
         image = self._crop_panes(image)
         if self.image_size is not None:
