@@ -193,6 +193,13 @@ class Environment(gym.Env):
         self._last_step_glitched = False
         self._last_settle_polls = 0    # state-settle poll iterations in last gather
         self._last_nav_attempts = 1    # navigate attempts used in last reset
+        # Per-episode step-time accumulators (F4 attribution: stragglers with no
+        # reset/glitch events = steps themselves ran slow; this makes that
+        # visible). Summarized into the reset event; individual steps >5s also
+        # emit an immediate slow_step event.
+        self._ep_step_ms_sum = 0.0
+        self._ep_step_ms_max = 0.0
+        self._ep_slow_steps = 0        # steps >2s in the current episode
 
     def _emit(self, evt: str, **fields) -> None:
         """Append one JSONL event when NGLLIB_EVENT_LOG is set; else no-op."""
@@ -268,12 +275,18 @@ class Environment(gym.Env):
             nav_attempts=self._last_nav_attempts, settle_polls=self._last_settle_polls,
             restarted=_restarted, first=_first,
             prev_steps=_prev_steps, prev_terminated=_prev_term, prev_glitched=_prev_glitched,
+            prev_step_ms_mean=(self._ep_step_ms_sum / _prev_steps if _prev_steps else 0.0),
+            prev_step_ms_max=self._ep_step_ms_max,
+            prev_slow_steps=self._ep_slow_steps,
             segment=(task_info.get("segment_id") if isinstance(task_info, dict) else None),
         )
         # Start counters for the new episode.
         self._ep_steps = 0
         self._ep_terminated = False
         self._last_step_glitched = False
+        self._ep_step_ms_sum = 0.0
+        self._ep_step_ms_max = 0.0
+        self._ep_slow_steps = 0
 
         info = {
             "task_info": task_info,
@@ -283,6 +296,7 @@ class Environment(gym.Env):
         return obs, info
 
     def step(self, action):
+        _t_step = time.monotonic()
         wd = self._watchdog(self.step_timeout_s)
         try:
             self._apply_actions(action)
@@ -349,6 +363,15 @@ class Environment(gym.Env):
         self._prev_json = json_state
         self._ep_steps += 1
         self._ep_terminated = terminated
+        _dur_ms = (time.monotonic() - _t_step) * 1000.0
+        self._ep_step_ms_sum += _dur_ms
+        if _dur_ms > self._ep_step_ms_max:
+            self._ep_step_ms_max = _dur_ms
+        if _dur_ms > 2000.0:
+            self._ep_slow_steps += 1
+            if _dur_ms > 5000.0:
+                self._emit("slow_step", ms=_dur_ms, step_idx=self._ep_steps,
+                           settle_polls=self._last_settle_polls)
         return obs, reward, terminated, truncated, info
 
     def close(self):
