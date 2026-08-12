@@ -104,6 +104,8 @@ class Environment(gym.Env):
         restart_after_consecutive_failures: int = 3,
         nav_timeout_ms: int = 90_000,
         recovery_mode: Literal["escalate", "in_place"] = "escalate",
+        reset_ahead: bool = False,
+        reset_ahead_after_steps: int = 270,
         # --- Deployment defaults -------------------------------------------------
         config_path: str | None = None,
         verbose: bool = False,
@@ -147,6 +149,15 @@ class Environment(gym.Env):
         self.restart_after_consecutive_failures = restart_after_consecutive_failures
         self.nav_timeout_ms = nav_timeout_ms
         self.recovery_mode = recovery_mode
+        # M5 reset-ahead: pre-navigate the NEXT episode in a warm BrowserContext
+        # while the current episode is still stepping, so the reset swaps pages
+        # instead of paying navigation+settle (~3s median, 8-70s tail) on the
+        # critical path. All prep runs on the env's own thread (Playwright sync
+        # objects are thread-bound) as small ticks piggybacked on step().
+        self.reset_ahead = reset_ahead
+        self.reset_ahead_after_steps = reset_ahead_after_steps
+        self._warm: dict[str, Any] | None = None
+        self._warm_skip_ep = -1  # episode whose prep failed; don't retry within it
         self._chrome_pid: int | None = None
         self._consecutive_step_failures = 0
 
@@ -247,10 +258,30 @@ class Environment(gym.Env):
             self._restart_browser()
             _restarted = True
 
-        self._ensure_browser_launched()
-        if self.fresh_context_every_reset:
-            self._recycle_context()
-        start_state, task_info = self._resolve_reset_state(options)
+        # M5: adopt the warm pre-navigated context if prep finished. Skip when a
+        # seed reseeds the RNG (pre-sampled state used the old stream) or options
+        # override the reset (eval paths) — those fall back to the inline path.
+        _warm_used = False
+        if (
+            self.reset_ahead
+            and isinstance(self._warm, dict)
+            and self._warm.get("ready")
+            and not _restarted
+            and seed is None
+            and not options
+        ):
+            try:
+                start_state, task_info = self._adopt_warm()
+                _warm_used = True
+            except Exception as e:
+                logger.warning("reset-ahead adopt failed (%s); inline reset", e)
+                self._discard_warm()
+        if not _warm_used:
+            self._discard_warm()  # stale/unready prep can't be reused
+            self._ensure_browser_launched()
+            if self.fresh_context_every_reset:
+                self._recycle_context()
+            start_state, task_info = self._resolve_reset_state(options)
 
         try:
             self._reward_fn = self._reward_factory(task_info)
@@ -260,7 +291,8 @@ class Environment(gym.Env):
         self._task_info = task_info
 
         _tn = time.monotonic()
-        self._navigate_with_retry(start_state)
+        if not _warm_used:
+            self._navigate_with_retry(start_state)
         _navigate_ms = (time.monotonic() - _tn) * 1000.0
 
         _tg = time.monotonic()
@@ -273,7 +305,7 @@ class Environment(gym.Env):
             "reset", total_ms=(time.monotonic() - _t0) * 1000.0,
             navigate_ms=_navigate_ms, gather_ms=_gather_ms,
             nav_attempts=self._last_nav_attempts, settle_polls=self._last_settle_polls,
-            restarted=_restarted, first=_first,
+            restarted=_restarted, first=_first, warm=_warm_used,
             prev_steps=_prev_steps, prev_terminated=_prev_term, prev_glitched=_prev_glitched,
             prev_step_ms_mean=(self._ep_step_ms_sum / _prev_steps if _prev_steps else 0.0),
             prev_step_ms_max=self._ep_step_ms_max,
@@ -363,6 +395,8 @@ class Environment(gym.Env):
         self._prev_json = json_state
         self._ep_steps += 1
         self._ep_terminated = terminated
+        if self.reset_ahead:
+            self._reset_ahead_tick()
         _dur_ms = (time.monotonic() - _t_step) * 1000.0
         self._ep_step_ms_sum += _dur_ms
         if _dur_ms > self._ep_step_ms_max:
@@ -376,6 +410,7 @@ class Environment(gym.Env):
 
     def close(self):
         """Tear down the browser. Idempotent."""
+        self._discard_warm()
         try:
             if self.page is not None:
                 self.page.close()
@@ -607,6 +642,102 @@ class Environment(gym.Env):
                 pass
 
     # =========================================================================
+    # Internal: M5 reset-ahead (warm-context prep off the critical path)
+    # =========================================================================
+
+    def _discard_warm(self) -> None:
+        w = self._warm
+        self._warm = None
+        if isinstance(w, dict):
+            try:
+                w["context"].close()
+            except Exception:
+                pass
+
+    def _reset_ahead_tick(self) -> None:
+        """One small prep step, piggybacked on step(); runs on the env's own
+        thread (Playwright sync objects are thread-bound). First eligible tick
+        creates a fresh context and kicks navigation (browser loads it in the
+        background); later ticks cheaply poll readiness. Any failure discards
+        the prep — reset() then just takes the normal inline path."""
+        if self._ep_steps < self.reset_ahead_after_steps:
+            return
+        if self._warm_skip_ep == self._episode_count and self._warm is None:
+            return
+        w = self._warm
+        if w is None:
+            wd = self._watchdog(15.0)
+            ctx = None
+            try:
+                start_state, task_info = self._resolve_reset_state({})
+                url = self._start_state_to_url(start_state)
+                W, H = self.window_size
+                ctx = self.browser.new_context(viewport={"width": W, "height": H})
+                page = ctx.new_page()
+                try:  # mirror _recycle_context's cache clear (chromium-only)
+                    cdp = ctx.new_cdp_session(page)
+                    cdp.send("Network.clearBrowserCache")
+                    cdp.detach()
+                except Exception:
+                    pass
+                # wait_until="commit" returns once navigation starts; the
+                # browser keeps loading/rendering in the background while the
+                # active episode continues stepping.
+                page.goto(url, timeout=15_000, wait_until="commit")
+                self._warm = {
+                    "context": ctx, "page": page, "start_state": start_state,
+                    "task_info": task_info, "ready": False,
+                    "t0": time.monotonic(),
+                }
+            except Exception as e:
+                if ctx is not None:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+                self._warm = None
+                self._warm_skip_ep = self._episode_count
+                self._emit("warm_prep_failed", signature=str(e)[:120])
+            finally:
+                wd.cancel()
+        elif not w.get("ready"):
+            wd = self._watchdog(10.0)
+            try:
+                page = w["page"]
+                raw = page.evaluate(
+                    "() => (window.viewer && window.viewer.state) ? "
+                    "JSON.stringify(window.viewer.state) : null"
+                )
+                if raw is not None and page.evaluate(
+                    "() => !!(window.viewer && window.viewer.isReady && "
+                    "window.viewer.isReady())"
+                ):
+                    w["ready"] = True
+                    self._emit(
+                        "warm_ready",
+                        prep_ms=(time.monotonic() - w["t0"]) * 1000.0,
+                    )
+            except Exception:
+                pass  # still loading (or context died — adopt/discard handles it)
+            finally:
+                wd.cancel()
+
+    def _adopt_warm(self):
+        """Swap the ready warm context in as the active page. Returns the
+        pre-sampled (start_state, task_info)."""
+        w = self._warm
+        self._warm = None
+        old = self.page.context if self.page is not None else None
+        self.page = w["page"]
+        self._action_handler = MouseActionHandler(self.page)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
+        return w["start_state"], w["task_info"]
+
+    # =========================================================================
     # Internal: reset / state navigation
     # =========================================================================
 
@@ -699,23 +830,26 @@ class Environment(gym.Env):
         finally:
             wd.cancel()
 
-    def _navigate_inner(self, start_state) -> None:
+    def _start_state_to_url(self, start_state) -> str:
+        """Resolve the three start_state forms (None / URL str / NglState dict)."""
         if start_state is None:
             url = self.config.get("default_ngl_start_url")
             if not url:
                 raise ProviderError(
                     "No start state provided and config has no 'default_ngl_start_url'"
                 )
-        elif isinstance(start_state, str):
-            url = start_state
-        elif isinstance(start_state, dict):
-            url = self._state_dict_to_url(start_state)
-        else:
-            raise ProviderError(
-                "start_state must be None, a URL str, or an NglState dict; "
-                f"got {type(start_state).__name__}"
-            )
+            return url
+        if isinstance(start_state, str):
+            return start_state
+        if isinstance(start_state, dict):
+            return self._state_dict_to_url(start_state)
+        raise ProviderError(
+            "start_state must be None, a URL str, or an NglState dict; "
+            f"got {type(start_state).__name__}"
+        )
 
+    def _navigate_inner(self, start_state) -> None:
+        url = self._start_state_to_url(start_state)
         if self.verbose:
             print(f"Navigating to: {url[:120]}{'...' if len(url) > 120 else ''}")
         # Longer than Playwright's 30s default: a cold start with many browsers
