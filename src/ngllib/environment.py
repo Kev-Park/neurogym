@@ -941,7 +941,7 @@ class Environment(gym.Env):
         # browsers/GPU = slower renders = more misses), so poll up to
         # state_ready_timeout_s for the fields to appear before giving up —
         # resolving the race in-place is far cheaper than truncating the episode.
-        poll = 0.1
+        poll = 0.05
         polls = 0
         deadline = time.monotonic() + self.state_ready_timeout_s
         while not all(k in json_state for k in self._REQUIRED_STATE_FIELDS):
