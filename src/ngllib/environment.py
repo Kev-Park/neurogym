@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import io
 import json
@@ -106,6 +107,9 @@ class Environment(gym.Env):
         recovery_mode: Literal["escalate", "in_place"] = "escalate",
         reset_ahead: bool = False,
         reset_ahead_after_steps: int = 270,
+        capture_scale: float = 1.0,
+        clear_cache_on_recycle: bool = True,
+        extra_launch_args: list[str] | None = None,
         # --- Deployment defaults -------------------------------------------------
         config_path: str | None = None,
         verbose: bool = False,
@@ -128,6 +132,8 @@ class Environment(gym.Env):
             raise ValueError(
                 f"`recovery_mode` must be 'escalate' or 'in_place'; got {recovery_mode!r}"
             )
+        if not (0.0 < capture_scale <= 1.0):
+            raise ValueError(f"`capture_scale` must be in (0, 1]; got {capture_scale!r}")
 
         # Store config
         self.headless = headless
@@ -156,6 +162,17 @@ class Environment(gym.Env):
         # objects are thread-bound) as small ticks piggybacked on step().
         self.reset_ahead = reset_ahead
         self.reset_ahead_after_steps = reset_ahead_after_steps
+        # Capture the frame downscaled IN THE BROWSER (compositor does it on the
+        # GPU) instead of shipping full-res pixels for Python to decode+resize —
+        # the decode/resize is GIL-held per-step work, the true aggregate cost.
+        # Aspect ratio is preserved (window 2:1 -> capture 2:1, just smaller).
+        self.capture_scale = capture_scale
+        # Per-episode HTTP-cache clear forces re-downloading the Neuroglancer app
+        # + mesh chunks every navigation. The in-page memory the recycle exists
+        # to free (JS heap/WebGL) is separate; the HTTP cache is disk-backed,
+        # LRU-bounded by Chrome, and wiped by the periodic browser restart.
+        self.clear_cache_on_recycle = clear_cache_on_recycle
+        self.extra_launch_args = list(extra_launch_args or [])
         self._warm: dict[str, Any] | None = None
         self._warm_skip_ep = -1  # episode whose prep failed; don't retry within it
         self._chrome_pid: int | None = None
@@ -163,7 +180,7 @@ class Environment(gym.Env):
 
         self.config = self._load_config(config_path)
         self._image_shape = self._compute_image_shape(
-            window_size, left_pane, right_pane, image_size
+            window_size, left_pane, right_pane, image_size, capture_scale
         )
 
         # Task hooks (default no-ops if unspecified)
@@ -450,12 +467,13 @@ class Environment(gym.Env):
         left_pane: bool,
         right_pane: bool,
         image_size: tuple[int, int] | None,
+        capture_scale: float = 1.0,
     ) -> tuple[int, int, int]:
         # numpy shape: (H, W, C). image_size kwarg is (W, H) for user-friendliness.
         if image_size is not None:
             iw, ih = image_size
             return (ih, iw, 3)
-        W, H = window_size
+        W, H = round(window_size[0] * capture_scale), round(window_size[1] * capture_scale)
         if left_pane and right_pane:
             return (H, W, 3)
         return (H, W // 2, 3)  # single-pane crop
@@ -545,6 +563,7 @@ class Environment(gym.Env):
                         "--enable-features=Vulkan",
                         "--enable-unsafe-swiftshader",
                     ]
+        args += self.extra_launch_args
         return args
 
     def _ensure_browser_launched(self) -> None:
@@ -627,12 +646,13 @@ class Environment(gym.Env):
         old = self.page.context if self.page is not None else None
         context = self.browser.new_context(viewport={"width": W, "height": H})
         page = context.new_page()
-        try:  # chromium-only CDP call; harmless to skip on failure
-            cdp = context.new_cdp_session(page)
-            cdp.send("Network.clearBrowserCache")
-            cdp.detach()
-        except Exception:
-            pass
+        if self.clear_cache_on_recycle:
+            try:  # chromium-only CDP call; harmless to skip on failure
+                cdp = context.new_cdp_session(page)
+                cdp.send("Network.clearBrowserCache")
+                cdp.detach()
+            except Exception:
+                pass
         self.page = page
         self._action_handler = MouseActionHandler(page)
         if old is not None:
@@ -674,12 +694,13 @@ class Environment(gym.Env):
                 W, H = self.window_size
                 ctx = self.browser.new_context(viewport={"width": W, "height": H})
                 page = ctx.new_page()
-                try:  # mirror _recycle_context's cache clear (chromium-only)
-                    cdp = ctx.new_cdp_session(page)
-                    cdp.send("Network.clearBrowserCache")
-                    cdp.detach()
-                except Exception:
-                    pass
+                if self.clear_cache_on_recycle:
+                    try:  # mirror _recycle_context's cache clear (chromium-only)
+                        cdp = ctx.new_cdp_session(page)
+                        cdp.send("Network.clearBrowserCache")
+                        cdp.detach()
+                    except Exception:
+                        pass
                 # wait_until="commit" returns once navigation starts; the
                 # browser keeps loading/rendering in the background while the
                 # active episode continues stepping.
@@ -858,12 +879,12 @@ class Environment(gym.Env):
         self.page.goto(url, timeout=self.nav_timeout_ms)
 
         # Wait for viewer to initialize.
-        for _ in range(60):
+        for _ in range(600):
             if self._get_json_state_raw() is not None:
                 break
-            time.sleep(1)
+            time.sleep(0.1)
         # Wait for chunks to load + rendering to complete.
-        for _ in range(200):
+        for _ in range(400):
             try:
                 ready = self.page.evaluate(
                     "() => !!(window.viewer && window.viewer.isReady && window.viewer.isReady())"
@@ -872,7 +893,7 @@ class Environment(gym.Env):
                     break
             except Exception:
                 pass
-            time.sleep(0.05)
+            time.sleep(0.025)
 
     def _state_dict_to_url(self, state: NglState) -> str:
         """Overlay NglState onto the default URL's parsed state. Use `state["extra"]`
@@ -985,7 +1006,36 @@ class Environment(gym.Env):
             state["projectionOrientation"] = [0.0, 0.0, 0.0, 1.0]
         return state
 
+    def _capture_cdp_session(self):
+        """CDP session cached per page (page changes on context recycle/adopt)."""
+        if getattr(self, "_cap_cdp_page", None) is not self.page:
+            self._cap_cdp = self.page.context.new_cdp_session(self.page)
+            self._cap_cdp_page = self.page
+        return self._cap_cdp
+
     def _get_screenshot(self) -> np.ndarray:
+        if self.capture_scale != 1.0:
+            # Browser-side downscale: the compositor scales on the GPU and ships
+            # capture_scale^2 x fewer pixels — cutting the GIL-held Python
+            # decode/resize per step, which is the aggregate throughput cost.
+            W, H = self.window_size
+            fmt = "jpeg" if self.screenshot_format == "jpeg" else "png"
+            params: dict[str, Any] = {
+                "format": fmt,
+                "clip": {"x": 0, "y": 0, "width": W, "height": H,
+                         "scale": self.capture_scale},
+            }
+            if fmt == "jpeg":
+                params["quality"] = 85
+            res = self._capture_cdp_session().send("Page.captureScreenshot", params)
+            data = base64.b64decode(res["data"])
+            pil = Image.open(io.BytesIO(data)).convert("RGB")
+            # CDP's scaled clip can be off-by-one vs round(); normalize so the
+            # observation shape is exact.
+            expW, expH = round(W * self.capture_scale), round(H * self.capture_scale)
+            if pil.size != (expW, expH):
+                pil = pil.resize((expW, expH))
+            return np.asarray(pil)
         if self.screenshot_format == "jpeg":
             data = self.page.screenshot(type="jpeg", quality=85)
         else:
