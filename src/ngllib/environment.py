@@ -1016,17 +1016,28 @@ class Environment(gym.Env):
 
     def _get_json_state_raw(self) -> str | None:
         try:
-            return self.page.evaluate(
+            result = self.page.evaluate(
                 "() => (window.viewer && window.viewer.state) ? "
                 "JSON.stringify(window.viewer.state) : null"
             )
-        except Exception:
+            self._last_state_read_error = None
+            return result
+        except Exception as e:
+            # Preserve the underlying cause instead of swallowing it: after a
+            # watchdog kill the connection error surfaces HERE, and converting
+            # it silently to "could not read" masked the true blocked call
+            # (2026-08-17 hang forensics).
+            self._last_state_read_error = f"{type(e).__name__}: {str(e)[:140]}"
             return None
 
     def _get_json_state(self) -> dict[str, Any]:
         raw = self._get_json_state_raw()
         if raw is None:
-            raise BrowserError("could not read Neuroglancer viewer state from page")
+            cause = getattr(self, "_last_state_read_error", None)
+            raise BrowserError(
+                "could not read Neuroglancer viewer state from page"
+                + (f" [cause: {cause}]" if cause else "")
+            )
         state = json.loads(raw)
         if "projectionOrientation" not in state:
             state["projectionOrientation"] = [0.0, 0.0, 0.0, 1.0]
