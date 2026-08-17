@@ -618,14 +618,40 @@ class Environment(gym.Env):
         return None
 
     def _kill_chrome(self) -> None:
-        """Watchdog target: kill the browser so a blocked Playwright call raises."""
+        """Watchdog target: kill the browser so a blocked Playwright call raises.
+
+        Kills the ENTIRE Chrome process tree of THIS env, first ascending from
+        the recorded pid to the topmost Chrome ancestor. Killing only the
+        recorded pid can hit a child (gpu/renderer process) while the
+        socket-owning main browser survives — the blocked call then never
+        raises and the env thread hangs silently, stalling the whole runner
+        (observed 2026-08-17: hour-long iteration, no raise, no log). Scoped
+        to this env's tree so sibling browsers in the same process are safe.
+        """
         self._needs_browser_restart = True
         pid = self._chrome_pid
         if pid is None:
             return
         try:
-            psutil.Process(pid).kill()
-            logger.warning("watchdog killed hung Chrome (pid %d)", pid)
+            proc = psutil.Process(pid)
+            # Ascend to the topmost chrome process (the main browser).
+            for _ in range(6):
+                par = proc.parent()
+                if par is not None and "chrom" in (par.name() or "").lower():
+                    proc = par
+                else:
+                    break
+            killed = []
+            for c in proc.children(recursive=True):
+                try:
+                    c.kill()
+                    killed.append(c.pid)
+                except psutil.NoSuchProcess:
+                    pass
+            proc.kill()
+            killed.append(proc.pid)
+            logger.warning("watchdog killed hung Chrome tree (%d procs, root %d)",
+                           len(killed), proc.pid)
         except psutil.NoSuchProcess:
             pass
 
