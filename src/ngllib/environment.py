@@ -448,6 +448,7 @@ class Environment(gym.Env):
         self._playwright = None
         self._action_handler = None
         self._chrome_pid = None
+        self._driver_pid = None
 
     # =========================================================================
     # Internal: config & space construction
@@ -578,7 +579,18 @@ class Environment(gym.Env):
                 asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         try:
             pre_launch = time.time()
+            _kids_before = {c.pid for c in psutil.Process(os.getpid()).children()}
             self._playwright = sync_playwright().start()
+            # The driver (a direct node child of this process) mediates every
+            # sync call; killing it unblocks ANY hung Playwright call — the
+            # watchdog fallback for phases where no Chrome pid exists (launch/
+            # relaunch), which previously hung unguarded (2026-08-17).
+            try:
+                self._driver_pid = next(
+                    (c.pid for c in psutil.Process(os.getpid()).children()
+                     if c.pid not in _kids_before), None)
+            except Exception:
+                self._driver_pid = None
             W, H = self.window_size
             self.browser = self._playwright.chromium.launch(
                 headless=self.headless,
@@ -631,6 +643,7 @@ class Environment(gym.Env):
         self._needs_browser_restart = True
         pid = self._chrome_pid
         if pid is None:
+            self._kill_driver()
             return
         try:
             proc = psutil.Process(pid)
@@ -653,12 +666,29 @@ class Environment(gym.Env):
             logger.warning("watchdog killed hung Chrome tree (%d procs, root %d)",
                            len(killed), proc.pid)
         except psutil.NoSuchProcess:
+            self._kill_driver()
+
+    def _kill_driver(self) -> None:
+        """Last-resort unblocker: kill this env's Playwright node driver."""
+        dpid = getattr(self, "_driver_pid", None)
+        if dpid is None:
+            return
+        try:
+            proc = psutil.Process(dpid)
+            for c in proc.children(recursive=True):
+                try:
+                    c.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            proc.kill()
+            logger.warning("watchdog killed Playwright driver (pid %d)", dpid)
+        except psutil.NoSuchProcess:
             pass
+        self._driver_pid = None
 
     def _watchdog(self, timeout_s: float | None) -> _BrowserWatchdog:
-        return _BrowserWatchdog(
-            timeout_s if self._chrome_pid is not None else None, self._kill_chrome
-        )
+        armed = self._chrome_pid is not None or getattr(self, "_driver_pid", None) is not None
+        return _BrowserWatchdog(timeout_s if armed else None, self._kill_chrome)
 
     def _recycle_context(self) -> None:
         """Fresh BrowserContext + Page (and HTTP-cache clear) for the episode.
