@@ -707,7 +707,14 @@ class Environment(gym.Env):
             logger.warning("watchdog killed hung Chrome tree (%d procs, root %d)",
                            len(killed), proc.pid)
         except psutil.NoSuchProcess:
-            self._kill_driver()
+            pass
+        # ALWAYS also kill the driver: the sync client blocks on the DRIVER
+        # pipe, and a wedged driver (e.g. hung CDP send) never propagates the
+        # browser's death — the blocked call then never raises (observed across
+        # v1-v5 silent stalls, incl. after correctly-attributed tree-kills).
+        # Driver death breaks the pipe -> guaranteed raise; recovery does a
+        # full relaunch either way.
+        self._kill_driver()
 
     def _kill_driver(self) -> None:
         """Last-resort unblocker: kill this env's Playwright node driver."""
