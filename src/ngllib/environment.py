@@ -577,8 +577,29 @@ class Environment(gym.Env):
             current = asyncio.get_event_loop_policy()
             if not isinstance(current, asyncio.WindowsProactorEventLoopPolicy):
                 asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        # Guard the LAUNCH itself: driver spawn / chromium launch can hang with
+        # no pid yet known to kill (observed 2026-08-17: post-tree-kill relaunch
+        # froze here, silent forever). Fallback kills any node/chrome children
+        # spawned since pre_launch — ours with near-certainty; a rare sibling
+        # casualty just self-heals through its own recovery path.
+        pre_launch = time.time()
+
+        def _kill_new_children():
+            try:
+                for c in psutil.Process(os.getpid()).children(recursive=True):
+                    try:
+                        if c.create_time() >= pre_launch - 1.0 and (
+                            "node" in c.name().lower() or "chrom" in c.name().lower()
+                        ):
+                            c.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                logger.warning("launch watchdog swept children spawned since launch")
+            except Exception:
+                pass
+
+        _launch_wd = _BrowserWatchdog(120.0, _kill_new_children)
         try:
-            pre_launch = time.time()
             _kids_before = {c.pid for c in psutil.Process(os.getpid()).children()}
             self._playwright = sync_playwright().start()
             # The driver (a direct node child of this process) mediates every
@@ -607,6 +628,8 @@ class Environment(gym.Env):
                 f"failed to launch Chromium: {type(e).__name__}: {detail}. "
                 "Ensure 'playwright install chromium' has been run in this venv."
             ) from e
+        finally:
+            _launch_wd.cancel()
 
     def _restart_browser(self) -> None:
         logger.info("periodic browser restart at episode %d", self._episode_count)
