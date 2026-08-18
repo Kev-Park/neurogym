@@ -620,8 +620,26 @@ class Environment(gym.Env):
             self.page = self.browser.new_page(viewport={"width": W, "height": H})
             self._action_handler = MouseActionHandler(self.page)
             # Playwright doesn't expose the browser process; find it for the
-            # hang watchdog (kill target). Best-effort — None disables watchdog.
-            self._chrome_pid = self._find_chrome_pid(pre_launch)
+            # hang watchdog (kill target). THIS env's Chrome is a child of THIS
+            # env's driver — an unambiguous lookup. The old process-wide
+            # first-match could pick a SIBLING env's browser in the 16-env
+            # process, making the watchdog kill the wrong browser: the sibling
+            # recovered (looked like a routine glitch) while the truly hung env
+            # stayed blocked forever (the silent-runner saga, 2026-08-17).
+            self._chrome_pid = None
+            if self._driver_pid is not None:
+                for _ in range(20):
+                    try:
+                        kids = psutil.Process(self._driver_pid).children(recursive=True)
+                        self._chrome_pid = next(
+                            (c.pid for c in kids if "chrom" in c.name().lower()), None)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        break
+                    if self._chrome_pid is not None:
+                        break
+                    time.sleep(0.1)
+            if self._chrome_pid is None:
+                self._chrome_pid = self._find_chrome_pid(pre_launch)  # legacy fallback
         except Exception as e:
             detail = str(e) or repr(e)
             raise BrowserError(
