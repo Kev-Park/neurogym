@@ -135,11 +135,18 @@ class NativeEnvironment(gym.Env):
         self._task_info: dict[str, Any] = {}
         self._reward_fn: Callable | None = None
         self._terminated_fn: Callable | None = None
-        # Per-state tile memo: rotate/zoom steps reuse the fetched tiles.
+        # Tile pipeline: `_tiles` is the last COMPLETED tile set (memo-keyed);
+        # `_pending` is an in-flight fetch group. reset() blocks on it (the
+        # first observation is exact); step() adopts it when done and renders
+        # with the previous tiles meanwhile — Neuroglancer-equivalent
+        # semantics (Chrome renders whatever chunks are loaded; a frame after
+        # a move shows the previous slice until streaming catches up). Cold
+        # chunk fetches are 3-7s serial from S3; blocking per step on that
+        # was the density-probe wall.
         self._tile_key = None
         self._tiles: dict[str, Any] = {}
-        # The 2-3 tile fetches per position change are network-bound and
-        # independent — overlap them (data threads only; never GL).
+        self._pending: tuple | None = None  # (key, {name: Future}, ext)
+        # Data-only threads (never GL).
         self._fetch_pool: ThreadPoolExecutor | None = None
 
     # ------------------------------------------------------------------ spaces
@@ -211,7 +218,7 @@ class NativeEnvironment(gym.Env):
             v, f = self._meshes.get(rid)
             self._renderer.load_mesh(rid, v, f)
 
-        obs = self._gather_observation()
+        obs = self._gather_observation(block_tiles=True)
         self._prev_obs = obs
         return obs, {"task_info": task_info, "json_state": copy.deepcopy(st), "step": 0}
 
@@ -364,21 +371,18 @@ class NativeEnvironment(gym.Env):
         xs = float(self._json_state["crossSectionScale"])
         return xs * CSS_PANE * 4.0, xs * CSS_VIEW_H * 4.0
 
-    def _fetch_tiles(self) -> dict[str, Any]:
-        """EM/label tiles for the current state, memoized so rotate/zoom
-        steps (position and xs unchanged) skip the fetch."""
+    def _tile_state_key(self):
         st = self._json_state
         pos = st["position"]
+        return (round(pos[0], 2), round(pos[1], 2), round(pos[2], 2),
+                round(float(st["crossSectionScale"]), 5),
+                str(st["segments"][0]), self.left_pane)
+
+    def _submit_tile_fetch(self, key):
+        st = self._json_state
         rid = str(st["segments"][0])
-        key = (round(pos[0], 2), round(pos[1], 2), round(pos[2], 2),
-               round(float(st["crossSectionScale"]), 5), rid,
-               self.left_pane)
-        if key == self._tile_key:
-            return self._tiles
-        pos_nm = np.asarray(pos, dtype=np.float64) * VOXEL_NM
+        pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
         ext = self._pane_extents_nm()
-        tiles: dict[str, Any] = {"ext": ext, "plane": None, "left": None,
-                                 "label": None}
         if self._fetch_pool is None:
             self._fetch_pool = ThreadPoolExecutor(
                 max_workers=3, thread_name_prefix="ngl-native-fetch")
@@ -395,13 +399,43 @@ class NativeEnvironment(gym.Env):
             futs["label"] = self._fetch_pool.submit(
                 self._em.label_tile, shifted, ext[0], ext[1], rid,
                 (PANE, PANE_H))
+        self._pending = (key, futs, ext)
+
+    def _adopt_pending(self) -> None:
+        key, futs, ext = self._pending
+        tiles: dict[str, Any] = {"ext": ext, "plane": None, "left": None,
+                                 "label": None}
         for name, fut in futs.items():
             try:
                 tiles[name] = fut.result()
             except Exception as e:
                 logger.warning("EM %s tile fetch failed (%s); skipped", name, e)
         self._tile_key, self._tiles = key, tiles
-        return tiles
+        self._pending = None
+
+    def _fetch_tiles(self, block: bool) -> dict[str, Any]:
+        """Tiles for the current state. block=True (reset) waits for exact
+        tiles; block=False (step) returns the last completed set while the
+        fetch streams in — see the pipeline note in __init__."""
+        key = self._tile_state_key()
+        if key == self._tile_key:
+            return self._tiles
+        if self._pending is not None and self._pending[0] != key:
+            # Superseded in-flight fetch: adopt it only if it already
+            # finished (warms the LRU either way), then refetch.
+            if all(f.done() for f in self._pending[1].values()):
+                self._adopt_pending()
+                if key == self._tile_key:
+                    return self._tiles
+            elif block:
+                self._adopt_pending()  # drain before the exact fetch
+            else:
+                return self._tiles  # keep rendering stale; let it land
+        if self._pending is None:
+            self._submit_tile_fetch(key)
+        if block or all(f.done() for f in self._pending[1].values()):
+            self._adopt_pending()
+        return self._tiles
 
     def _render_left(self, tiles: dict[str, Any]) -> np.ndarray:
         """2D xy EM pane: browser-matched filter chain + tint + crosshair."""
@@ -443,9 +477,9 @@ class NativeEnvironment(gym.Env):
         out[TOOLBAR:] = pane
         return out
 
-    def _gather_observation(self) -> dict[str, Any]:
+    def _gather_observation(self, block_tiles: bool = False) -> dict[str, Any]:
         st = self._json_state
-        tiles = self._fetch_tiles()
+        tiles = self._fetch_tiles(block=block_tiles)
         panes = []
         if self.left_pane:
             panes.append(self._render_left(tiles))

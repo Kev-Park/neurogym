@@ -28,7 +28,7 @@ class EMTiles:
     # In-RAM chunk LRU per volume handle. Chrome keeps the episode's chunk
     # working set hot in memory; without this every revisit pays disk-cache
     # decode (or worse, network), and the synchronous step blocks on it.
-    LRU_BYTES = 512 << 20
+    LRU_BYTES = 256 << 20  # per volume handle; envs each hold a few handles
 
     def __init__(self, cache_dir: str):
         from cloudvolume import CloudVolume
