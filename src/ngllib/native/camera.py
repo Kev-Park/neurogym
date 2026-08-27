@@ -28,8 +28,9 @@ CALIBRATE: the collection-pair comparison decides the exact convention;
 start with canonical space = voxels scaled by (1, 1, 10) and
 projection_scale in xy-voxel units.
 
-relative_depth_range: NG navigation default — CALIBRATE (start 0.5; affects
-only clipping, not on-screen scale, so it is a weak parameter).
+relative_depth_range: NG default = 10 (viewer.ts: new
+TrackableDepthRange(-10, ...); negative = relative). After the /f division
+this gives near 0.1, far ~5.1 in orbit-distance units — near-unclipped.
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ def projection_camera(
     projection_scale: float,
     width: int,
     height: int,
-    relative_depth_range: float = 0.5,
+    relative_depth_range: float = 10.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """(view, projection) matrices for NG's perspective pane.
 
