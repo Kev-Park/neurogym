@@ -26,6 +26,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Literal
 
 import gymnasium as gym
@@ -137,6 +138,9 @@ class NativeEnvironment(gym.Env):
         # Per-state tile memo: rotate/zoom steps reuse the fetched tiles.
         self._tile_key = None
         self._tiles: dict[str, Any] = {}
+        # The 2-3 tile fetches per position change are network-bound and
+        # independent — overlap them (data threads only; never GL).
+        self._fetch_pool: ThreadPoolExecutor | None = None
 
     # ------------------------------------------------------------------ spaces
 
@@ -238,6 +242,9 @@ class NativeEnvironment(gym.Env):
         return obs, reward, terminated, False, info
 
     def close(self):
+        if self._fetch_pool is not None:
+            self._fetch_pool.shutdown(wait=False)
+            self._fetch_pool = None
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
@@ -372,23 +379,27 @@ class NativeEnvironment(gym.Env):
         ext = self._pane_extents_nm()
         tiles: dict[str, Any] = {"ext": ext, "plane": None, "left": None,
                                  "label": None}
-        try:
-            tiles["plane"] = self._em.tile(pos_nm, ext[0], ext[1], max_px=1024)
-        except Exception as e:
-            logger.warning("EM plane tile fetch failed (%s); plane skipped", e)
+        if self._fetch_pool is None:
+            self._fetch_pool = ThreadPoolExecutor(
+                max_workers=3, thread_name_prefix="ngl-native-fetch")
+        futs = {"plane": self._fetch_pool.submit(
+            self._em.tile, pos_nm, ext[0], ext[1], 1024)}
         if self.left_pane:
             # Baked registration correction: move the fetch center by the
             # calibrated (dy, dx) captured px, in nm.
             shifted = pos_nm + np.array([
                 LEFT_SHIFT_PX[1] * ext[0] / PANE,
                 LEFT_SHIFT_PX[0] * ext[1] / PANE_H, 0.0])
+            futs["left"] = self._fetch_pool.submit(
+                self._em.tile, shifted, ext[0], ext[1], 1024, True)
+            futs["label"] = self._fetch_pool.submit(
+                self._em.label_tile, shifted, ext[0], ext[1], rid,
+                (PANE, PANE_H))
+        for name, fut in futs.items():
             try:
-                tiles["left"] = self._em.tile(
-                    shifted, ext[0], ext[1], max_px=1024, subpixel=True)
-                tiles["label"] = self._em.label_tile(
-                    shifted, ext[0], ext[1], rid, out_px=(PANE, PANE_H))
+                tiles[name] = fut.result()
             except Exception as e:
-                logger.warning("EM 2D tile fetch failed (%s); pane blank", e)
+                logger.warning("EM %s tile fetch failed (%s); skipped", name, e)
         self._tile_key, self._tiles = key, tiles
         return tiles
 

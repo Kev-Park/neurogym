@@ -25,6 +25,11 @@ class EMTiles:
 
     RES_XY = [8, 16, 32, 64, 128]  # nm, mips 1..5
 
+    # In-RAM chunk LRU per volume handle. Chrome keeps the episode's chunk
+    # working set hot in memory; without this every revisit pays disk-cache
+    # decode (or worse, network), and the synchronous step blocks on it.
+    LRU_BYTES = 512 << 20
+
     def __init__(self, cache_dir: str):
         from cloudvolume import CloudVolume
 
@@ -32,33 +37,60 @@ class EMTiles:
         self._CloudVolume = CloudVolume
         self._cache = cache_dir
 
+    def _open(self, url: str, **kw):
+        base = dict(use_https=True, cache=self._cache, progress=False,
+                    fill_missing=True, bounded=False)
+        try:
+            return self._CloudVolume(url, lru_bytes=self.LRU_BYTES,
+                                     **base, **kw)
+        except TypeError:  # older cloud-volume without lru_bytes
+            return self._CloudVolume(url, **base, **kw)
+
     def _vol(self, mip: int):
         if mip not in self._vols:
-            self._vols[mip] = self._CloudVolume(
-                EM_URL, mip=mip, use_https=True, cache=self._cache,
-                progress=False, fill_missing=True, bounded=False)
+            self._vols[mip] = self._open(EM_URL, mip=mip)
         return self._vols[mip]
+
+    def _seg_vol(self, target_res_nm: float):
+        """Seg volume at the coarsest mip still at/below target_res_nm per
+        px — fetching labels at native resolution over-fetches ~64x in area
+        for typical pane extents."""
+        if "seg_scales" not in self._vols:
+            try:
+                base = self._open(SEG_URL, agglomerate=False)
+                self._vols["seg_scales"] = [
+                    s["resolution"][0] for s in base.info["scales"]]
+                self._vols[("seg", 0)] = base
+            except Exception:
+                self._vols["seg_scales"] = None
+        scales = self._vols["seg_scales"]
+        if scales is None:
+            return None
+        mip = 0
+        for i, r in enumerate(scales):
+            if r <= target_res_nm:
+                mip = i
+            else:
+                break
+        if ("seg", mip) not in self._vols:
+            self._vols[("seg", mip)] = self._open(
+                SEG_URL, agglomerate=False, mip=mip)
+        return self._vols[("seg", mip)]
 
     def label_tile(self, pos_nm, extent_x_nm, extent_y_nm, root_id,
                    out_px=(450, 433)):
         """Boolean mask of the root segment on the z-slice, or None if the
         static label chunks aren't readable from the m783 bucket."""
-        if "seg" not in self._vols:
-            try:
-                self._vols["seg"] = self._CloudVolume(
-                    SEG_URL, use_https=True, cache=self._cache,
-                    progress=False, fill_missing=True, bounded=False,
-                    agglomerate=False)
-            except Exception:
-                self._vols["seg"] = None
-        vol = self._vols["seg"]
-        if vol is None:
-            return None
         try:
+            vol = self._seg_vol(extent_x_nm / out_px[0])
+            if vol is None:
+                return None
             res = vol.resolution  # nm per voxel
             cx = int(pos_nm[0] / res[0]); cy = int(pos_nm[1] / res[1])
             z = int(pos_nm[2] / res[2])
             hx = int(extent_x_nm / res[0] / 2); hy = int(extent_y_nm / res[1] / 2)
+            if hx < 1 or hy < 1:
+                return None
             cut = vol[cx - hx:cx + hx, cy - hy:cy + hy, z:z + 1]
             lab = np.asarray(cut)[:, :, 0, 0].T
             mask = (lab == int(root_id)).astype(np.uint8) * 255
