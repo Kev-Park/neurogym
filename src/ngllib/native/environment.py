@@ -267,8 +267,11 @@ class NativeEnvironment(gym.Env):
     @classmethod
     def _tile_pool(cls) -> ProcessPoolExecutor:
         if cls._TILE_POOL is None:
+            # Tune down (NGL_NATIVE_FETCH_WORKERS) when many runner
+            # processes share a node — fetch workers multiply per runner.
             cls._TILE_POOL = ProcessPoolExecutor(
-                max_workers=6,
+                max_workers=int(os.environ.get(
+                    "NGL_NATIVE_FETCH_WORKERS", "6")),
                 mp_context=multiprocessing.get_context("spawn"))
         return cls._TILE_POOL
 
