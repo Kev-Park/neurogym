@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import copy
 import logging
+import multiprocessing
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Callable, Literal
 
 import gymnasium as gym
@@ -38,7 +40,7 @@ from ..errors import ProviderError
 from ..providers import StateProvider
 from ..utils.geom import euler_to_quaternion, quaternion_to_euler
 from .colors import segment_color
-from .em import EMTiles, MeshStore
+from .em import MeshStore, worker_label_tile, worker_tile
 from .render3d import MeshRenderer
 
 logger = logging.getLogger(__name__)
@@ -125,7 +127,6 @@ class NativeEnvironment(gym.Env):
         # GL/data backends are lazy (first reset) so construction stays cheap
         # and importable off-GPU, mirroring the browser env's lazy launch.
         self._renderer: MeshRenderer | None = None
-        self._em: EMTiles | None = None
         self._meshes: MeshStore | None = None
         self._mesh_budget = mesh_budget_bytes
 
@@ -146,8 +147,6 @@ class NativeEnvironment(gym.Env):
         self._tile_key = None
         self._tiles: dict[str, Any] = {}
         self._pending: tuple | None = None  # (key, {name: Future}, ext)
-        # Data-only threads (never GL).
-        self._fetch_pool: ThreadPoolExecutor | None = None
 
     # ------------------------------------------------------------------ spaces
 
@@ -249,24 +248,35 @@ class NativeEnvironment(gym.Env):
         return obs, reward, terminated, False, info
 
     def close(self):
-        if self._fetch_pool is not None:
-            self._fetch_pool.shutdown(wait=False)
-            self._fetch_pool = None
+        # The class-level tile pool outlives individual envs on purpose
+        # (shared by the process's env fleet; reaped at interpreter exit).
+        self._pending = None
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
-        self._em = None
         self._meshes = None
 
     # ------------------------------------------------------------------ internals
+
+    # One fetch pool per PROCESS, shared by all envs in it (a runner hosts
+    # 16 threaded envs): GIL-isolates chunk download/decode and dedupes the
+    # workers' chunk LRUs across envs. Spawn context — fork would inherit
+    # CUDA/EGL state.
+    _TILE_POOL: ProcessPoolExecutor | None = None
+
+    @classmethod
+    def _tile_pool(cls) -> ProcessPoolExecutor:
+        if cls._TILE_POOL is None:
+            cls._TILE_POOL = ProcessPoolExecutor(
+                max_workers=6,
+                mp_context=multiprocessing.get_context("spawn"))
+        return cls._TILE_POOL
 
     def _ensure_backends(self) -> None:
         if self._renderer is None:
             self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget)
             logger.info("native renderer GL: %s",
                         self._renderer.ctx.info["GL_RENDERER"])
-        if self._em is None:
-            self._em = EMTiles(self._cache_dir)
         if self._meshes is None:
             self._meshes = MeshStore(self._cache_dir)
 
@@ -383,31 +393,32 @@ class NativeEnvironment(gym.Env):
         rid = str(st["segments"][0])
         pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
         ext = self._pane_extents_nm()
-        if self._fetch_pool is None:
-            self._fetch_pool = ThreadPoolExecutor(
-                max_workers=3, thread_name_prefix="ngl-native-fetch")
-        futs = {"plane": self._fetch_pool.submit(
-            self._em.tile, pos_nm, ext[0], ext[1], 1024)}
+        pool = self._tile_pool()
+        cd = self._cache_dir
+        futs = {"plane": pool.submit(
+            worker_tile, cd, pos_nm, ext[0], ext[1], 1024, False)}
         if self.left_pane:
             # Baked registration correction: move the fetch center by the
             # calibrated (dy, dx) captured px, in nm.
             shifted = pos_nm + np.array([
                 LEFT_SHIFT_PX[1] * ext[0] / PANE,
                 LEFT_SHIFT_PX[0] * ext[1] / PANE_H, 0.0])
-            futs["left"] = self._fetch_pool.submit(
-                self._em.tile, shifted, ext[0], ext[1], 1024, True)
-            futs["label"] = self._fetch_pool.submit(
-                self._em.label_tile, shifted, ext[0], ext[1], rid,
+            futs["left"] = pool.submit(
+                worker_tile, cd, shifted, ext[0], ext[1], 1024, True)
+            futs["label"] = pool.submit(
+                worker_label_tile, cd, shifted, ext[0], ext[1], rid,
                 (PANE, PANE_H))
         self._pending = (key, futs, ext)
 
-    def _adopt_pending(self) -> None:
+    def _adopt_pending(self, timeout_s: float = 180.0) -> None:
         key, futs, ext = self._pending
         tiles: dict[str, Any] = {"ext": ext, "plane": None, "left": None,
                                  "label": None}
         for name, fut in futs.items():
             try:
-                tiles[name] = fut.result()
+                tiles[name] = fut.result(timeout=timeout_s)
+            except FuturesTimeout:
+                logger.warning("EM %s tile fetch timed out; skipped", name)
             except Exception as e:
                 logger.warning("EM %s tile fetch failed (%s); skipped", name, e)
         self._tile_key, self._tiles = key, tiles
@@ -438,9 +449,14 @@ class NativeEnvironment(gym.Env):
         return self._tiles
 
     def _render_left(self, tiles: dict[str, Any]) -> np.ndarray:
-        """2D xy EM pane: browser-matched filter chain + tint + crosshair."""
+        """2D xy EM pane: browser-matched filter chain + tint + crosshair.
+        Memoized on the tile set — the pane only changes when tiles do, and
+        the PIL chain is the priciest per-step CPU otherwise."""
+        if "left_canvas" in tiles:
+            return tiles["left_canvas"]
         canvas = np.zeros((PANE, PANE, 3), dtype=np.uint8)
         if tiles["left"] is None:
+            tiles["left_canvas"] = canvas
             return canvas
         # Filter chain (calibrated): subpixel-phase tile -> GL-linear resample
         # to the 900x867 CSS pane -> Chrome's area-average capture downscale.
@@ -461,6 +477,7 @@ class NativeEnvironment(gym.Env):
         colm = rgb[cy:cy + length, cx]
         rgb[cy:cy + length, cx] = 0.5 * np.array([0, 255, 0]) + 0.5 * colm
         canvas[TOOLBAR:] = np.clip(rgb, 0, 255).astype(np.uint8)
+        tiles["left_canvas"] = canvas
         return canvas
 
     def _render_right(self, tiles: dict[str, Any]) -> np.ndarray:

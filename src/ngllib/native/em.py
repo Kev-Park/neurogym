@@ -131,6 +131,35 @@ class EMTiles:
         return img
 
 
+# ---------------------------------------------------------------------------
+# Process-pool fetch workers. Chunk download+decode is GIL-heavy (numpy
+# assembly, zlib) — done on threads it starves the env stepping threads
+# (measured: M=8 aggregate DROPPED vs M=4). Each worker process holds one
+# EMTiles per cache_dir; a per-runner pool is shared by all its envs, so
+# the in-RAM chunk LRU also dedupes across envs.
+
+_WORKER_EM: dict = {}
+
+
+def _worker_em(cache_dir: str) -> EMTiles:
+    em = _WORKER_EM.get(cache_dir)
+    if em is None:
+        em = _WORKER_EM[cache_dir] = EMTiles(cache_dir)
+    return em
+
+
+def worker_tile(cache_dir, pos_nm, extent_x_nm, extent_y_nm, max_px,
+                subpixel):
+    return _worker_em(cache_dir).tile(
+        np.asarray(pos_nm), extent_x_nm, extent_y_nm, max_px, subpixel)
+
+
+def worker_label_tile(cache_dir, pos_nm, extent_x_nm, extent_y_nm, root_id,
+                      out_px):
+    return _worker_em(cache_dir).label_tile(
+        np.asarray(pos_nm), extent_x_nm, extent_y_nm, root_id, out_px)
+
+
 class MeshStore:
     """Sharded-Draco mesh fetch (CloudVolume) with a decoded-mesh cache."""
 
