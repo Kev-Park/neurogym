@@ -168,7 +168,11 @@ class NativeEnvironment(gym.Env):
         # from the SAME rng stream at the same point it would be inline, so
         # sampling is unchanged (the wall-clock curriculum sees it ~one
         # episode early — negligible). seed/options resets discard it.
-        self.reset_ahead = reset_ahead and render_service is None
+        # In service mode the prefetch is a pre-drawn state + fire-and-forget
+        # warm RPC (the service preloads mesh+canvas); local mode prefetches
+        # mesh/tiles itself. Without it, short-episode phases stall vector
+        # barriers on 1-3s blocking resets (measured: 2.2s/vector-step).
+        self.reset_ahead = reset_ahead
         self._prefetch: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ spaces
@@ -251,7 +255,9 @@ class NativeEnvironment(gym.Env):
         self._tile_key = None
 
         rid = str(st["segments"][0])
-        if self._service is None and not self._renderer.has_mesh(rid):
+        if self._service is not None and pf is not None:
+            pass  # service caches were warmed by the prefetch RPC
+        elif self._service is None and not self._renderer.has_mesh(rid):
             v = vn = f = None
             if pf is not None and pf.get("mesh_fut") is not None:
                 try:
@@ -263,7 +269,7 @@ class NativeEnvironment(gym.Env):
                 v, f = self._meshes.get(rid)
                 vn = None
             self._renderer.load_mesh(rid, v, f, normals=vn)
-        if pf is not None:
+        if pf is not None and pf.get("tiles") is not None:
             # Adopt the prefetched tile group; the blocking gather below
             # resolves it (usually already done).
             self._pending = pf["tiles"]
@@ -500,6 +506,16 @@ class NativeEnvironment(gym.Env):
             state, task_info = self._reset_state_provider(self._rng, {})
         except Exception as e:
             logger.warning("reset-ahead pre-sample failed (%s)", e)
+            return
+        if self._service is not None:
+            # Fire-and-forget warm: the service preloads the mesh and starts
+            # the canvas fetch so the coming reset hits warm caches.
+            try:
+                self._service.warm(state)
+            except Exception as e:
+                logger.warning("service warm failed (%s)", e)
+            self._prefetch = {"state": state, "task_info": task_info,
+                              "mesh_fut": None, "tiles": None}
             return
         try:
             rid = str(state["segments"][0])
