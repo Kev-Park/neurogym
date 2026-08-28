@@ -412,10 +412,14 @@ class NativeEnvironment(gym.Env):
             for i in range(4):
                 new_state["projectionOrientation"][i] += float(d[i])
 
-        new_state["projectionScale"] = min(
+        # Floor at 1.0 (deviation from the browser arithmetic ONLY at the
+        # degenerate point): repeated zoom-ins can hit projectionScale == 0
+        # exactly (14000 - 7x2000), which makes the camera matrix singular
+        # here — Chrome just renders garbage and carries on.
+        new_state["projectionScale"] = max(1.0, min(
             500_000,
             new_state["projectionScale"] + float(action["delta_proj_scale"][0]),
-        )
+        ))
 
     # ---- observation
 
