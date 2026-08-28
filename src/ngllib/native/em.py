@@ -160,6 +160,29 @@ def worker_label_tile(cache_dir, pos_nm, extent_x_nm, extent_y_nm, root_id,
         np.asarray(pos_nm), extent_x_nm, extent_y_nm, root_id, out_px)
 
 
+_WORKER_MESHES: dict = {}
+
+
+def worker_mesh(cache_dir: str, root_id: str):
+    """Fetch + decode a mesh AND its smooth vertex normals in the worker
+    process (reset-ahead prefetch): download/Draco/np.add.at are the ~30s
+    reset tail, all GIL-heavy — none of it belongs on the env thread.
+    Returns (vertices_nm f4 [N,3], normals f4 [N,3], faces i4 [M,3])."""
+    store = _WORKER_MESHES.get(cache_dir)
+    if store is None:
+        store = _WORKER_MESHES[cache_dir] = MeshStore(cache_dir)
+    v, f = store.get(root_id)
+    e1 = v[f[:, 1]] - v[f[:, 0]]
+    e2 = v[f[:, 2]] - v[f[:, 0]]
+    fn = np.cross(e1, e2)
+    vn = np.zeros_like(v)
+    for k in range(3):
+        np.add.at(vn, f[:, k], fn)
+    vn /= (np.linalg.norm(vn, axis=1, keepdims=True) + 1e-9)
+    store.drop(root_id)  # worker-side RAM cache would only grow
+    return v, vn.astype("f4"), f
+
+
 class MeshStore:
     """Sharded-Draco mesh fetch (CloudVolume) with a decoded-mesh cache."""
 

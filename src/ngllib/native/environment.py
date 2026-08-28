@@ -40,7 +40,7 @@ from ..errors import ProviderError
 from ..providers import StateProvider
 from ..utils.geom import euler_to_quaternion, quaternion_to_euler
 from .colors import segment_color
-from .em import MeshStore, worker_label_tile, worker_tile
+from .em import MeshStore, worker_label_tile, worker_mesh, worker_tile
 from .render3d import MeshRenderer
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,7 @@ class NativeEnvironment(gym.Env):
         termination_factory: Callable | None = None,
         cache_dir: str | None = None,
         mesh_budget_bytes: int = 2 << 30,
+        reset_ahead: bool = True,
     ):
         super().__init__()
         if tuple(window_size) != (1800, 900) or capture_scale != 0.5:
@@ -147,6 +148,15 @@ class NativeEnvironment(gym.Env):
         self._tile_key = None
         self._tiles: dict[str, Any] = {}
         self._pending: tuple | None = None  # (key, {name: Future}, ext)
+        # Reset-ahead prefetch (native analog of the browser env's M5):
+        # measured 38s reset tail = mesh download/decode/normals + cold
+        # tiles for the NEXT episode's neuron — all prefetchable during the
+        # current episode. The provider draw for the next episode is taken
+        # from the SAME rng stream at the same point it would be inline, so
+        # sampling is unchanged (the wall-clock curriculum sees it ~one
+        # episode early — negligible). seed/options resets discard it.
+        self.reset_ahead = reset_ahead
+        self._prefetch: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ spaces
 
@@ -192,7 +202,15 @@ class NativeEnvironment(gym.Env):
         options = options or {}
         self._ensure_backends()
 
-        start_state, task_info = self._resolve_reset_state(options)
+        pf = None
+        if (self.reset_ahead and self._prefetch is not None
+                and seed is None and not options):
+            pf = self._prefetch  # adopt: state pre-drawn from the same rng stream
+        self._prefetch = None
+        if pf is not None:
+            start_state, task_info = pf["state"], pf["task_info"]
+        else:
+            start_state, task_info = self._resolve_reset_state(options)
         if start_state is None or not isinstance(start_state, dict):
             raise ValueError(
                 "NativeEnvironment requires an explicit NglState dict from the "
@@ -214,11 +232,26 @@ class NativeEnvironment(gym.Env):
 
         rid = str(st["segments"][0])
         if not self._renderer.has_mesh(rid):
-            v, f = self._meshes.get(rid)
-            self._renderer.load_mesh(rid, v, f)
+            v = vn = f = None
+            if pf is not None and pf.get("mesh_fut") is not None:
+                try:
+                    v, vn, f = pf["mesh_fut"].result(timeout=240)
+                except Exception as e:
+                    logger.warning("prefetched mesh failed (%s); inline fetch", e)
+                    v = None
+            if v is None:
+                v, f = self._meshes.get(rid)
+                vn = None
+            self._renderer.load_mesh(rid, v, f, normals=vn)
+        if pf is not None:
+            # Adopt the prefetched tile group; the blocking gather below
+            # resolves it (usually already done).
+            self._pending = pf["tiles"]
 
         obs = self._gather_observation(block_tiles=True)
         self._prev_obs = obs
+        if self.reset_ahead:
+            self._schedule_prefetch()
         return obs, {"task_info": task_info, "json_state": copy.deepcopy(st), "step": 0}
 
     def step(self, action):
@@ -251,6 +284,7 @@ class NativeEnvironment(gym.Env):
         # The class-level tile pool outlives individual envs on purpose
         # (shared by the process's env fleet; reaped at interpreter exit).
         self._pending = None
+        self._prefetch = None
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
@@ -384,18 +418,20 @@ class NativeEnvironment(gym.Env):
         xs = float(self._json_state["crossSectionScale"])
         return xs * CSS_PANE * 4.0, xs * CSS_VIEW_H * 4.0
 
+    def _tile_key_for(self, pos, xs, rid):
+        return (round(pos[0], 2), round(pos[1], 2), round(pos[2], 2),
+                round(float(xs), 5), rid, self.left_pane)
+
     def _tile_state_key(self):
         st = self._json_state
-        pos = st["position"]
-        return (round(pos[0], 2), round(pos[1], 2), round(pos[2], 2),
-                round(float(st["crossSectionScale"]), 5),
-                str(st["segments"][0]), self.left_pane)
+        return self._tile_key_for(st["position"], st["crossSectionScale"],
+                                  str(st["segments"][0]))
 
-    def _submit_tile_fetch(self, key):
-        st = self._json_state
-        rid = str(st["segments"][0])
-        pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
-        ext = self._pane_extents_nm()
+    def _submit_tile_group(self, pos, xs, rid) -> tuple:
+        """(key, futs, ext) for an arbitrary state — used both for the
+        current state and for reset-ahead prefetch."""
+        pos_nm = np.asarray(pos, dtype=np.float64) * VOXEL_NM
+        ext = (float(xs) * CSS_PANE * 4.0, float(xs) * CSS_VIEW_H * 4.0)
         pool = self._tile_pool()
         cd = self._cache_dir
         futs = {"plane": pool.submit(
@@ -411,7 +447,36 @@ class NativeEnvironment(gym.Env):
             futs["label"] = pool.submit(
                 worker_label_tile, cd, shifted, ext[0], ext[1], rid,
                 (PANE, PANE_H))
-        self._pending = (key, futs, ext)
+        return (self._tile_key_for(pos, xs, rid), futs, ext)
+
+    def _submit_tile_fetch(self, key):
+        st = self._json_state
+        self._pending = self._submit_tile_group(
+            st["position"], st["crossSectionScale"], str(st["segments"][0]))
+
+    def _schedule_prefetch(self) -> None:
+        """Pre-draw the next episode and start its mesh/tile fetches."""
+        if self._reset_state_provider is None or self._prefetch is not None:
+            return
+        try:
+            state, task_info = self._reset_state_provider(self._rng, {})
+        except Exception as e:
+            logger.warning("reset-ahead pre-sample failed (%s)", e)
+            return
+        try:
+            rid = str(state["segments"][0])
+            mesh_fut = (None if self._renderer.has_mesh(rid)
+                        else self._tile_pool().submit(
+                            worker_mesh, self._cache_dir, rid))
+            tiles = self._submit_tile_group(
+                state["position"], state["crossSectionScale"], rid)
+        except Exception as e:
+            logger.warning("reset-ahead prefetch submit failed (%s)", e)
+            mesh_fut, tiles = None, None
+        if tiles is None:
+            return
+        self._prefetch = {"state": state, "task_info": task_info,
+                          "mesh_fut": mesh_fut, "tiles": tiles}
 
     def _adopt_pending(self, timeout_s: float = 180.0) -> None:
         key, futs, ext = self._pending

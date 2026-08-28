@@ -101,20 +101,26 @@ class MeshRenderer:
     def has_mesh(self, root_id: str) -> bool:
         return root_id in self._vaos
 
-    def load_mesh(self, root_id: str, vertices_nm, faces) -> None:
-        """Indexed draw with smooth per-vertex normals; LRU-evicts past budget."""
+    def load_mesh(self, root_id: str, vertices_nm, faces,
+                  normals=None) -> None:
+        """Indexed draw with smooth per-vertex normals (precomputed via
+        `normals`, e.g. by em.worker_mesh, or derived here); LRU-evicts
+        past budget."""
         if root_id in self._vaos:
             self._vaos.move_to_end(root_id)
             return
         v = np.asarray(vertices_nm, dtype="f4")
         f = np.asarray(faces, dtype="i4")
-        e1 = v[f[:, 1]] - v[f[:, 0]]
-        e2 = v[f[:, 2]] - v[f[:, 0]]
-        fn = np.cross(e1, e2)
-        vn = np.zeros_like(v)
-        for k in range(3):
-            np.add.at(vn, f[:, k], fn)
-        vn /= (np.linalg.norm(vn, axis=1, keepdims=True) + 1e-9)
+        if normals is not None:
+            vn = np.asarray(normals, dtype="f4")
+        else:
+            e1 = v[f[:, 1]] - v[f[:, 0]]
+            e2 = v[f[:, 2]] - v[f[:, 0]]
+            fn = np.cross(e1, e2)
+            vn = np.zeros_like(v)
+            for k in range(3):
+                np.add.at(vn, f[:, k], fn)
+            vn /= (np.linalg.norm(vn, axis=1, keepdims=True) + 1e-9)
         vbo = self.ctx.buffer(np.hstack([v, vn.astype("f4")]).tobytes())
         ibo = self.ctx.buffer(f.tobytes())
         vao = self.ctx.vertex_array(
