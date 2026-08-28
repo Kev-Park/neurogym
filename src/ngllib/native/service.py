@@ -25,7 +25,7 @@ import logging
 import queue
 import threading
 import time
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -43,8 +43,6 @@ class RenderEncodeService:
                  fetch_workers: int = 8, window_ms: float = 5.0,
                  mesh_budget_bytes: int = 4 << 30,
                  canvas_cache: int = 512):
-        import multiprocessing
-
         self._encoder = encoder
         self.feature_dim = int(encoder.feature_dim)
         self._cache_dir = cache_dir
@@ -52,9 +50,15 @@ class RenderEncodeService:
         self._rend = MeshRenderer(pane2d.PANE, pane2d.PANE_H,
                                   mesh_budget_bytes)
         self._meshes = MeshStore(cache_dir)
-        self._fetch_pool = ProcessPoolExecutor(
+        # THREADS, not processes: nested multiprocessing inside a Ray actor
+        # breaks (resource-tracker KeyErrors kill the actor). Canvas work is
+        # network waits + PIL/zlib C calls that release the GIL.
+        from .em import _worker_em
+
+        _worker_em(cache_dir)  # eager init so threads only read the cache
+        self._fetch_pool = ThreadPoolExecutor(
             max_workers=fetch_workers,
-            mp_context=multiprocessing.get_context("spawn"))
+            thread_name_prefix="ngl-svc-fetch")
         self._req_q: queue.Queue = queue.Queue()
         self._enc_q: queue.Queue = queue.Queue(maxsize=2)
         # Composed-canvas cache: tile_key -> canvas; misses submit a worker
