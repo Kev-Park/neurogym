@@ -40,7 +40,13 @@ from ..errors import ProviderError
 from ..providers import StateProvider
 from ..utils.geom import euler_to_quaternion, quaternion_to_euler
 from .colors import segment_color
-from .em import MeshStore, worker_label_tile, worker_mesh, worker_tile
+from .em import (
+    MeshStore,
+    worker_label_tile,
+    worker_left_canvas,
+    worker_mesh,
+    worker_tile,
+)
 from .render3d import MeshRenderer
 
 logger = logging.getLogger(__name__)
@@ -134,6 +140,13 @@ class NativeEnvironment(gym.Env):
             import uuid
 
             self._client_id = uuid.uuid4().hex
+            # Client-side 2D canvas pipeline (service mode): composed in
+            # this runner's fetch process pool, shipped to the service only
+            # when it changes. In-service compose starved the actor's GIL
+            # at fleet click rates.
+            self._svc_key = None       # canvas key the service holds for us
+            self._svc_fut = None
+            self._svc_futkey = None
         self._image_shape = self._compute_image_shape()
         self.observation_space = self._build_observation_space()
         self.action_space = self._build_action_space()
@@ -273,6 +286,10 @@ class NativeEnvironment(gym.Env):
             # Adopt the prefetched tile group; the blocking gather below
             # resolves it (usually already done).
             self._pending = pf["tiles"]
+        if pf is not None and pf.get("canvas_fut") is not None:
+            # Adopt the pre-composed canvas for the service-mode gather.
+            self._svc_fut = pf["canvas_fut"]
+            self._svc_futkey = self._tile_state_key()
 
         obs = self._gather_observation(block_tiles=True)
         self._prev_obs = obs
@@ -498,6 +515,30 @@ class NativeEnvironment(gym.Env):
         self._pending = self._submit_tile_group(
             st["position"], st["crossSectionScale"], str(st["segments"][0]))
 
+    def _service_canvas(self, block: bool) -> np.ndarray | None:
+        """Composed 2D canvas when it changed (else None -> service reuses
+        the last one). Same stale-tolerant semantics as local-mode tiles."""
+        key = self._tile_state_key()
+        if key == self._svc_key:
+            return None
+        st = self._json_state
+        if self._svc_fut is None or self._svc_futkey != key:
+            self._svc_fut = self._tile_pool().submit(
+                worker_left_canvas, self._cache_dir, list(st["position"]),
+                float(st["crossSectionScale"]), str(st["segments"][0]))
+            self._svc_futkey = key
+        if block or self._svc_fut.done():
+            try:
+                canvas = self._svc_fut.result(timeout=180)
+            except Exception as e:
+                logger.warning("client canvas failed (%s); stale", e)
+                canvas = None
+            self._svc_fut = None
+            if canvas is not None:
+                self._svc_key = key
+                return canvas
+        return None
+
     def _schedule_prefetch(self) -> None:
         """Pre-draw the next episode and start its mesh/tile fetches."""
         if self._reset_state_provider is None or self._prefetch is not None:
@@ -508,14 +549,19 @@ class NativeEnvironment(gym.Env):
             logger.warning("reset-ahead pre-sample failed (%s)", e)
             return
         if self._service is not None:
-            # Fire-and-forget warm: the service preloads the mesh and starts
-            # the canvas fetch so the coming reset hits warm caches.
+            # Warm the service's mesh cache and pre-compose the next
+            # episode's canvas client-side, so the reset blocks on neither.
             try:
                 self._service.warm(state)
             except Exception as e:
                 logger.warning("service warm failed (%s)", e)
+            canvas_fut = self._tile_pool().submit(
+                worker_left_canvas, self._cache_dir,
+                list(state["position"]), float(state["crossSectionScale"]),
+                str(state["segments"][0]))
             self._prefetch = {"state": state, "task_info": task_info,
-                              "mesh_fut": None, "tiles": None}
+                              "mesh_fut": None, "tiles": None,
+                              "canvas_fut": canvas_fut}
             return
         try:
             rid = str(state["segments"][0])
@@ -619,8 +665,8 @@ class NativeEnvironment(gym.Env):
     def _gather_observation(self, block_tiles: bool = False) -> dict[str, Any]:
         st = self._json_state
         if self._service is not None:
-            feats = self._service.features(self._client_id, st,
-                                           block_canvas=block_tiles)
+            canvas = self._service_canvas(block=block_tiles)
+            feats = self._service.features(self._client_id, st, canvas)
             orient_raw = st["projectionOrientation"]
             orient = (np.asarray(quaternion_to_euler(orient_raw), dtype=np.float32)
                       if self.orientation == "euler"

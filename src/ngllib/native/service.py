@@ -25,14 +25,14 @@ import logging
 import queue
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from typing import Any
 
 import numpy as np
 
 from . import pane2d
 from .colors import segment_color
-from .em import MeshStore, worker_left_canvas
+from .em import MeshStore
 from .render3d import MeshRenderer
 
 logger = logging.getLogger(__name__)
@@ -54,23 +54,13 @@ class RenderEncodeService:
         self._mesh_budget = mesh_budget_bytes
         self._gl_ready = threading.Event()
         self._meshes = MeshStore(cache_dir)
-        # THREADS, not processes: nested multiprocessing inside a Ray actor
-        # breaks (resource-tracker KeyErrors kill the actor). Canvas work is
-        # network waits + PIL/zlib C calls that release the GIL.
-        from .em import _worker_em
-
-        _worker_em(cache_dir)  # eager init so threads only read the cache
-        self._fetch_pool = ThreadPoolExecutor(
-            max_workers=fetch_workers,
-            thread_name_prefix="ngl-svc-fetch")
         self._req_q: queue.Queue = queue.Queue()
         self._enc_q: queue.Queue = queue.Queue(maxsize=2)
-        # Composed-canvas cache: tile_key -> canvas; misses submit a worker
-        # job and serve the client's last canvas meanwhile.
-        self._canvases: dict[tuple, np.ndarray] = {}
-        self._canvas_order: list[tuple] = []
-        self._canvas_cap = canvas_cache
-        self._canvas_pending: dict[tuple, Any] = {}
+        # 2D canvases are composed CLIENT-SIDE (runner process pools) and
+        # shipped only when they change: composing in-actor needed ~3.4
+        # GIL-seconds/s of PIL work at fleet click rates and starved the
+        # whole service (measured: 30 sps vs the probe's 255 without
+        # canvases). The service keeps only each client's last canvas.
         self._client_last: dict[Any, np.ndarray] = {}
         self._blank = np.zeros((pane2d.PANE, pane2d.PANE, 3), dtype=np.uint8)
         self._stop = False
@@ -82,11 +72,12 @@ class RenderEncodeService:
     # ------------------------------------------------------------ public API
 
     def features(self, client_id, state: dict[str, Any],
-                 block_canvas: bool = False) -> np.ndarray:
-        """(2*D,) float32 features for the state. block_canvas=True (resets)
-        waits for the exact 2D canvas instead of serving a stale one."""
+                 canvas: np.ndarray | None = None) -> np.ndarray:
+        """(2*D,) float32 features for the state. `canvas` is the client's
+        freshly composed 2D pane when it changed; None reuses the client's
+        previous canvas (stale-tolerant, browser-equivalent)."""
         fut: Future = Future()
-        self._req_q.put(("obs", client_id, state, block_canvas, fut))
+        self._req_q.put(("obs", client_id, state, canvas, fut))
         return fut.result(timeout=300)
 
     def pick(self, state: dict[str, Any], px: int, py: int):
@@ -95,48 +86,17 @@ class RenderEncodeService:
         self._req_q.put(("pick", None, state, (px, py), fut))
         return fut.result(timeout=300)
 
+    def warm(self, state: dict[str, Any]) -> None:
+        """Preload the state's mesh (reset-ahead)."""
+        fut: Future = Future()
+        self._req_q.put(("warm", None, state, None, fut))
+        fut.result(timeout=300)
+
     def close(self):
         self._stop = True
         self._enc_q.put(None)
-        self._fetch_pool.shutdown(wait=False)
 
     # ------------------------------------------------------------ internals
-
-    def _tile_key(self, state):
-        p = state["position"]
-        return (round(p[0], 2), round(p[1], 2), round(p[2], 2),
-                round(float(state["crossSectionScale"]), 5),
-                str(state["segments"][0]))
-
-    def _canvas_store(self, key, canvas):
-        self._canvases[key] = canvas
-        self._canvas_order.append(key)
-        while len(self._canvas_order) > self._canvas_cap:
-            self._canvases.pop(self._canvas_order.pop(0), None)
-
-    def _canvas_for(self, client_id, state, block: bool) -> np.ndarray:
-        key = self._tile_key(state)
-        got = self._canvases.get(key)
-        if got is None:
-            fut = self._canvas_pending.get(key)
-            if fut is None:
-                fut = self._fetch_pool.submit(
-                    worker_left_canvas, self._cache_dir, state["position"],
-                    float(state["crossSectionScale"]),
-                    str(state["segments"][0]))
-                self._canvas_pending[key] = fut
-            if block or fut.done():
-                try:
-                    got = fut.result(timeout=180)
-                except Exception as e:
-                    logger.warning("left canvas failed (%s); blank", e)
-                    got = self._blank
-                self._canvas_pending.pop(key, None)
-                self._canvas_store(key, got)
-        if got is None:  # stale path
-            got = self._client_last.get(client_id, self._blank)
-        self._client_last[client_id] = got
-        return got
 
     def _ensure_mesh(self, rid: str):
         if not self._rend.has_mesh(rid):
@@ -206,9 +166,15 @@ class RenderEncodeService:
                     if kind == "pick":
                         _, _, state, (px, py), fut = msg
                         fut.set_result(self._do_pick(state, px, py))
+                    elif kind == "warm":
+                        _, _, state, _, fut = msg
+                        self._ensure_mesh(str(state["segments"][0]))
+                        fut.set_result(True)
                     else:
-                        _, cid, state, block, fut = msg
-                        left = self._canvas_for(cid, state, block)
+                        _, cid, state, canvas, fut = msg
+                        if canvas is not None:
+                            self._client_last[cid] = np.asarray(canvas)
+                        left = self._client_last.get(cid, self._blank)
                         right = self._render_right(state)
                         frames.append(left)
                         frames.append(right)
