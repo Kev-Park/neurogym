@@ -45,26 +45,21 @@ from .render3d import MeshRenderer
 
 logger = logging.getLogger(__name__)
 
-VOXEL_NM = np.array([4.0, 4.0, 40.0])
-# Calibrated: nm per projectionScale unit (grid + golden-section refine on
-# browser pairs; ~= the 4nm xy voxel, refined empirically).
-SCALE_CAL_NM = 4.07
-# Calibrated: browser/native EM intensity ratio on grey 2D-pane pixels
-# (median of per-state ratios; NG's image-layer opacity-0.5 default does NOT
-# halve on-screen EM).
-EM_GAIN = 0.978
-# Calibrated: baked 2D-pane fetch-center correction in captured px (dy, dx).
-# Raw registration medians were (-6, 0); the correction transfer gain is -2
-# (baking c changes the residual by -2c), so the nulling correction is half.
-LEFT_SHIFT_PX = (-3.0, 0.0)
-
-# Capture geometry at capture_scale 0.5 (the calibrated configuration).
-PANE = 450          # each pane, captured px
-TOOLBAR = 17        # NG top toolbar (~33 CSS px) at capture scale 0.5
-PANE_H = PANE - TOOLBAR
-CSS_PANE = 900.0    # each pane, CSS px
-CSS_TOOLBAR = 33.0
-CSS_VIEW_H = 867.0  # pane CSS height below the toolbar
+# Calibrated constants + capture geometry live in pane2d (shared with the
+# per-node render service); re-exported names keep this module's code and
+# external references stable.
+from .pane2d import (  # noqa: E402
+    CSS_PANE,
+    CSS_TOOLBAR,
+    CSS_VIEW_H,
+    EM_GAIN,
+    LEFT_SHIFT_PX,
+    PANE,
+    PANE_H,
+    SCALE_CAL_NM,
+    TOOLBAR,
+    VOXEL_NM,
+)
 
 _noop_reward_factory = lambda task_info: (  # noqa: E731
     lambda obs, action, prev_obs, terminated: 0.0)
@@ -98,6 +93,8 @@ class NativeEnvironment(gym.Env):
         cache_dir: str | None = None,
         mesh_budget_bytes: int = 2 << 30,
         reset_ahead: bool = True,
+        render_service: Callable[[], Any] | None = None,
+        service_feature_dim: int = 384,
     ):
         super().__init__()
         if tuple(window_size) != (1800, 900) or capture_scale != 0.5:
@@ -123,6 +120,20 @@ class NativeEnvironment(gym.Env):
         self._reward_factory = reward_factory or _noop_reward_factory
         self._termination_factory = termination_factory or _noop_termination_factory
 
+        # Service mode: rendering + encoding happen in the per-node
+        # render service (ngllib.native.service); this env is a pure state
+        # machine exchanging states for features. `render_service` is a
+        # zero-arg factory (resolved lazily inside the worker process)
+        # returning a handle with .features(client_id, state, block_canvas)
+        # and .pick(state, px, py). Prefetch/tile pipelines are moot here —
+        # the service caches meshes/canvases across ALL clients.
+        self._service_factory = render_service
+        self._service = None
+        self._service_feature_dim = int(service_feature_dim)
+        if render_service is not None:
+            import uuid
+
+            self._client_id = uuid.uuid4().hex
         self._image_shape = self._compute_image_shape()
         self.observation_space = self._build_observation_space()
         self.action_space = self._build_action_space()
@@ -157,7 +168,7 @@ class NativeEnvironment(gym.Env):
         # from the SAME rng stream at the same point it would be inline, so
         # sampling is unchanged (the wall-clock curriculum sees it ~one
         # episode early — negligible). seed/options resets discard it.
-        self.reset_ahead = reset_ahead
+        self.reset_ahead = reset_ahead and render_service is None
         self._prefetch: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ spaces
@@ -172,13 +183,20 @@ class NativeEnvironment(gym.Env):
 
     def _build_observation_space(self) -> spaces.Dict:
         orient_dim = 3 if self.orientation == "euler" else 4
-        return spaces.Dict({
+        base = {
             "position": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
             "xs_scale": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
             "orientation": spaces.Box(low=-np.inf, high=np.inf, shape=(orient_dim,), dtype=np.float32),
             "proj_scale": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
-            "image": spaces.Box(low=0, high=255, shape=self._image_shape, dtype=np.uint8),
-        })
+        }
+        if self._service_factory is not None:
+            base["image_features"] = spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(2 * self._service_feature_dim,), dtype=np.float32)
+        else:
+            base["image"] = spaces.Box(
+                low=0, high=255, shape=self._image_shape, dtype=np.uint8)
+        return spaces.Dict(base)
 
     def _build_action_space(self) -> spaces.Dict:
         W, H = self.window_size
@@ -233,7 +251,7 @@ class NativeEnvironment(gym.Env):
         self._tile_key = None
 
         rid = str(st["segments"][0])
-        if not self._renderer.has_mesh(rid):
+        if self._service is None and not self._renderer.has_mesh(rid):
             v = vn = f = None
             if pf is not None and pf.get("mesh_fut") is not None:
                 try:
@@ -315,6 +333,10 @@ class NativeEnvironment(gym.Env):
         return cls._TILE_POOL
 
     def _ensure_backends(self) -> None:
+        if self._service_factory is not None:
+            if self._service is None:
+                self._service = self._service_factory()
+            return
         if self._renderer is None:
             self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget)
             logger.info("native renderer GL: %s",
@@ -362,6 +384,13 @@ class NativeEnvironment(gym.Env):
 
     def _click_3d(self, x_css: float, y_css: float) -> None:
         st = self._json_state
+        if self._service is not None:
+            ix = int(round(x_css * self.capture_scale - PANE))
+            iy = int(round(y_css * self.capture_scale - TOOLBAR))
+            hit = self._service.pick(st, ix, iy)
+            if hit is not None:
+                st["position"] = [float(v) for v in hit]
+            return
         pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
         quat = st["projectionOrientation"]
         zoom_nm = float(st["projectionScale"]) * SCALE_CAL_NM
@@ -573,6 +602,20 @@ class NativeEnvironment(gym.Env):
 
     def _gather_observation(self, block_tiles: bool = False) -> dict[str, Any]:
         st = self._json_state
+        if self._service is not None:
+            feats = self._service.features(self._client_id, st,
+                                           block_canvas=block_tiles)
+            orient_raw = st["projectionOrientation"]
+            orient = (np.asarray(quaternion_to_euler(orient_raw), dtype=np.float32)
+                      if self.orientation == "euler"
+                      else np.asarray(orient_raw, dtype=np.float32))
+            return {
+                "position": np.asarray(st["position"], dtype=np.float32),
+                "xs_scale": np.asarray([st["crossSectionScale"]], dtype=np.float32),
+                "orientation": orient,
+                "proj_scale": np.asarray([st["projectionScale"]], dtype=np.float32),
+                "image_features": np.asarray(feats, dtype=np.float32),
+            }
         tiles = self._fetch_tiles(block=block_tiles)
         panes = []
         if self.left_pane:

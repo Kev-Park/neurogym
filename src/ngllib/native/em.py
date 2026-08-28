@@ -164,6 +164,22 @@ def worker_label_tile(cache_dir, pos_nm, extent_x_nm, extent_y_nm, root_id,
         np.asarray(pos_nm), extent_x_nm, extent_y_nm, root_id, out_px)
 
 
+def worker_left_canvas(cache_dir, pos, xs_scale, root_id):
+    """Fully composed 2D pane canvas for a state, built inside the fetch
+    worker (tile + label fetch AND the PIL chain — all off the GIL of the
+    caller). pos in voxels."""
+    from . import pane2d
+
+    em = _worker_em(cache_dir)
+    pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
+    ext = pane2d.pane_extents_nm(xs_scale)
+    shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
+    tile = em.tile(shifted, ext[0], ext[1], 1024, True)
+    label = em.label_tile(shifted, ext[0], ext[1], root_id,
+                          (pane2d.PANE, pane2d.PANE_H))
+    return pane2d.compose_left(tile, label, root_id)
+
+
 _WORKER_MESHES: dict = {}
 
 
