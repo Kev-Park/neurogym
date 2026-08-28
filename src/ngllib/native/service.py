@@ -62,6 +62,7 @@ class RenderEncodeService:
         # whole service (measured: 30 sps vs the probe's 255 without
         # canvases). The service keeps only each client's last canvas.
         self._client_last: dict[Any, np.ndarray] = {}
+        self._client_plane: dict[Any, np.ndarray | None] = {}
         self._blank = np.zeros((pane2d.PANE, pane2d.PANE, 3), dtype=np.uint8)
         self._stop = False
         self._gl_thread = threading.Thread(target=self._gl_loop, daemon=True)
@@ -72,12 +73,14 @@ class RenderEncodeService:
     # ------------------------------------------------------------ public API
 
     def features(self, client_id, state: dict[str, Any],
-                 canvas: np.ndarray | None = None) -> np.ndarray:
-        """(2*D,) float32 features for the state. `canvas` is the client's
-        freshly composed 2D pane when it changed; None reuses the client's
-        previous canvas (stale-tolerant, browser-equivalent)."""
+                 canvas: np.ndarray | None = None,
+                 plane: np.ndarray | None = None) -> np.ndarray:
+        """(2*D,) float32 features for the state. `canvas` (2D pane) and
+        `plane` (section-plane EM tile — deployment/Chrome renders it, so
+        the 3D pane does by default) ship when they changed; None reuses
+        the client's previous set (stale-tolerant, browser-equivalent)."""
         fut: Future = Future()
-        self._req_q.put(("obs", client_id, state, canvas, fut))
+        self._req_q.put(("obs", client_id, state, (canvas, plane), fut))
         return fut.result(timeout=300)
 
     def pick(self, state: dict[str, Any], px: int, py: int):
@@ -103,17 +106,17 @@ class RenderEncodeService:
             v, f = self._meshes.get(rid)
             self._rend.load_mesh(rid, v, f)
 
-    def _render_right(self, state) -> np.ndarray:
+    def _render_right(self, state, plane_tile) -> np.ndarray:
         rid = str(state["segments"][0])
         self._ensure_mesh(rid)
         pos_nm = np.asarray(state["position"], dtype=np.float64) * pane2d.VOXEL_NM
-        # Section-plane EM texture omitted service-side v1: the plane occupies
-        # a small screen region and its EM content is the least policy-salient
-        # element; revisit with a parity spot-check if features drift.
+        ext = pane2d.pane_extents_nm(float(state["crossSectionScale"]))
         pane = self._rend.render(
             rid, pos_nm, state["projectionOrientation"],
             float(state["projectionScale"]) * pane2d.SCALE_CAL_NM,
-            segment_color(int(rid)), em_gain=pane2d.EM_GAIN)
+            segment_color(int(rid)),
+            em_tile=plane_tile, em_extent_nm=ext,
+            em_gain=pane2d.EM_GAIN)
         return pane2d.paste_right(pane)
 
     def _do_pick(self, state, px, py):
@@ -171,11 +174,15 @@ class RenderEncodeService:
                         self._ensure_mesh(str(state["segments"][0]))
                         fut.set_result(True)
                     else:
-                        _, cid, state, canvas, fut = msg
+                        _, cid, state, (canvas, plane), fut = msg
                         if canvas is not None:
                             self._client_last[cid] = np.asarray(canvas)
+                            self._client_plane[cid] = (
+                                np.asarray(plane) if plane is not None
+                                else None)
                         left = self._client_last.get(cid, self._blank)
-                        right = self._render_right(state)
+                        right = self._render_right(
+                            state, self._client_plane.get(cid))
                         frames.append(left)
                         frames.append(right)
                         futs.append(fut)
