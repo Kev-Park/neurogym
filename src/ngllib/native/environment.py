@@ -115,7 +115,9 @@ class NativeEnvironment(gym.Env):
         self.right_pane = right_pane
         self.capture_scale = capture_scale
         self.orientation = orientation
-        self._cache_dir = cache_dir or os.path.expanduser("~/.cache/ngllib_native")
+        # None = no CloudVolume disk cache (default; NFS caches tax cold
+        # fetches 4-30x — see em.py). Pass a LOCAL-disk dir to opt in.
+        self._cache_dir = cache_dir
 
         self._reset_state_provider = reset_state_provider
         self._reward_factory = reward_factory or _noop_reward_factory

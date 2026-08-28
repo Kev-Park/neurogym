@@ -30,12 +30,16 @@ class EMTiles:
     # decode (or worse, network), and the synchronous step blocks on it.
     LRU_BYTES = 256 << 20  # per volume handle; envs each hold a few handles
 
-    def __init__(self, cache_dir: str):
+    def __init__(self, cache_dir: str | None = None):
         from cloudvolume import CloudVolume
 
         self._vols: dict = {}
         self._CloudVolume = CloudVolume
-        self._cache = cache_dir
+        # Disk cache DEFAULT OFF (2026-08-28): on bucket NFS the cache's
+        # write-through metadata ops taxed every cold fetch 4-30x (measured:
+        # EM tile 3-7s cached vs 0.8-1.4s uncached; mesh 10-40s vs 0.7s).
+        # The in-RAM chunk LRU covers repeats; pass a LOCAL-disk dir only.
+        self._cache = cache_dir or False
 
     def _open(self, url: str, **kw):
         base = dict(use_https=True, cache=self._cache, progress=False,
@@ -184,13 +188,16 @@ def worker_mesh(cache_dir: str, root_id: str):
 
 
 class MeshStore:
-    """Sharded-Draco mesh fetch (CloudVolume) with a decoded-mesh cache."""
+    """Sharded-Draco mesh fetch (CloudVolume) with a decoded-mesh cache.
 
-    def __init__(self, cache_dir: str):
+    No disk cache (see EMTiles note): uncached mesh.get is ~0.7s; the NFS
+    write-through cache made it 10-40s."""
+
+    def __init__(self, cache_dir: str | None = None):
         from cloudvolume import CloudVolume
 
-        self._vol = CloudVolume(SEG_URL, use_https=True, cache=cache_dir,
-                                progress=False)
+        self._vol = CloudVolume(SEG_URL, use_https=True,
+                                cache=cache_dir or False, progress=False)
         self._meshes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
     def get(self, root_id: str) -> tuple[np.ndarray, np.ndarray]:
