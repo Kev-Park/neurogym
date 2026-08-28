@@ -250,7 +250,10 @@ class NativeEnvironment(gym.Env):
 
         obs = self._gather_observation(block_tiles=True)
         self._prev_obs = obs
-        if self.reset_ahead:
+        # Only provider-driven resets prefetch: an explicit-state reset
+        # (eval) must not consume provider rng draws for episodes that will
+        # never run.
+        if self.reset_ahead and seed is None and not options:
             self._schedule_prefetch()
         return obs, {"task_info": task_info, "json_state": copy.deepcopy(st), "step": 0}
 
