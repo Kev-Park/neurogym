@@ -47,8 +47,12 @@ class RenderEncodeService:
         self.feature_dim = int(encoder.feature_dim)
         self._cache_dir = cache_dir
         self._window_s = window_ms / 1000.0
-        self._rend = MeshRenderer(pane2d.PANE, pane2d.PANE_H,
-                                  mesh_budget_bytes)
+        # GL context is created ON the GL thread (moderngl contexts are
+        # thread-affine; creating it here and using it there fails with
+        # "cannot create buffer").
+        self._rend: MeshRenderer | None = None
+        self._mesh_budget = mesh_budget_bytes
+        self._gl_ready = threading.Event()
         self._meshes = MeshStore(cache_dir)
         # THREADS, not processes: nested multiprocessing inside a Ray actor
         # breaks (resource-tracker KeyErrors kill the actor). Canvas work is
@@ -180,6 +184,9 @@ class RenderEncodeService:
         return [float(v) for v in (w[:3] / w[3]) / pane2d.VOXEL_NM]
 
     def _gl_loop(self):
+        self._rend = MeshRenderer(pane2d.PANE, pane2d.PANE_H,
+                                  self._mesh_budget)
+        self._gl_ready.set()
         while not self._stop:
             try:
                 first = self._req_q.get(timeout=0.5)
