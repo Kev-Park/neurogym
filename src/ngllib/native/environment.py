@@ -43,9 +43,9 @@ from .colors import segment_color
 from .em import (
     MeshStore,
     worker_label_tile,
-    worker_left_canvas,
     worker_mesh,
     worker_tile,
+    worker_visuals,
 )
 from .render3d import MeshRenderer
 
