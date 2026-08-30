@@ -524,25 +524,38 @@ class NativeEnvironment(gym.Env):
 
     def _service_visuals(self, block: bool):
         """(canvas, plane_tile) when they changed (else (None, None) ->
-        service reuses the last set). Stale-tolerant like local-mode tiles."""
+        service reuses the last set). Stale-tolerant like local-mode tiles.
+
+        ONE fetch in flight at a time, always allowed to finish: resubmitting
+        on every key change starved the pool under click-heavy stepping (a
+        fetch takes ~1s, clicks land every few tens of ms), leaving the 2D
+        pane stale 85% of steps — measured by probe_obs_equivalence.py.
+        Local mode never had this because _fetch_tiles keeps its pending
+        group; this mirrors that.
+        """
         key = self._tile_state_key()
         if key == self._svc_key:
             return None, None
-        st = self._json_state
-        if self._svc_fut is None or self._svc_futkey != key:
-            self._svc_fut = self._submit_visuals(st)
-            self._svc_futkey = key
-        fut = self._svc_fut
-        if block or fut.done():
+        if self._svc_fut is not None:
+            if not (block or self._svc_fut.done()):
+                return None, None  # let it land; do NOT resubmit
             canvas = plane = None
             try:
-                canvas, plane = fut.result(timeout=180)
+                canvas, plane = self._svc_fut.result(timeout=180)
             except Exception as e:
                 logger.warning("client visuals failed (%s); stale", e)
-            self._svc_fut = None
+            landed_key, self._svc_fut = self._svc_futkey, None
             if canvas is not None:
-                self._svc_key = key
+                # Ship it even if the state moved on: a canvas one step
+                # behind beats an arbitrarily old one, and the next step
+                # submits for the then-current key.
+                self._svc_key = landed_key
                 return canvas, plane
+            return None, None
+        self._svc_fut = self._submit_visuals(self._json_state)
+        self._svc_futkey = key
+        if block:
+            return self._service_visuals(block=True)
         return None, None
 
     def _schedule_prefetch(self) -> None:
