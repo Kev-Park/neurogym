@@ -286,9 +286,9 @@ class NativeEnvironment(gym.Env):
             # Adopt the prefetched tile group; the blocking gather below
             # resolves it (usually already done).
             self._pending = pf["tiles"]
-        if pf is not None and pf.get("visual_futs") is not None:
+        if pf is not None and pf.get("visual_fut") is not None:
             # Adopt the pre-fetched canvas+plane for the service-mode gather.
-            self._svc_fut = pf["visual_futs"]
+            self._svc_fut = pf["visual_fut"]
             self._svc_futkey = self._tile_state_key()
 
         obs = self._gather_observation(block_tiles=True)
@@ -515,20 +515,12 @@ class NativeEnvironment(gym.Env):
         self._pending = self._submit_tile_group(
             st["position"], st["crossSectionScale"], str(st["segments"][0]))
 
-    def _submit_visuals(self, state) -> tuple:
-        """(canvas_fut, plane_fut) for a state: the composed 2D pane and the
-        3D section-plane EM tile (deployment/Chrome has the plane — it ships
-        to the service by default)."""
-        pos_nm = np.asarray(state["position"], dtype=np.float64) * VOXEL_NM
-        xs = float(state["crossSectionScale"])
-        ext = (xs * CSS_PANE * 4.0, xs * CSS_VIEW_H * 4.0)
-        pool = self._tile_pool()
-        canvas_fut = pool.submit(
-            worker_left_canvas, self._cache_dir, list(state["position"]),
-            xs, str(state["segments"][0]))
-        plane_fut = pool.submit(
-            worker_tile, self._cache_dir, pos_nm, ext[0], ext[1], 1024, False)
-        return canvas_fut, plane_fut
+    def _submit_visuals(self, state):
+        """Future of (canvas, plane_tile) — one worker job for both (they
+        share EM chunks; two jobs doubled pool dispatch per move)."""
+        return self._tile_pool().submit(
+            worker_visuals, self._cache_dir, list(state["position"]),
+            float(state["crossSectionScale"]), str(state["segments"][0]))
 
     def _service_visuals(self, block: bool):
         """(canvas, plane_tile) when they changed (else (None, None) ->
@@ -540,12 +532,11 @@ class NativeEnvironment(gym.Env):
         if self._svc_fut is None or self._svc_futkey != key:
             self._svc_fut = self._submit_visuals(st)
             self._svc_futkey = key
-        cf, pf_ = self._svc_fut
-        if block or (cf.done() and pf_.done()):
+        fut = self._svc_fut
+        if block or fut.done():
             canvas = plane = None
             try:
-                canvas = cf.result(timeout=180)
-                plane = pf_.result(timeout=180)
+                canvas, plane = fut.result(timeout=180)
             except Exception as e:
                 logger.warning("client visuals failed (%s); stale", e)
             self._svc_fut = None
@@ -572,7 +563,7 @@ class NativeEnvironment(gym.Env):
                 logger.warning("service warm failed (%s)", e)
             self._prefetch = {"state": state, "task_info": task_info,
                               "mesh_fut": None, "tiles": None,
-                              "visual_futs": self._submit_visuals(state)}
+                              "visual_fut": self._submit_visuals(state)}
             return
         try:
             rid = str(state["segments"][0])

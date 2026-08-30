@@ -164,6 +164,24 @@ def worker_label_tile(cache_dir, pos_nm, extent_x_nm, extent_y_nm, root_id,
         np.asarray(pos_nm), extent_x_nm, extent_y_nm, root_id, out_px)
 
 
+def worker_visuals(cache_dir, pos, xs_scale, root_id):
+    """(2D canvas, 3D section-plane tile) in ONE worker call: the two share
+    the same EM chunks, so a single job reuses the in-worker chunk LRU and
+    halves the client's pool dispatches per position change."""
+    from . import pane2d
+
+    em = _worker_em(cache_dir)
+    pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
+    ext = pane2d.pane_extents_nm(xs_scale)
+    shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
+    tile = em.tile(shifted, ext[0], ext[1], 1024, True)
+    label = em.label_tile(shifted, ext[0], ext[1], root_id,
+                          (pane2d.PANE, pane2d.PANE_H))
+    canvas = pane2d.compose_left(tile, label, root_id)
+    plane = em.tile(pos_nm, ext[0], ext[1], 1024, False)
+    return canvas, plane
+
+
 def worker_left_canvas(cache_dir, pos, xs_scale, root_id):
     """Fully composed 2D pane canvas for a state, built inside the fetch
     worker (tile + label fetch AND the PIL chain — all off the GIL of the
