@@ -73,6 +73,43 @@ _noop_termination_factory = lambda task_info: (  # noqa: E731
     lambda obs, action, prev_obs: False)
 
 
+class _PlaneOnly:
+    """Adapts a plane-tile future to the (canvas, plane) contract used by the
+    2D-pane path, so callers need no branch."""
+
+    def __init__(self, fut):
+        self._f = fut
+
+    def done(self):
+        return self._f.done()
+
+    def result(self, timeout=None):
+        return None, self._f.result(timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# OPEN ISSUE - 2D-PANE DE-SYNC (must be handled before re-enabling left_pane)
+# ---------------------------------------------------------------------------
+# The 2D EM pane needs a CloudVolume fetch (~1s uncached, 3-7s cached-on-NFS)
+# while a step takes 20-200ms, so after every position change the pane shows
+# the PREVIOUS location for several steps. Measured freshness under
+# click-heavy stepping: local 2/40 steps (5%), service 20/40 after the
+# one-in-flight fix.
+# Why it matters: the pane is NOT task-essential but IS task-correlated, so a
+# policy trained on FRESH panes will take a dependency on 384 of its 768
+# visual dims - exactly the dims whose appearance differs most between the
+# simulator and Chrome. Stale panes may therefore have been accidental domain
+# randomization (see native-v9-test).
+# Options when re-enabling, none yet chosen:
+#   (a) block on the exact canvas each step (correct, costs throughput);
+#   (b) feed a staleness/age channel so the policy can discount it;
+#   (c) deliberately randomize the pane (explicit DR) rather than leaving
+#       staleness as an uncontrolled accident;
+#   (d) render the 2D pane from already-resident chunks only (never stale,
+#       sometimes lower-res).
+# Until one is chosen, runs use right_pane only.
+
+
 class NativeEnvironment(gym.Env):
     """Native (browser-free) Neuroglancer-equivalent environment.
 
@@ -207,9 +244,10 @@ class NativeEnvironment(gym.Env):
             "proj_scale": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
         }
         if self._service_factory is not None:
+            n_panes = (1 if self.left_pane else 0) + (1 if self.right_pane else 0)
             base["image_features"] = spaces.Box(
                 low=-np.inf, high=np.inf,
-                shape=(2 * self._service_feature_dim,), dtype=np.float32)
+                shape=(n_panes * self._service_feature_dim,), dtype=np.float32)
         else:
             base["image"] = spaces.Box(
                 low=0, high=255, shape=self._image_shape, dtype=np.uint8)
@@ -516,8 +554,16 @@ class NativeEnvironment(gym.Env):
             st["position"], st["crossSectionScale"], str(st["segments"][0]))
 
     def _submit_visuals(self, state):
-        """Future of (canvas, plane_tile) — one worker job for both (they
-        share EM chunks; two jobs doubled pool dispatch per move)."""
+        """Future of (canvas, plane_tile). One worker job for both when the
+        2D pane is on (they share EM chunks). With the 2D pane OFF we fetch
+        ONLY the section-plane tile - no canvas compose, no label cutout."""
+        if not self.left_pane:
+            pos_nm = np.asarray(state["position"], dtype=np.float64) * VOXEL_NM
+            xs = float(state["crossSectionScale"])
+            ext = (xs * CSS_PANE * 4.0, xs * CSS_VIEW_H * 4.0)
+            fut = self._tile_pool().submit(
+                worker_tile, self._cache_dir, pos_nm, ext[0], ext[1], 1024, False)
+            return _PlaneOnly(fut)
         return self._tile_pool().submit(
             worker_visuals, self._cache_dir, list(state["position"]),
             float(state["crossSectionScale"]), str(state["segments"][0]))
@@ -681,7 +727,8 @@ class NativeEnvironment(gym.Env):
         st = self._json_state
         if self._service is not None:
             canvas, plane = self._service_visuals(block=block_tiles)
-            feats = self._service.features(self._client_id, st, canvas, plane)
+            feats = self._service.features(self._client_id, st, canvas, plane,
+                                          with_left=self.left_pane)
             orient_raw = st["projectionOrientation"]
             orient = (np.asarray(quaternion_to_euler(orient_raw), dtype=np.float32)
                       if self.orientation == "euler"

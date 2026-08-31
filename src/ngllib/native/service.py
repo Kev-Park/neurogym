@@ -74,13 +74,14 @@ class RenderEncodeService:
 
     def features(self, client_id, state: dict[str, Any],
                  canvas: np.ndarray | None = None,
-                 plane: np.ndarray | None = None) -> np.ndarray:
+                 plane: np.ndarray | None = None,
+                 with_left: bool = True) -> np.ndarray:
         """(2*D,) float32 features for the state. `canvas` (2D pane) and
         `plane` (section-plane EM tile — deployment/Chrome renders it, so
         the 3D pane does by default) ship when they changed; None reuses
         the client's previous set (stale-tolerant, browser-equivalent)."""
         fut: Future = Future()
-        self._req_q.put(("obs", client_id, state, (canvas, plane), fut))
+        self._req_q.put(("obs", client_id, state, (canvas, plane, with_left), fut))
         return fut.result(timeout=300)
 
     def pick(self, state: dict[str, Any], px: int, py: int):
@@ -174,18 +175,23 @@ class RenderEncodeService:
                         self._ensure_mesh(str(state["segments"][0]))
                         fut.set_result(True)
                     else:
-                        _, cid, state, (canvas, plane), fut = msg
+                        _, cid, state, payload, fut = msg
+                        canvas, plane, with_left = payload
+                        if plane is not None:
+                            self._client_plane[cid] = np.asarray(plane)
                         if canvas is not None:
                             self._client_last[cid] = np.asarray(canvas)
-                            self._client_plane[cid] = (
-                                np.asarray(plane) if plane is not None
-                                else None)
-                        left = self._client_last.get(cid, self._blank)
                         right = self._render_right(
                             state, self._client_plane.get(cid))
-                        frames.append(left)
+                        # RIGHT-PANE-ONLY clients (with_left=False) send no 2D
+                        # canvas and get a 1-pane embedding: the EM pane is not
+                        # task-essential but IS task-correlated, so feeding it
+                        # invites a dependency on the input that differs most
+                        # between the simulator and Chrome.
+                        if with_left:
+                            frames.append(self._client_last.get(cid, self._blank))
                         frames.append(right)
-                        futs.append(fut)
+                        futs.append((fut, 2 if with_left else 1))
                 except Exception as e:  # noqa: BLE001
                     msg[-1].set_exception(e)
             if futs:
@@ -198,11 +204,13 @@ class RenderEncodeService:
                 return
             frames, futs = item
             try:
-                feats = self._encoder.encode(frames)  # (2N, D)
-                for j, fut in enumerate(futs):
+                feats = self._encoder.encode(frames)
+                off = 0
+                for fut, k in futs:
                     fut.set_result(
-                        feats[2 * j:2 * j + 2].reshape(-1).astype(np.float32))
+                        feats[off:off + k].reshape(-1).astype(np.float32))
+                    off += k
             except Exception as e:  # noqa: BLE001
-                for fut in futs:
+                for fut, _k in futs:
                     if not fut.done():
                         fut.set_exception(e)
