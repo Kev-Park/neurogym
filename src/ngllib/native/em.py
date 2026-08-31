@@ -222,28 +222,62 @@ def worker_mesh(cache_dir: str, root_id: str):
 
 
 class MeshStore:
-    """Sharded-Draco mesh fetch (CloudVolume) with a decoded-mesh cache.
+    """Sharded-Draco mesh fetch (CloudVolume) with an LRU decoded-mesh cache.
 
     No disk cache (see EMTiles note): uncached mesh.get is ~0.7s; the NFS
-    write-through cache made it 10-40s."""
+    write-through cache made it 10-40s.
 
-    def __init__(self, cache_dir: str | None = None):
+    The cache is byte-BOUNDED (2026-08-31). It used to be an unbounded dict,
+    so every root_id ever visited stayed resident: a 32-env single-node run
+    reached 206 GiB RSS and was cgroup-killed at iteration 410 of 740 with no
+    traceback. Budget is PER STORE, and local mode builds one per env, so
+    scale it with the env count on the node (NGL_NATIVE_MESH_LRU_MB).
+    A miss just refetches (~0.7s), so this trades a rare stall for a bound.
+    """
+
+    MESH_LRU_BYTES = 512 << 20
+
+    def __init__(self, cache_dir: str | None = None,
+                 lru_bytes: int | None = None):
+        import os
+        from collections import OrderedDict
+
         from cloudvolume import CloudVolume
 
         self._vol = CloudVolume(SEG_URL, use_https=True,
                                 cache=cache_dir or False, progress=False)
-        self._meshes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._meshes: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = (
+            OrderedDict())
+        self._bytes = 0
+        if lru_bytes is None:
+            mb = os.environ.get("NGL_NATIVE_MESH_LRU_MB")
+            lru_bytes = (int(mb) << 20) if mb else self.MESH_LRU_BYTES
+        self._budget = int(lru_bytes)
 
     def get(self, root_id: str) -> tuple[np.ndarray, np.ndarray]:
         """(vertices_nm float32 [N,3], faces int32 [M,3])."""
-        if root_id not in self._meshes:
-            m = self._vol.mesh.get(int(root_id))
-            mesh = m[int(root_id)] if hasattr(m, "get") or isinstance(m, dict) else m
-            self._meshes[root_id] = (
-                np.asarray(mesh.vertices, dtype="f4"),
-                np.asarray(mesh.faces, dtype="i4"),
-            )
-        return self._meshes[root_id]
+        hit = self._meshes.get(root_id)
+        if hit is not None:
+            self._meshes.move_to_end(root_id)
+            return hit
+        m = self._vol.mesh.get(int(root_id))
+        mesh = m[int(root_id)] if hasattr(m, "get") or isinstance(m, dict) else m
+        entry = (np.asarray(mesh.vertices, dtype="f4"),
+                 np.asarray(mesh.faces, dtype="i4"))
+        self._meshes[root_id] = entry
+        self._bytes += entry[0].nbytes + entry[1].nbytes
+        # Never evict the entry just inserted, even if it alone exceeds the
+        # budget — the caller is about to render it.
+        while self._bytes > self._budget and len(self._meshes) > 1:
+            _, old = self._meshes.popitem(last=False)
+            self._bytes -= old[0].nbytes + old[1].nbytes
+        return entry
 
     def drop(self, root_id: str) -> None:
-        self._meshes.pop(root_id, None)
+        old = self._meshes.pop(root_id, None)
+        if old is not None:
+            self._bytes -= old[0].nbytes + old[1].nbytes
+
+    @property
+    def cached_bytes(self) -> int:
+        return self._bytes
