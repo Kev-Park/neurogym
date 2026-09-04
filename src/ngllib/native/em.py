@@ -164,21 +164,33 @@ def worker_label_tile(cache_dir, pos_nm, extent_x_nm, extent_y_nm, root_id,
         np.asarray(pos_nm), extent_x_nm, extent_y_nm, root_id, out_px)
 
 
-def worker_visuals(cache_dir, pos, xs_scale, root_id):
+def worker_visuals(cache_dir, pos, xs_scale, root_id, max_px=1024,
+                   with_label=True):
     """(2D canvas, 3D section-plane tile) in ONE worker call: the two share
     the same EM chunks, so a single job reuses the in-worker chunk LRU and
-    halves the client's pool dispatches per position change."""
+    halves the client's pool dispatches per position change.
+
+    `max_px` is the resolution dial -- EMTiles.tile picks the coarsest mip
+    whose extent/res fits in max_px, so 256 fetches ~16x fewer voxels than
+    1024 and lands proportionally sooner. `with_label=False` additionally
+    skips the segmentation cutout. Together they make the cheap PREVIEW
+    stage of the progressive pipeline (see NativeEnvironment._fetch_tiles):
+    Chrome streams coarse mips first and paints segmentation after the EM,
+    so a blurry untinted preview of the RIGHT location is closer to it than
+    a sharp view of the previous one.
+    """
     from . import pane2d
 
     em = _worker_em(cache_dir)
     pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
     ext = pane2d.pane_extents_nm(xs_scale)
     shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
-    tile = em.tile(shifted, ext[0], ext[1], 1024, True)
-    label = em.label_tile(shifted, ext[0], ext[1], root_id,
-                          (pane2d.PANE, pane2d.PANE_H))
+    tile = em.tile(shifted, ext[0], ext[1], max_px, True)
+    label = (em.label_tile(shifted, ext[0], ext[1], root_id,
+                           (pane2d.PANE, pane2d.PANE_H))
+             if with_label else None)
     canvas = pane2d.compose_left(tile, label, root_id)
-    plane = em.tile(pos_nm, ext[0], ext[1], 1024, False)
+    plane = em.tile(pos_nm, ext[0], ext[1], max_px, False)
     return canvas, plane
 
 

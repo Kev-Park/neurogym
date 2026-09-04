@@ -209,7 +209,10 @@ class NativeEnvironment(gym.Env):
         # was the density-probe wall.
         self._tile_key = None
         self._tiles: dict[str, Any] = {}
-        self._pending: tuple | None = None  # (key, {name: Future}, ext)
+        self._pending: tuple | None = None  # (key, {name: Fut}, ext, stage)
+        # Progressive 2D pane: 'coarse' = low-mip, untinted preview of the
+        # CURRENT location; 'fine' = full-resolution + segment tint.
+        self._tile_stage: str = "fine"
         # Reset-ahead prefetch (native analog of the browser env's M5):
         # measured 38s reset tail = mesh download/decode/normals + cold
         # tiles for the NEXT episode's neuron — all prefetchable during the
@@ -525,9 +528,10 @@ class NativeEnvironment(gym.Env):
         return self._tile_key_for(st["position"], st["crossSectionScale"],
                                   str(st["segments"][0]))
 
-    def _submit_tile_group(self, pos, xs, rid) -> tuple:
-        """(key, futs, ext) for an arbitrary state — used both for the
-        current state and for reset-ahead prefetch."""
+    def _submit_tile_group(self, pos, xs, rid, stage: str = "fine") -> tuple:
+        """(key, futs, ext, stage) for an arbitrary state — used for the
+        current state and for reset-ahead prefetch. stage='coarse' fetches
+        the fast low-mip untinted preview; 'fine' the full tile."""
         pos_nm = np.asarray(pos, dtype=np.float64) * VOXEL_NM
         ext = (float(xs) * CSS_PANE * 4.0, float(xs) * CSS_VIEW_H * 4.0)
         pool = self._tile_pool()
@@ -545,17 +549,21 @@ class NativeEnvironment(gym.Env):
             # Pixel-identical: the service path already composes via
             # pane2d.compose_left and probe_obs_equivalence measures
             # l2rel=0.0000 / cos=1.0000 against local's inline _render_left.
+            mx = 256 if stage == "coarse" else 1024
             futs = {"visuals": pool.submit(
-                worker_visuals, cd, list(pos), float(xs), rid)}
+                worker_visuals, cd, list(pos), float(xs), rid, mx,
+                stage != "coarse")}
         else:
+            mx = 256 if stage == "coarse" else 1024
             futs = {"plane": pool.submit(
-                worker_tile, cd, pos_nm, ext[0], ext[1], 1024, False)}
-        return (self._tile_key_for(pos, xs, rid), futs, ext)
+                worker_tile, cd, pos_nm, ext[0], ext[1], mx, False)}
+        return (self._tile_key_for(pos, xs, rid), futs, ext, stage)
 
-    def _submit_tile_fetch(self, key):
+    def _submit_tile_fetch(self, key, stage: str = "fine"):
         st = self._json_state
         self._pending = self._submit_tile_group(
-            st["position"], st["crossSectionScale"], str(st["segments"][0]))
+            st["position"], st["crossSectionScale"], str(st["segments"][0]),
+            stage)
 
     def _submit_visuals(self, state):
         """Future of (canvas, plane_tile). One worker job for both when the
@@ -644,7 +652,7 @@ class NativeEnvironment(gym.Env):
                           "mesh_fut": mesh_fut, "tiles": tiles}
 
     def _adopt_pending(self, timeout_s: float = 180.0) -> None:
-        key, futs, ext = self._pending
+        key, futs, ext, stage = self._pending
         tiles: dict[str, Any] = {"ext": ext, "plane": None, "left": None,
                                  "label": None}
         for name, fut in futs.items():
@@ -660,6 +668,7 @@ class NativeEnvironment(gym.Env):
             except Exception as e:
                 logger.warning("EM %s tile fetch failed (%s); skipped", name, e)
         self._tile_key, self._tiles = key, tiles
+        self._tile_stage = stage
         self._pending = None
 
     def _fetch_tiles(self, block: bool) -> dict[str, Any]:
@@ -667,23 +676,35 @@ class NativeEnvironment(gym.Env):
         tiles; block=False (step) returns the last completed set while the
         fetch streams in — see the pipeline note in __init__."""
         key = self._tile_state_key()
-        if key == self._tile_key:
-            return self._tiles
+        if key == self._tile_key and self._tile_stage == "fine":
+            return self._tiles  # settled at full resolution
         if self._pending is not None and self._pending[0] != key:
             # Superseded in-flight fetch: adopt it only if it already
             # finished (warms the LRU either way), then refetch.
             if all(f.done() for f in self._pending[1].values()):
                 self._adopt_pending()
-                if key == self._tile_key:
+                if key == self._tile_key and self._tile_stage == "fine":
                     return self._tiles
             elif block:
                 self._adopt_pending()  # drain before the exact fetch
             else:
                 return self._tiles  # keep rendering stale; let it land
         if self._pending is None:
-            self._submit_tile_fetch(key)
+            # PROGRESSIVE (2026-09-04): on a step, fetch the coarse preview
+            # first — Chrome renders the CURRENT location from coarse mips
+            # immediately (measured: 80% of pixels already correct at step
+            # 0, converging in 3-6 steps) whereas swapping atomically to a
+            # fine tile left us showing the PREVIOUS location at 19% pixel
+            # agreement until it landed. reset() blocks anyway, so it goes
+            # straight to fine rather than paying for a preview nobody sees.
+            self._submit_tile_fetch(key, "fine" if block else "coarse")
         if block or all(f.done() for f in self._pending[1].values()):
             self._adopt_pending()
+            if (not block and self._tile_key == key
+                    and self._tile_stage == "coarse"):
+                # Preview is up for the CURRENT key: queue the refinement.
+                # Still one fetch in flight at a time.
+                self._submit_tile_fetch(key, "fine")
         return self._tiles
 
     def _render_left(self, tiles: dict[str, Any]) -> np.ndarray:
