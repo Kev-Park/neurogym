@@ -42,7 +42,6 @@ from ..utils.geom import euler_to_quaternion, quaternion_to_euler
 from .colors import segment_color
 from .em import (
     MeshStore,
-    worker_label_tile,
     worker_mesh,
     worker_tile,
     worker_visuals,
@@ -533,19 +532,24 @@ class NativeEnvironment(gym.Env):
         ext = (float(xs) * CSS_PANE * 4.0, float(xs) * CSS_VIEW_H * 4.0)
         pool = self._tile_pool()
         cd = self._cache_dir
-        futs = {"plane": pool.submit(
-            worker_tile, cd, pos_nm, ext[0], ext[1], 1024, False)}
         if self.left_pane:
-            # Baked registration correction: move the fetch center by the
-            # calibrated (dy, dx) captured px, in nm.
-            shifted = pos_nm + np.array([
-                LEFT_SHIFT_PX[1] * ext[0] / PANE,
-                LEFT_SHIFT_PX[0] * ext[1] / PANE_H, 0.0])
-            futs["left"] = pool.submit(
-                worker_tile, cd, shifted, ext[0], ext[1], 1024, True)
-            futs["label"] = pool.submit(
-                worker_label_tile, cd, shifted, ext[0], ext[1], rid,
-                (PANE, PANE_H))
+            # ONE combined job, not three (2026-09-03). Submitting plane +
+            # left + label separately needs TWO waves through the default
+            # NGL_NATIVE_FETCH_WORKERS=2 pool, so `all(f.done())` was
+            # essentially never true within a step and the 2D pane NEVER
+            # refreshed: probe_obs_equivalence measured LOCAL fresh=0/40 vs
+            # SERVICE fresh=8/40, and the local-mode policy scored 81.0% on
+            # Chrome vs service's 90.5% (paired p=0.0019). worker_visuals
+            # does the same fetches in one call (shared chunk LRU) and
+            # returns the COMPOSED canvas, which _render_left uses directly.
+            # Pixel-identical: the service path already composes via
+            # pane2d.compose_left and probe_obs_equivalence measures
+            # l2rel=0.0000 / cos=1.0000 against local's inline _render_left.
+            futs = {"visuals": pool.submit(
+                worker_visuals, cd, list(pos), float(xs), rid)}
+        else:
+            futs = {"plane": pool.submit(
+                worker_tile, cd, pos_nm, ext[0], ext[1], 1024, False)}
         return (self._tile_key_for(pos, xs, rid), futs, ext)
 
     def _submit_tile_fetch(self, key):
@@ -645,7 +649,12 @@ class NativeEnvironment(gym.Env):
                                  "label": None}
         for name, fut in futs.items():
             try:
-                tiles[name] = fut.result(timeout=timeout_s)
+                if name == "visuals":
+                    # (composed 2D canvas, 3D section-plane tile)
+                    tiles["left_canvas"], tiles["plane"] = fut.result(
+                        timeout=timeout_s)
+                else:
+                    tiles[name] = fut.result(timeout=timeout_s)
             except FuturesTimeout:
                 logger.warning("EM %s tile fetch timed out; skipped", name)
             except Exception as e:
