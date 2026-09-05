@@ -210,9 +210,24 @@ class NativeEnvironment(gym.Env):
         self._tile_key = None
         self._tiles: dict[str, Any] = {}
         self._pending: tuple | None = None  # (key, {name: Fut}, ext, stage)
-        # Progressive 2D pane: 'coarse' = low-mip, untinted preview of the
-        # CURRENT location; 'fine' = full-resolution + segment tint.
+        # 2D-pane fill policy (NGL_NATIVE_PANE_MODE), default 'atomic':
+        #   atomic      one fine fetch, swapped in when it lands. Shows the
+        #               PREVIOUS location meanwhile. The shipped behaviour
+        #               (native-pace740, 92.5% on Chrome).
+        #   progressive coarse preview -> then fine. Sequential. MEASURED
+        #               WORSE: native-prog740 81.5%, -11pp vs atomic,
+        #               paired p=0.0016 -- the policy preferred a sharp
+        #               stale pane to a blurry current one.
+        #   concurrent  coarse AND fine submitted together, as Neuroglancer
+        #               does (filterVisibleSources yields every scale).
+        #   random      atomic, but a per-episode random adopt delay -- DR
+        #               over fetch latency, which is a networking artifact
+        #               (Chrome's own step-0 fidelity spans 38-80% on
+        #               identical states).
+        self._pane_mode: str = os.environ.get("NGL_NATIVE_PANE_MODE", "atomic")
         self._tile_stage: str = "fine"
+        self._coarse_pending: tuple | None = None
+        self._adopt_delay: int = 0   # random mode: steps still to wait
         # Reset-ahead prefetch (native analog of the browser env's M5):
         # measured 38s reset tail = mesh download/decode/normals + cold
         # tiles for the NEXT episode's neuron — all prefetchable during the
@@ -306,6 +321,11 @@ class NativeEnvironment(gym.Env):
                 raise ValueError(f"reset state missing required field {k!r}")
         self._json_state = st
         self._tile_key = None
+        self._coarse_pending = None
+        # RANDOM mode: one latency draw per episode, so an episode has a
+        # consistent "network speed" rather than per-step jitter.
+        self._adopt_delay = (int(self._rng.integers(0, 5))
+                             if self._pane_mode == "random" else 0)
 
         rid = str(st["segments"][0])
         if self._service is not None and pf is not None:
@@ -652,7 +672,11 @@ class NativeEnvironment(gym.Env):
                           "mesh_fut": mesh_fut, "tiles": tiles}
 
     def _adopt_pending(self, timeout_s: float = 180.0) -> None:
-        key, futs, ext, stage = self._pending
+        self._adopt_group(*self._pending, timeout_s=timeout_s)
+        self._pending = None
+
+    def _adopt_group(self, key, futs, ext, stage,
+                     timeout_s: float = 180.0) -> None:
         tiles: dict[str, Any] = {"ext": ext, "plane": None, "left": None,
                                  "label": None}
         for name, fut in futs.items():
@@ -669,7 +693,6 @@ class NativeEnvironment(gym.Env):
                 logger.warning("EM %s tile fetch failed (%s); skipped", name, e)
         self._tile_key, self._tiles = key, tiles
         self._tile_stage = stage
-        self._pending = None
 
     def _fetch_tiles(self, block: bool) -> dict[str, Any]:
         """Tiles for the current state. block=True (reset) waits for exact
@@ -689,21 +712,41 @@ class NativeEnvironment(gym.Env):
                 self._adopt_pending()  # drain before the exact fetch
             else:
                 return self._tiles  # keep rendering stale; let it land
+        mode = self._pane_mode
+        # CONCURRENT: a coarse companion fetch runs ALONGSIDE the fine one
+        # (Neuroglancer's filterVisibleSources yields every scale at once),
+        # so the preview does not delay the full tile the way the sequential
+        # 'progressive' staging did.
+        if mode == "concurrent" and not block and self._coarse_pending is not None:
+            ck, cfuts, cext, cstage = self._coarse_pending
+            if ck != key:
+                self._coarse_pending = None          # superseded; drop it
+            elif all(f.done() for f in cfuts.values()):
+                if not (self._tile_key == key and self._tile_stage == "fine"):
+                    self._adopt_group(ck, cfuts, cext, cstage)
+                self._coarse_pending = None
         if self._pending is None:
-            # PROGRESSIVE (2026-09-04): on a step, fetch the coarse preview
-            # first — Chrome renders the CURRENT location from coarse mips
-            # immediately (measured: 80% of pixels already correct at step
-            # 0, converging in 3-6 steps) whereas swapping atomically to a
-            # fine tile left us showing the PREVIOUS location at 19% pixel
-            # agreement until it landed. reset() blocks anyway, so it goes
-            # straight to fine rather than paying for a preview nobody sees.
-            self._submit_tile_fetch(key, "fine" if block else "coarse")
+            stage = "fine" if (block or mode in ("atomic", "random",
+                                                 "concurrent")) else "coarse"
+            self._submit_tile_fetch(key, stage)
+            if mode == "concurrent" and not block:
+                st = self._json_state
+                self._coarse_pending = self._submit_tile_group(
+                    st["position"], st["crossSectionScale"],
+                    str(st["segments"][0]), "coarse")
         if block or all(f.done() for f in self._pending[1].values()):
+            # RANDOM: hold a landed tile for a per-episode number of extra
+            # steps. Fetch latency is a networking artifact -- Chrome's own
+            # step-0 fidelity spans 38-80% on identical states -- so train
+            # across the distribution instead of one fixed lag. Panes stay
+            # SHARP: 'progressive' showed that a blurry current pane costs
+            # 11pp against a sharp stale one.
+            if not block and mode == "random" and self._adopt_delay > 0:
+                self._adopt_delay -= 1
+                return self._tiles
             self._adopt_pending()
-            if (not block and self._tile_key == key
-                    and self._tile_stage == "coarse"):
-                # Preview is up for the CURRENT key: queue the refinement.
-                # Still one fetch in flight at a time.
+            if (not block and mode == "progressive"
+                    and self._tile_key == key and self._tile_stage == "coarse"):
                 self._submit_tile_fetch(key, "fine")
         return self._tiles
 
