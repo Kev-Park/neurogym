@@ -110,9 +110,13 @@ class EMTiles:
             lab = self._label_cutout(pos_nm, extent_x_nm, extent_y_nm, out_px)
             if lab is None:
                 return None
-            # NEAREST, like the masks: ids must not be interpolated.
-            img = Image.fromarray(lab.astype(np.int64), mode="I")
-            return np.asarray(img.resize(out_px, Image.NEAREST)).astype(np.int64)
+            # Nearest-neighbour by index, NOT through PIL: segment ids run to
+            # ~7e17 and PIL's integer mode "I" is int32, which would silently
+            # mangle every id. Ids must never be interpolated either.
+            h, w = lab.shape
+            rows = np.minimum((np.arange(out_px[1]) * h) // out_px[1], h - 1)
+            cols = np.minimum((np.arange(out_px[0]) * w) // out_px[0], w - 1)
+            return lab[rows][:, cols]
         except Exception:
             return None
 

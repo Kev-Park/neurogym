@@ -369,10 +369,12 @@ class NativeEnvironment(gym.Env):
     def step(self, action):
         action_type = int(action["action_type"])
         if action_type == 0:
-            # NG binds mousedown0 to rotate-via-mouse-drag; a click with no
-            # drag applies a zero rotation, so the browser env's left_click is
-            # a state no-op too. Accepted, not rejected, so both backends take
-            # the identical action space.
+            # mousedown0 is a DRAG binding on both panes -- translate on the
+            # slice view, rotate on the perspective view
+            # (default_input_event_bindings.ts) -- so a click with no drag
+            # applies a zero delta and the browser env's left_click is a state
+            # no-op too. Accepted, not rejected, so both backends take the
+            # identical action space.
             pass
         elif action_type in (1, 2):
             self._apply_click(action)
