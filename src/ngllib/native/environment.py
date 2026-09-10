@@ -353,7 +353,7 @@ class NativeEnvironment(gym.Env):
         self._coarse_pending = None
         # Cancel, don't just drop: an abandoned mesh fetch would keep a pool
         # worker busy for the new episode's first seconds.
-        for fut in self._mesh_futs.values():
+        for _lod, fut in self._mesh_futs.values():
             fut.cancel()
         self._mesh_futs.clear()
         self._mesh_due.clear()
