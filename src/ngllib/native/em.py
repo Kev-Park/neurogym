@@ -103,6 +103,34 @@ class EMTiles:
         except Exception:
             return None
 
+    def segment_at(self, pos_nm, target_res_nm: float | None = None):
+        """Root id of the segment at a world point, or None for background.
+
+        Backs Neuroglancer's `select` (bound to dblclick0): the 2D pane needs
+        to answer "which segment is under this pixel". The m783 volume stores
+        ROOT ids directly -- `label_tile` compares `lab == root_id` with
+        `agglomerate=False` -- so a single-voxel read is the whole query, no
+        supervoxel->root graph lookup.
+
+        `target_res_nm` selects the mip the same way `label_tile` does, so a
+        pick resolves to the segment the user can actually SEE at the current
+        zoom rather than one only visible at full resolution.
+        """
+        try:
+            vol = self._seg_vol(target_res_nm if target_res_nm is not None
+                                else 0.0)   # 0.0 => finest available mip
+            if vol is None:
+                return None
+            res = vol.resolution
+            cx = int(pos_nm[0] / res[0])
+            cy = int(pos_nm[1] / res[1])
+            z = int(pos_nm[2] / res[2])
+            cut = np.asarray(vol[cx:cx + 1, cy:cy + 1, z:z + 1])
+            rid = int(cut.reshape(-1)[0])
+            return rid or None          # 0 is background, not a segment
+        except Exception:
+            return None
+
     def tile(self, pos_nm, extent_x_nm, extent_y_nm=None, max_px=1024,
              subpixel: bool = False):
         """EM z-slice tile. With subpixel=True, the fractional texel phase
