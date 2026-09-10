@@ -55,12 +55,14 @@ logger = logging.getLogger(__name__)
 # external references stable.
 from .pane2d import (  # noqa: E402
     CSS_PANE,
-    CSS_TOOLBAR,
     CSS_VIEW_H,
     EM_GAIN,
     LEFT_SHIFT_PX,
     PANE,
     PANE_H,
+    PANEL_CX_CLICK,
+    PANEL_CY_CLICK,
+    PANEL_TOP_CLICK,
     SCALE_CAL_NM,
     TOOLBAR,
     VOXEL_NM,
@@ -475,13 +477,13 @@ class NativeEnvironment(gym.Env):
             self._click_3d(x_css, y_css)
         else:
             # 2D xy slice: orthographic — clicked point maps linearly to the
-            # z-plane at crossSectionScale canonical (4nm) units per CSS px.
-            if y_css < CSS_TOOLBAR:
+            # z-plane at crossSectionScale canonical (4nm) units per CSS px,
+            # about the PANEL centre in click coordinates (see pane2d).
+            if y_css < PANEL_TOP_CLICK:
                 return
             xs = float(st["crossSectionScale"])
-            cx_css, cy_css = CSS_PANE / 2.0, CSS_TOOLBAR + CSS_VIEW_H / 2.0
-            st["position"][0] += (x_css - cx_css) * xs
-            st["position"][1] += (y_css - cy_css) * xs
+            st["position"][0] += (x_css - PANEL_CX_CLICK) * xs
+            st["position"][1] += (y_css - PANEL_CY_CLICK) * xs
 
     def _apply_select(self, x_css: float, y_css: float) -> None:
         """NG `select`: toggle the segment under the cursor in/out of the
@@ -489,7 +491,7 @@ class NativeEnvironment(gym.Env):
         st["segments"] each frame and the 2D tile key includes the selection,
         so the mesh loads and the label tint refreshes without extra plumbing.
         """
-        if y_css < CSS_TOOLBAR:
+        if y_css < PANEL_TOP_CLICK:
             return
         rid = (self._segment_under_3d(x_css, y_css) if x_css >= CSS_PANE
                else self._segment_under_2d(x_css, y_css))
@@ -514,9 +516,8 @@ class NativeEnvironment(gym.Env):
         uses extent/out_px) so a pick agrees with the tint that is drawn."""
         st = self._json_state
         xs = float(st["crossSectionScale"])
-        cx_css, cy_css = CSS_PANE / 2.0, CSS_TOOLBAR + CSS_VIEW_H / 2.0
-        world = [st["position"][0] + (x_css - cx_css) * xs,
-                 st["position"][1] + (y_css - cy_css) * xs,
+        world = [st["position"][0] + (x_css - PANEL_CX_CLICK) * xs,
+                 st["position"][1] + (y_css - PANEL_CY_CLICK) * xs,
                  st["position"][2]]
         # NG picks against the slice it RENDERS, which is the CSS-resolution
         # pane (900 px wide), not the downscaled capture -- so the pick mip is
@@ -585,6 +586,14 @@ class NativeEnvironment(gym.Env):
 
         Shared by move-to-mouse-position (action 1) and select (action 2) so
         the two cannot drift on what "under the cursor" means.
+
+        NOTE (2026-09-10): the `- TOOLBAR` below carries the same off-by-17-CSS-px
+        error the 2D branch had before PANEL_*_CLICK -- the DOM measurement says
+        a panel starts at click y=23 and is 853 CSS px tall, so the row should be
+        (y_css - 23) * PANE_H / 853, which puts the panel centre at PANE_H/2
+        rather than ~8.7 rows above it. Left alone deliberately: it changes where
+        every 3D click lands and so alters every existing run, and unlike the 2D
+        pick it has no measurement backing it yet. Fix behind its own gate.
         """
         st = self._json_state
         if self._service is not None:

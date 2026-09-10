@@ -28,6 +28,22 @@ CSS_PANE = 900.0
 CSS_TOOLBAR = 33.0
 CSS_VIEW_H = 867.0
 
+# Click geometry, measured off the live DOM (probe_select_parity.py --mode
+# rects, 2026-09-10). `mouse_xy` is relative to `.neuroglancer-layer-group-
+# viewer` -- that is where execute_click places its events -- and that element
+# sits at page y=24, while the data panels sit at page y=47 and are 853 CSS px
+# tall. So in CLICK coordinates a panel starts at y=23 and its centre is at
+# 449.5, NOT at CSS_TOOLBAR + CSS_VIEW_H/2 = 466.5.
+#
+# These are deliberately separate from CSS_TOOLBAR/CSS_VIEW_H above, which are
+# CAPTURE geometry: the fetch extent and the composed canvas are calibrated
+# against them together with LEFT_SHIFT_PX and EM_GAIN, and changing those
+# changes the observation for every existing run.
+PANEL_TOP_CLICK = 23.0
+PANEL_H_CLICK = 853.0
+PANEL_CX_CLICK = CSS_PANE / 2.0
+PANEL_CY_CLICK = PANEL_TOP_CLICK + PANEL_H_CLICK / 2.0   # 449.5
+
 
 def pane_extents_nm(xs_scale: float) -> tuple[float, float]:
     return float(xs_scale) * CSS_PANE * 4.0, float(xs_scale) * CSS_VIEW_H * 4.0
