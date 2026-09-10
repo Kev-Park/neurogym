@@ -331,6 +331,10 @@ class NativeEnvironment(gym.Env):
         self._json_state = st
         self._tile_key = None
         self._coarse_pending = None
+        # Cancel, don't just drop: an abandoned mesh fetch would keep a pool
+        # worker busy for the new episode's first seconds.
+        for fut in self._mesh_futs.values():
+            fut.cancel()
         self._mesh_futs.clear()
         # RANDOM mode: one latency draw per episode, so an episode has a
         # consistent "network speed" rather than per-step jitter.
