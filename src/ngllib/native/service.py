@@ -108,8 +108,10 @@ class RenderEncodeService:
             self._rend.load_mesh(rid, v, f)
 
     def _seg_ids(self, state) -> list[str]:
-        """NG's `select` toggles segments into a SET; every one of them draws."""
-        return [str(r) for r in state["segments"]]
+        """VISIBLE segments. NG's `select` toggles VISIBILITY, and a hidden
+        one stays in the list prefixed with "!" -- see
+        NativeEnvironment._seg_key."""
+        return [str(r) for r in state["segments"] if not str(r).startswith("!")]
 
     def _ensure_meshes(self, state) -> list[str]:
         ids = self._seg_ids(state)

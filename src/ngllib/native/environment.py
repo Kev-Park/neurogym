@@ -327,7 +327,8 @@ class NativeEnvironment(gym.Env):
         self._adopt_delay = (int(self._rng.integers(0, 5))
                              if self._pane_mode == "random" else 0)
 
-        rid = str(st["segments"][0])
+        _vis = self._seg_key(st["segments"])
+        rid = _vis[0] if _vis else str(st["segments"][0]).lstrip("!")
         if self._service is not None and pf is not None:
             pass  # service caches were warmed by the prefetch RPC
         elif self._service is None:
@@ -491,12 +492,17 @@ class NativeEnvironment(gym.Env):
                else self._segment_under_2d(x_css, y_css))
         if rid is None:
             return                      # clicked background: NG selects nothing
+        # Toggle VISIBILITY, NG-style: a hidden segment stays in the list
+        # under a "!" prefix (it is still *selected*), and re-selecting it
+        # unhides it rather than appending a duplicate.
         segs = [str(s) for s in self._json_state["segments"]]
         rid_s = str(rid)
         if rid_s in segs:
-            segs.remove(rid_s)          # toggle OFF
+            segs[segs.index(rid_s)] = "!" + rid_s          # visible -> hidden
+        elif "!" + rid_s in segs:
+            segs[segs.index("!" + rid_s)] = rid_s          # hidden -> visible
         else:
-            segs.append(rid_s)          # toggle ON
+            segs.append(rid_s)                             # newly selected
         self._json_state["segments"] = segs
 
     def _segment_under_2d(self, x_css: float, y_css: float):
@@ -647,10 +653,16 @@ class NativeEnvironment(gym.Env):
 
     @staticmethod
     def _seg_key(segments):
-        """Selection as a stable, hashable key. NG's `select` toggles segments
-        into a SET, so the 2D labels and the 3D meshes both depend on the whole
-        selection, not just the first entry."""
-        return tuple(str(s) for s in segments)
+        """VISIBLE segments, as a stable hashable key.
+
+        NG keeps two sets (layer/segmentation/index.ts): `selectedSegments`,
+        everything in the list, and `visibleSegments`, the subset that is
+        drawn. `select` (dblclick0) toggles VISIBILITY, and a selected-but-
+        hidden segment serializes as "!<id>" rather than being dropped. Only
+        the visible ones produce a 2D tint or a 3D mesh, so both the tile key
+        and every draw path key on this.
+        """
+        return tuple(str(s) for s in segments if not str(s).startswith("!"))
 
     def _tile_key_for(self, pos, xs, rid):
         rid_key = rid if isinstance(rid, (str, int)) else self._seg_key(rid)
@@ -772,7 +784,8 @@ class NativeEnvironment(gym.Env):
                               "visual_fut": self._submit_visuals(state)}
             return
         try:
-            rid = str(state["segments"][0])
+            vis = self._seg_key(state["segments"])
+            rid = vis[0] if vis else str(state["segments"][0]).lstrip("!")
             mesh_fut = (None if self._renderer.has_mesh(rid)
                         else self._tile_pool().submit(
                             worker_mesh, self._cache_dir, rid))
@@ -887,12 +900,12 @@ class NativeEnvironment(gym.Env):
             # per selected segment (`label` is a {root_id: mask} dict when the
             # selection holds more than one).
             lab = tiles["label"]
+            vis = self._seg_key(self._json_state["segments"])
             if isinstance(lab, dict):
-                pairs = [(int(r), lab[int(r)])
-                         for r in self._json_state["segments"]
+                pairs = [(int(r), lab[int(r)]) for r in vis
                          if lab.get(int(r)) is not None]
             else:
-                pairs = [(int(self._json_state["segments"][0]), lab)]
+                pairs = [(int(vis[0]), lab)] if vis else []
             for _rid, m in pairs:
                 col = np.asarray(segment_color(_rid)) * 255.0
                 rgb[m] = 0.5 * col[None, :] + 0.5 * rgb[m]
