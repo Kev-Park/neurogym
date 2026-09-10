@@ -136,6 +136,26 @@ class MeshRenderer:
             self._vao_bytes -= old_bytes
 
     @staticmethod
+    def _as_ids(root_id):
+        """`select` toggles a SET of segments, so every draw path takes either
+        a single id (legacy callers) or a sequence of them."""
+        if isinstance(root_id, (str, int)):
+            return [str(root_id)]
+        return [str(r) for r in root_id]
+
+    def _draw_meshes(self, ids, colors) -> None:
+        """One draw per loaded segment, each in its own colour. Segments whose
+        mesh has not arrived yet are simply skipped -- the pane shows what is
+        loaded rather than raising mid-frame."""
+        for i, rid in enumerate(ids):
+            entry = self._vaos.get(rid)
+            if entry is None:
+                continue
+            self.prog["color"].value = tuple(float(c) for c in colors[i])
+            entry[0].render(mode=4)
+            self._vaos.move_to_end(rid)
+
+    @staticmethod
     def _rot(q):
         x, y, z, w = q
         n = (x * x + y * y + z * z + w * w) ** 0.5 or 1.0
@@ -170,10 +190,14 @@ class MeshRenderer:
         vao.render(mode=5)  # TRIANGLE_STRIP
         vao.release(); vbo.release(); tex.release()
 
-    def render(self, root_id: str, position_nm, quat, zoom_nm,
+    def render(self, root_id, position_nm, quat, zoom_nm,
                color, em_tile=None, em_extent_nm=None,
                em_gain: float = 1.0) -> np.ndarray:
-        """Full 3D pane: mesh + section plane + axis lines. (H, W, 3) uint8."""
+        """Full 3D pane: mesh(es) + section plane + axis lines. (H, W, 3) uint8.
+
+        `root_id` is one id or a sequence of them; `color` is correspondingly
+        one RGB triple or one per id.
+        """
         view, proj = self._matrices(position_nm, quat, zoom_nm)
         mvp = (proj @ view).astype("f4")
         mvp_b = mvp.T.copy().tobytes()  # column-major
@@ -186,10 +210,11 @@ class MeshRenderer:
 
         self.prog["mvp"].write(mvp_b)
         self.prog["light"].value = (*(ldir * 0.8), 0.2)
-        self.prog["color"].value = tuple(float(c) for c in color)
-        vao, _, _ = self._vaos[root_id]
-        self._vaos.move_to_end(root_id)
-        vao.render(mode=4)
+        ids = self._as_ids(root_id)
+        colors = ([color] * len(ids) if isinstance(root_id, (str, int))
+                  or not isinstance(color[0], (list, tuple, np.ndarray))
+                  else list(color))
+        self._draw_meshes(ids, colors)
 
         if em_tile is not None:
             self._draw_plane(mvp_b, pos, em_tile, em_extent_nm,
@@ -214,7 +239,7 @@ class MeshRenderer:
         px = np.frombuffer(self.fbo.read(components=4), dtype=np.uint8)
         return px.reshape(self.height, self.width, 4)[::-1, :, :3].copy()
 
-    def pick_depth(self, root_id: str, position_nm, quat, zoom_nm,
+    def pick_depth(self, root_id, position_nm, quat, zoom_nm,
                    plane_extent_nm=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Depth buffer of the PICKABLE content (mesh + section plane) at the
         given state, plus (view, proj) for unprojection.
@@ -232,9 +257,8 @@ class MeshRenderer:
         self.fbo.clear(0.0, 0.0, 0.0, 1.0)
         self.prog["mvp"].write(mvp_b)
         self.prog["light"].value = (0.0, 0.0, 0.8, 0.2)
-        self.prog["color"].value = (1.0, 1.0, 1.0)
-        vao, _, _ = self._vaos[root_id]
-        vao.render(mode=4)
+        ids = self._as_ids(root_id)
+        self._draw_meshes(ids, [(1.0, 1.0, 1.0)] * len(ids))
         if plane_extent_nm is not None:
             # Depth-only participation: a 1px dummy texture is enough.
             dummy = np.zeros((2, 2), dtype=np.uint8)

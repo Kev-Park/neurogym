@@ -84,7 +84,14 @@ class EMTiles:
     def label_tile(self, pos_nm, extent_x_nm, extent_y_nm, root_id,
                    out_px=(450, 433)):
         """Boolean mask of the root segment on the z-slice, or None if the
-        static label chunks aren't readable from the m783 bucket."""
+        static label chunks aren't readable from the m783 bucket.
+
+        `root_id` may be a sequence, in which case a {root_id: mask} dict is
+        returned from a SINGLE volume read -- Neuroglancer's `select` builds a
+        set of segments and each needs its own mask, but they all live in the
+        same cutout.
+        """
+        multi = not isinstance(root_id, (int, str, np.integer))
         try:
             vol = self._seg_vol(extent_x_nm / out_px[0])
             if vol is None:
@@ -97,9 +104,15 @@ class EMTiles:
                 return None
             cut = vol[cx - hx:cx + hx, cy - hy:cy + hy, z:z + 1]
             lab = np.asarray(cut)[:, :, 0, 0].T
-            mask = (lab == int(root_id)).astype(np.uint8) * 255
-            m = Image.fromarray(mask).resize(out_px, Image.NEAREST)
-            return np.asarray(m) > 127
+
+            def _mask_for(rid):
+                mask = (lab == int(rid)).astype(np.uint8) * 255
+                m = Image.fromarray(mask).resize(out_px, Image.NEAREST)
+                return np.asarray(m) > 127
+
+            if multi:
+                return {int(r): _mask_for(r) for r in root_id}
+            return _mask_for(root_id)
         except Exception:
             return None
 
@@ -214,6 +227,9 @@ def worker_visuals(cache_dir, pos, xs_scale, root_id, max_px=1024,
     ext = pane2d.pane_extents_nm(xs_scale)
     shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
     tile = em.tile(shifted, ext[0], ext[1], max_px, True)
+    # root_id may be a single id or the whole selected SET (NG's `select`
+    # toggles segments into a set); label_tile returns a mask or a
+    # {root_id: mask} dict accordingly, and compose_left tints each.
     label = (em.label_tile(shifted, ext[0], ext[1], root_id,
                            (pane2d.PANE, pane2d.PANE_H))
              if with_label else None)

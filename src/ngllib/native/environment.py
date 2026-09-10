@@ -330,18 +330,22 @@ class NativeEnvironment(gym.Env):
         rid = str(st["segments"][0])
         if self._service is not None and pf is not None:
             pass  # service caches were warmed by the prefetch RPC
-        elif self._service is None and not self._renderer.has_mesh(rid):
-            v = vn = f = None
-            if pf is not None and pf.get("mesh_fut") is not None:
-                try:
-                    v, vn, f = pf["mesh_fut"].result(timeout=240)
-                except Exception as e:
-                    logger.warning("prefetched mesh failed (%s); inline fetch", e)
-                    v = None
-            if v is None:
-                v, f = self._meshes.get(rid)
-                vn = None
-            self._renderer.load_mesh(rid, v, f, normals=vn)
+        elif self._service is None:
+            if not self._renderer.has_mesh(rid):
+                v = vn = f = None
+                if pf is not None and pf.get("mesh_fut") is not None:
+                    try:
+                        v, vn, f = pf["mesh_fut"].result(timeout=240)
+                    except Exception as e:
+                        logger.warning("prefetched mesh failed (%s); inline fetch", e)
+                        v = None
+                if v is None:
+                    v, f = self._meshes.get(rid)
+                    vn = None
+                self._renderer.load_mesh(rid, v, f, normals=vn)
+            # A reset state may already carry several selected segments; only
+            # the first one has a prefetched mesh.
+            self._ensure_meshes(st["segments"])
         if pf is not None and pf.get("tiles") is not None:
             # Adopt the prefetched tile group; the blocking gather below
             # resolves it (usually already done).
@@ -362,14 +366,19 @@ class NativeEnvironment(gym.Env):
 
     def step(self, action):
         action_type = int(action["action_type"])
-        if action_type == 1:
+        if action_type == 0:
+            # NG binds mousedown0 to rotate-via-mouse-drag; a click with no
+            # drag applies a zero rotation, so the browser env's left_click is
+            # a state no-op too. Accepted, not rejected, so both backends take
+            # the identical action space.
+            pass
+        elif action_type in (1, 2):
             self._apply_click(action)
         elif action_type == 3:
             self._apply_state_edit(action)
         else:
             raise NotImplementedError(
-                f"NativeEnvironment supports right_click (1) and edit_state (3); "
-                f"got action_type={action_type}")
+                f"action_type must be 0, 1, 2, or 3; got {action_type}")
 
         obs = self._gather_observation()
         try:
@@ -450,9 +459,14 @@ class NativeEnvironment(gym.Env):
     # ---- actions
 
     def _apply_click(self, action: dict[str, Any]) -> None:
-        """NG right-click = move-to-mouse-position; background = no-op."""
+        """NG bindings on a rendered data panel (default_input_event_bindings):
+        `at:mousedown2` -> move-to-mouse-position (action_type 1),
+        `at:dblclick0`  -> select (action_type 2). Background = no-op."""
         x_css, y_css = (float(v) for v in action["mouse_xy"])
         st = self._json_state
+        if int(action.get("action_type", 1)) == 2:
+            self._apply_select(x_css, y_css)
+            return
         if x_css >= CSS_PANE:
             self._click_3d(x_css, y_css)
         else:
@@ -465,26 +479,118 @@ class NativeEnvironment(gym.Env):
             st["position"][0] += (x_css - cx_css) * xs
             st["position"][1] += (y_css - cy_css) * xs
 
+    def _apply_select(self, x_css: float, y_css: float) -> None:
+        """NG `select`: toggle the segment under the cursor in/out of the
+        selected set. Both panes follow automatically -- _render_right reads
+        st["segments"] each frame and the 2D tile key includes the selection,
+        so the mesh loads and the label tint refreshes without extra plumbing.
+        """
+        if y_css < CSS_TOOLBAR:
+            return
+        rid = (self._segment_under_3d(x_css, y_css) if x_css >= CSS_PANE
+               else self._segment_under_2d(x_css, y_css))
+        if rid is None:
+            return                      # clicked background: NG selects nothing
+        segs = [str(s) for s in self._json_state["segments"]]
+        rid_s = str(rid)
+        if rid_s in segs:
+            segs.remove(rid_s)          # toggle OFF
+        else:
+            segs.append(rid_s)          # toggle ON
+        self._json_state["segments"] = segs
+
+    def _segment_under_2d(self, x_css: float, y_css: float):
+        """Segment id under a 2D-pane pixel via a point query on the
+        segmentation volume, at the SAME mip the pane displays (label_tile
+        uses extent/out_px) so a pick agrees with the tint that is drawn."""
+        st = self._json_state
+        xs = float(st["crossSectionScale"])
+        cx_css, cy_css = CSS_PANE / 2.0, CSS_TOOLBAR + CSS_VIEW_H / 2.0
+        world = [st["position"][0] + (x_css - cx_css) * xs,
+                 st["position"][1] + (y_css - cy_css) * xs,
+                 st["position"][2]]
+        res_nm = xs * CSS_PANE * 4.0 / PANE   # == label_tile's extent/out_px
+        return self._pick_em_tiles().segment_at(
+            np.asarray(world, dtype=np.float64) * VOXEL_NM, res_nm)
+
+    def _segment_under_3d(self, x_css: float, y_css: float):
+        """Segment id under a 3D-pane pixel: the front-most SELECTED mesh at
+        that pixel. Only selected segments have meshes in the pane, so a 3D
+        double-click can only ever deselect -- which is exactly what NG does.
+
+        Depth-per-segment rather than a volume query at the unprojected point:
+        the hit lies ON a mesh surface, where a single-voxel lookup easily
+        lands in the neighbouring segment or in background.
+        """
+        if self._service is not None:
+            world = self._service.pick(
+                self._json_state,
+                int(round(x_css * self.capture_scale - PANE)),
+                int(round(y_css * self.capture_scale - TOOLBAR)))
+            if world is None:
+                return None
+            return self._pick_em_tiles().segment_at(
+                np.asarray(world, dtype=np.float64) * VOXEL_NM)
+        st = self._json_state
+        ix = int(round(x_css * self.capture_scale - PANE))
+        iy = int(round(y_css * self.capture_scale - TOOLBAR))
+        if not (0 <= ix < PANE and 0 <= iy < PANE_H):
+            return None
+        ids = self._seg_key(st["segments"])
+        if not ids:
+            return None
+        self._ensure_meshes(ids)
+        pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
+        zoom_nm = float(st["projectionScale"]) * SCALE_CAL_NM
+        best, best_d = None, 0.9999
+        for rid in ids:
+            depth, _, _ = self._renderer.pick_depth(
+                [rid], pos_nm, st["projectionOrientation"], zoom_nm)
+            # NG picks over a small radius; take the front-most hit nearby.
+            y0, y1 = max(0, iy - 3), min(PANE_H, iy + 4)
+            x0, x1 = max(0, ix - 3), min(PANE, ix + 4)
+            d = float(depth[y0:y1, x0:x1].min())
+            if d < best_d:
+                best, best_d = rid, d
+        return best
+
+    def _pick_em_tiles(self):
+        """EMTiles handle for client-side point queries (selecting is rare, so
+        this deliberately does not go through the fetch pool)."""
+        if getattr(self, "_pick_em", None) is None:
+            from .em import EMTiles
+            self._pick_em = EMTiles(self._cache_dir)
+        return self._pick_em
+
     def _click_3d(self, x_css: float, y_css: float) -> None:
+        """NG right-click on the 3D pane: move-to-mouse-position."""
+        hit = self._pick_3d_world(x_css, y_css)
+        if hit is not None:
+            self._json_state["position"] = [float(v) for v in hit]
+
+    def _pick_3d_world(self, x_css: float, y_css: float):
+        """World point (voxels) under a 3D-pane pixel, or None for background.
+
+        Shared by move-to-mouse-position (action 1) and select (action 2) so
+        the two cannot drift on what "under the cursor" means.
+        """
         st = self._json_state
         if self._service is not None:
             ix = int(round(x_css * self.capture_scale - PANE))
             iy = int(round(y_css * self.capture_scale - TOOLBAR))
-            hit = self._service.pick(st, ix, iy)
-            if hit is not None:
-                st["position"] = [float(v) for v in hit]
-            return
+            return self._service.pick(st, ix, iy)
         pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
         quat = st["projectionOrientation"]
         zoom_nm = float(st["projectionScale"]) * SCALE_CAL_NM
         ext = self._pane_extents_nm()
         depth, view, proj = self._renderer.pick_depth(
-            str(st["segments"][0]), pos_nm, quat, zoom_nm, plane_extent_nm=ext)
+            self._seg_key(st["segments"]), pos_nm, quat, zoom_nm,
+            plane_extent_nm=ext)
         fx = x_css * self.capture_scale - PANE
         fy = y_css * self.capture_scale - TOOLBAR
         ix, iy = int(round(fx)), int(round(fy))
         if not (0 <= ix < PANE and 0 <= iy < PANE_H):
-            return
+            return None
         d = depth[iy, ix]
         px, py = ix, iy
         if d >= 0.9999:
@@ -494,14 +600,14 @@ class NativeEnvironment(gym.Env):
             x0, x1 = max(0, ix - 3), min(PANE, ix + 4)
             win = depth[y0:y1, x0:x1]
             if not (win < 0.9999).any():
-                return  # background: no-op
+                return None  # background: no-op
             yy, xx = np.unravel_index(np.argmin(win), win.shape)
             d, px, py = win[yy, xx], x0 + xx, y0 + yy
         ndc = np.array([2 * (px + 0.5) / PANE - 1,
                         1 - 2 * (py + 0.5) / PANE_H,
                         2 * d - 1, 1.0])
         w = np.linalg.inv(proj @ view) @ ndc
-        st["position"] = [float(v) for v in (w[:3] / w[3]) / VOXEL_NM]
+        return [float(v) for v in (w[:3] / w[3]) / VOXEL_NM]
 
     def _apply_state_edit(self, action: dict[str, Any]) -> None:
         """Bit-exact port of the browser env's `_apply_state_edit`."""
@@ -539,14 +645,22 @@ class NativeEnvironment(gym.Env):
         xs = float(self._json_state["crossSectionScale"])
         return xs * CSS_PANE * 4.0, xs * CSS_VIEW_H * 4.0
 
+    @staticmethod
+    def _seg_key(segments):
+        """Selection as a stable, hashable key. NG's `select` toggles segments
+        into a SET, so the 2D labels and the 3D meshes both depend on the whole
+        selection, not just the first entry."""
+        return tuple(str(s) for s in segments)
+
     def _tile_key_for(self, pos, xs, rid):
+        rid_key = rid if isinstance(rid, (str, int)) else self._seg_key(rid)
         return (round(pos[0], 2), round(pos[1], 2), round(pos[2], 2),
-                round(float(xs), 5), rid, self.left_pane)
+                round(float(xs), 5), rid_key, self.left_pane)
 
     def _tile_state_key(self):
         st = self._json_state
         return self._tile_key_for(st["position"], st["crossSectionScale"],
-                                  str(st["segments"][0]))
+                                  self._seg_key(st["segments"]))
 
     def _submit_tile_group(self, pos, xs, rid, stage: str = "fine") -> tuple:
         """(key, futs, ext, stage) for an arbitrary state — used for the
@@ -582,8 +696,8 @@ class NativeEnvironment(gym.Env):
     def _submit_tile_fetch(self, key, stage: str = "fine"):
         st = self._json_state
         self._pending = self._submit_tile_group(
-            st["position"], st["crossSectionScale"], str(st["segments"][0]),
-            stage)
+            st["position"], st["crossSectionScale"],
+            self._seg_key(st["segments"]), stage)
 
     def _submit_visuals(self, state):
         """Future of (canvas, plane_tile). One worker job for both when the
@@ -598,7 +712,8 @@ class NativeEnvironment(gym.Env):
             return _PlaneOnly(fut)
         return self._tile_pool().submit(
             worker_visuals, self._cache_dir, list(state["position"]),
-            float(state["crossSectionScale"]), str(state["segments"][0]))
+            float(state["crossSectionScale"]),
+            self._seg_key(state["segments"]))
 
     def _service_visuals(self, block: bool):
         """(canvas, plane_tile) when they changed (else (None, None) ->
@@ -662,7 +777,8 @@ class NativeEnvironment(gym.Env):
                         else self._tile_pool().submit(
                             worker_mesh, self._cache_dir, rid))
             tiles = self._submit_tile_group(
-                state["position"], state["crossSectionScale"], rid)
+                state["position"], state["crossSectionScale"],
+                self._seg_key(state["segments"]))
         except Exception as e:
             logger.warning("reset-ahead prefetch submit failed (%s)", e)
             mesh_fut, tiles = None, None
@@ -767,10 +883,19 @@ class NativeEnvironment(gym.Env):
                          ).astype(np.float32) * EM_GAIN
         rgb = np.repeat(img[..., None], 3, axis=2)
         if tiles["label"] is not None:
-            col = np.asarray(
-                segment_color(int(self._json_state["segments"][0]))) * 255.0
-            # NG segmentation 2D: selectedAlpha 0.5 over the image.
-            rgb[tiles["label"]] = 0.5 * col[None, :] + 0.5 * rgb[tiles["label"]]
+            # NG segmentation 2D: selectedAlpha 0.5 over the image, one colour
+            # per selected segment (`label` is a {root_id: mask} dict when the
+            # selection holds more than one).
+            lab = tiles["label"]
+            if isinstance(lab, dict):
+                pairs = [(int(r), lab[int(r)])
+                         for r in self._json_state["segments"]
+                         if lab.get(int(r)) is not None]
+            else:
+                pairs = [(int(self._json_state["segments"][0]), lab)]
+            for _rid, m in pairs:
+                col = np.asarray(segment_color(_rid)) * 255.0
+                rgb[m] = 0.5 * col[None, :] + 0.5 * rgb[m]
         # One-sided crosshair (red +x, green +y), alpha 0.5.
         cy, cx = PANE_H // 2, PANE // 2
         length = int(min(900, 867) / 4 / 2)
@@ -782,14 +907,36 @@ class NativeEnvironment(gym.Env):
         tiles["left_canvas"] = canvas
         return canvas
 
+    def _ensure_meshes(self, segments) -> None:
+        """Load the mesh of every selected segment that is not resident.
+
+        Selecting a segment is rare (one action), so the fetch is inline
+        rather than pooled; a mesh that fails to load is skipped and the pane
+        renders the rest, matching Chrome's behaviour of drawing what has
+        arrived rather than blanking the view.
+        """
+        if self._service is not None:
+            return
+        for rid in self._seg_key(segments):
+            if self._renderer.has_mesh(rid):
+                continue
+            try:
+                v, f = self._meshes.get(rid)
+                self._renderer.load_mesh(rid, v, f)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("mesh fetch for selected segment %s failed (%s)",
+                               rid, e)
+
     def _render_right(self, tiles: dict[str, Any]) -> np.ndarray:
         st = self._json_state
-        rid = str(st["segments"][0])
+        ids = self._seg_key(st["segments"])
+        # A segment selected mid-episode (double-click) has no mesh yet.
+        self._ensure_meshes(ids)
         pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
         pane = self._renderer.render(
-            rid, pos_nm, st["projectionOrientation"],
+            ids, pos_nm, st["projectionOrientation"],
             float(st["projectionScale"]) * SCALE_CAL_NM,
-            segment_color(int(rid)),
+            [segment_color(int(r)) for r in ids],
             em_tile=tiles["plane"], em_extent_nm=tiles["ext"],
             em_gain=EM_GAIN)
         out = np.zeros((PANE, PANE, 3), dtype=np.uint8)

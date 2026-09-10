@@ -107,26 +107,37 @@ class RenderEncodeService:
             v, f = self._meshes.get(rid)
             self._rend.load_mesh(rid, v, f)
 
+    def _seg_ids(self, state) -> list[str]:
+        """NG's `select` toggles segments into a SET; every one of them draws."""
+        return [str(r) for r in state["segments"]]
+
+    def _ensure_meshes(self, state) -> list[str]:
+        ids = self._seg_ids(state)
+        for rid in ids:
+            try:
+                self._ensure_mesh(rid)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("mesh fetch for segment %s failed (%s)", rid, e)
+        return ids
+
     def _render_right(self, state, plane_tile) -> np.ndarray:
-        rid = str(state["segments"][0])
-        self._ensure_mesh(rid)
+        ids = self._ensure_meshes(state)
         pos_nm = np.asarray(state["position"], dtype=np.float64) * pane2d.VOXEL_NM
         ext = pane2d.pane_extents_nm(float(state["crossSectionScale"]))
         pane = self._rend.render(
-            rid, pos_nm, state["projectionOrientation"],
+            ids, pos_nm, state["projectionOrientation"],
             float(state["projectionScale"]) * pane2d.SCALE_CAL_NM,
-            segment_color(int(rid)),
+            [segment_color(int(r)) for r in ids],
             em_tile=plane_tile, em_extent_nm=ext,
             em_gain=pane2d.EM_GAIN)
         return pane2d.paste_right(pane)
 
     def _do_pick(self, state, px, py):
-        rid = str(state["segments"][0])
-        self._ensure_mesh(rid)
+        ids = self._ensure_meshes(state)
         pos_nm = np.asarray(state["position"], dtype=np.float64) * pane2d.VOXEL_NM
         ext = pane2d.pane_extents_nm(float(state["crossSectionScale"]))
         depth, view, proj = self._rend.pick_depth(
-            rid, pos_nm, state["projectionOrientation"],
+            ids, pos_nm, state["projectionOrientation"],
             float(state["projectionScale"]) * pane2d.SCALE_CAL_NM,
             plane_extent_nm=ext)
         if not (0 <= px < pane2d.PANE and 0 <= py < pane2d.PANE_H):
@@ -172,7 +183,7 @@ class RenderEncodeService:
                         fut.set_result(self._do_pick(state, px, py))
                     elif kind == "warm":
                         _, _, state, _, fut = msg
-                        self._ensure_mesh(str(state["segments"][0]))
+                        self._ensure_meshes(state)
                         fut.set_result(True)
                     else:
                         _, cid, state, payload, fut = msg

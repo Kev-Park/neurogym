@@ -42,7 +42,13 @@ def shifted_fetch_center_nm(pos_nm: np.ndarray, ext: tuple[float, float]):
 
 def compose_left(tile, label_mask, root_id) -> np.ndarray:
     """2D xy EM pane canvas (PANE x PANE x 3 uint8): calibrated filter chain
-    + segment tint + one-sided crosshair + toolbar strip."""
+    + segment tint + one-sided crosshair + toolbar strip.
+
+    Neuroglancer's `select` toggles segments into a SET and tints each with its
+    own colour, so `root_id` may be a single id or a sequence, and
+    `label_mask` correspondingly a single mask or a {root_id: mask} dict.
+    Single-id callers keep working unchanged.
+    """
     canvas = np.zeros((PANE, PANE, 3), dtype=np.uint8)
     if tile is None:
         return canvas
@@ -51,8 +57,18 @@ def compose_left(tile, label_mask, root_id) -> np.ndarray:
                      ).astype(np.float32) * EM_GAIN
     rgb = np.repeat(img[..., None], 3, axis=2)
     if label_mask is not None:
-        col = np.asarray(segment_color(int(root_id))) * 255.0
-        rgb[label_mask] = 0.5 * col[None, :] + 0.5 * rgb[label_mask]
+        if isinstance(label_mask, dict):
+            # Painted in the selection's own order so overlaps resolve the way
+            # a caller listed them, not by dict iteration accident.
+            ids = [int(r) for r in root_id] if not isinstance(
+                root_id, (int, str)) else [int(root_id)]
+            pairs = [(r, label_mask[r]) for r in ids if label_mask.get(r) is not None]
+        else:
+            rid0 = root_id[0] if not isinstance(root_id, (int, str)) else root_id
+            pairs = [(int(rid0), label_mask)]
+        for rid, m in pairs:
+            col = np.asarray(segment_color(int(rid))) * 255.0
+            rgb[m] = 0.5 * col[None, :] + 0.5 * rgb[m]
     cy, cx = PANE_H // 2, PANE // 2
     length = int(min(900, 867) / 4 / 2)
     row = rgb[cy, cx:cx + length]
