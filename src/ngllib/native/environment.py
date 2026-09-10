@@ -959,9 +959,15 @@ class NativeEnvironment(gym.Env):
         tiles["left_canvas"], tiles["left_vis"] = canvas, vis
         return canvas
 
-    # Coarsest level requested first; MeshStore.get walks down to whatever
-    # the segment actually has. NG streams meshes the same way.
-    MESH_COARSE_LOD = 2
+    # Coarse level requested first; MeshStore.get walks down to whatever the
+    # segment actually has. NG streams meshes the same way.
+    #
+    # 1, not 2, even though 2 is coarser: the walk-down costs a failed
+    # round-trip when a level is absent, and segments vary (measured ranges
+    # 0..1 and 0..2). Requesting lod<=2 measured 0.52 s against lod<=1 at
+    # 0.44 s -- asking for the coarsest level available anywhere is slower on
+    # average than asking for one every segment has.
+    MESH_COARSE_LOD = 1
 
     def _ensure_meshes(self, segments, block: bool = False) -> None:
         """Make selected segments' meshes resident, STREAMING like Chrome:

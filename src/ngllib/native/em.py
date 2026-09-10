@@ -328,9 +328,15 @@ def worker_mesh(cache_dir: str, root_id: str, lod: int = 0):
     e1 = v[f[:, 1]] - v[f[:, 0]]
     e2 = v[f[:, 2]] - v[f[:, 0]]
     fn = np.cross(e1, e2)
-    vn = np.zeros_like(v)
-    for k in range(3):
-        np.add.at(vn, f[:, k], fn)
+    # bincount, not np.add.at: same scatter-add, but add.at takes an unbuffered
+    # slow path and was a large share of the fetch-to-screen latency for meshes
+    # of 50-340k vertices. Each face normal accumulates onto its three corners,
+    # so the face list flattens against fn repeated three times.
+    idx = f.reshape(-1)
+    w = np.repeat(fn, 3, axis=0)
+    vn = np.empty((len(v), 3), dtype=np.float64)
+    for axis in range(3):
+        vn[:, axis] = np.bincount(idx, weights=w[:, axis], minlength=len(v))
     vn /= (np.linalg.norm(vn, axis=1, keepdims=True) + 1e-9)
     store.drop(root_id, lod)  # worker-side RAM cache would only grow
     return v, vn.astype("f4"), f
