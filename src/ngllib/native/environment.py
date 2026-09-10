@@ -67,6 +67,7 @@ from .pane2d import (  # noqa: E402
     TOOLBAR,
     VOXEL_NM,
     compose_left_parts,
+    tint_plane,
 )
 
 _noop_reward_factory = lambda task_info: (  # noqa: E731
@@ -972,11 +973,18 @@ class NativeEnvironment(gym.Env):
         # A segment selected mid-episode (double-click) has no mesh yet.
         self._ensure_meshes(ids)
         pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
+        plane = tiles["plane"]
+        if plane is not None and tiles.get("ids") is not None:
+            key = ("plane_rgb", ids)
+            if tiles.get("plane_key") != key:
+                tiles["plane_rgb"] = tint_plane(plane, tiles["ids"], ids)
+                tiles["plane_key"] = key
+            plane = tiles["plane_rgb"]
         pane = self._renderer.render(
             ids, pos_nm, st["projectionOrientation"],
             float(st["projectionScale"]) * SCALE_CAL_NM,
             [segment_color(int(r)) for r in ids],
-            em_tile=tiles["plane"], em_extent_nm=tiles["ext"],
+            em_tile=plane, em_extent_nm=tiles["ext"],
             em_gain=EM_GAIN)
         out = np.zeros((PANE, PANE, 3), dtype=np.uint8)
         out[TOOLBAR:] = pane

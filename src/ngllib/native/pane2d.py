@@ -77,6 +77,40 @@ def draw_crosshair(rgb: np.ndarray) -> None:
     rgb[cy:cy + length, cx] = 0.5 * np.array([0, 255, 0]) + 0.5 * colm
 
 
+def tint_plane(plane_gray, ids, visible) -> np.ndarray:
+    """Colourize the 3D pane's cross-section, the way NG does.
+
+    Neuroglancer draws the SAME segmentation layer on the perspective view's
+    slice, so with a segment selected its cross-section is tinted there too,
+    and with NOTHING visible the plane goes fully colourized under
+    SHOW_ALL_SEGMENTS. Measured on matched frames: Chrome's plane pixels carry
+    a channel spread of 5.76 where ours carried 0.00.
+
+    The id map is the 2D pane's, sampled at the registration-shifted centre
+    while the plane tile is fetched unshifted -- 3 captured px apart. The plane
+    is drawn at roughly 100-200 px on screen, so that is sub-pixel there; it is
+    reused rather than refetched precisely so a selection change stays free.
+    """
+    g = np.asarray(plane_gray)
+    if ids is None or g.ndim != 2:
+        return g
+    h, w = g.shape
+    rows = np.minimum((np.arange(h) * ids.shape[0]) // h, ids.shape[0] - 1)
+    cols = np.minimum((np.arange(w) * ids.shape[1]) // w, ids.shape[1] - 1)
+    pid = ids[rows][:, cols]
+    rgb = np.repeat(g.astype(np.float32)[..., None], 3, axis=2)
+    vis = [int(v) for v in visible]
+    if not vis:
+        tint_all(rgb, pid)
+    else:
+        for rid in vis:
+            m = pid == rid
+            if m.any():
+                col = np.asarray(segment_color(rid)) * 255.0
+                rgb[m] = 0.5 * col[None, :] + 0.5 * rgb[m]
+    return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
 def compose_left_parts(em_gray, ids, visible) -> np.ndarray:
     """2D pane canvas from the CACHED raster + id map and the CURRENT selection.
 

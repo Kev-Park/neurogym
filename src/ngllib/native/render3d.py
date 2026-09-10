@@ -89,8 +89,11 @@ class MeshRenderer:
                 uniform float lfac;
                 in vec2 v_uv; out vec4 frag;
                 void main() {
-                    float g = texture(em, v_uv).r * lfac;
-                    frag = vec4(g, g, g, 1.0);
+                    // RGB: Neuroglancer draws the SAME segmentation layer on
+                    // the perspective view's cross-section, so the plane is
+                    // tinted, not grey. A greyscale plane is uploaded with
+                    // its three channels equal, so this covers both.
+                    frag = vec4(texture(em, v_uv).rgb * lfac, 1.0);
                 }""",
         )
         # LRU mesh VAOs: root_id -> (vao, [vbo, ibo], bytes)
@@ -172,8 +175,15 @@ class MeshRenderer:
         return view, proj
 
     def _draw_plane(self, mvp_b, pos, em_tile, em_extent_nm, lfac):
-        tex = self.ctx.texture(em_tile.shape[::-1], 1,
-                               np.ascontiguousarray(em_tile).tobytes())
+        arr = np.ascontiguousarray(em_tile)
+        if arr.ndim == 3:
+            tex = self.ctx.texture((arr.shape[1], arr.shape[0]), 3,
+                                   arr.tobytes())
+        else:
+            # Greyscale: replicate so one shader path serves both.
+            tex = self.ctx.texture((arr.shape[1], arr.shape[0]), 3,
+                                   np.repeat(arr[..., None], 3, axis=2)
+                                   .tobytes())
         tex.use(0)
         hx, hy = em_extent_nm[0] / 2.0, em_extent_nm[1] / 2.0
         quad = np.array([
