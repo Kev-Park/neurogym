@@ -105,13 +105,23 @@ class MeshRenderer:
         return root_id in self._vaos
 
     def load_mesh(self, root_id: str, vertices_nm, faces,
-                  normals=None) -> None:
+                  normals=None, replace: bool = False) -> None:
         """Indexed draw with smooth per-vertex normals (precomputed via
         `normals`, e.g. by em.worker_mesh, or derived here); LRU-evicts
-        past budget."""
+        past budget.
+
+        `replace=True` swaps an already-resident mesh, which is how the
+        progressive path refines a coarse level once the fine one lands.
+        """
         if root_id in self._vaos:
-            self._vaos.move_to_end(root_id)
-            return
+            if not replace:
+                self._vaos.move_to_end(root_id)
+                return
+            old_vao, old_bufs, old_bytes = self._vaos.pop(root_id)
+            old_vao.release()
+            for b in old_bufs:
+                b.release()
+            self._vao_bytes -= old_bytes
         v = np.asarray(vertices_nm, dtype="f4")
         f = np.asarray(faces, dtype="i4")
         if normals is not None:

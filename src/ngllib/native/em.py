@@ -314,15 +314,17 @@ def worker_left_canvas(cache_dir, pos, xs_scale, root_id):
 _WORKER_MESHES: dict = {}
 
 
-def worker_mesh(cache_dir: str, root_id: str):
+def worker_mesh(cache_dir: str, root_id: str, lod: int = 0):
     """Fetch + decode a mesh AND its smooth vertex normals in the worker
     process (reset-ahead prefetch): download/Draco/np.add.at are the ~30s
     reset tail, all GIL-heavy — none of it belongs on the env thread.
-    Returns (vertices_nm f4 [N,3], normals f4 [N,3], faces i4 [M,3])."""
+
+    `lod` requests a coarser level; see MeshStore.get. Returns
+    (vertices_nm f4 [N,3], normals f4 [N,3], faces i4 [M,3])."""
     store = _WORKER_MESHES.get(cache_dir)
     if store is None:
         store = _WORKER_MESHES[cache_dir] = MeshStore(cache_dir)
-    v, f = store.get(root_id)
+    v, f = store.get(root_id, lod)
     e1 = v[f[:, 1]] - v[f[:, 0]]
     e2 = v[f[:, 2]] - v[f[:, 0]]
     fn = np.cross(e1, e2)
@@ -330,7 +332,7 @@ def worker_mesh(cache_dir: str, root_id: str):
     for k in range(3):
         np.add.at(vn, f[:, k], fn)
     vn /= (np.linalg.norm(vn, axis=1, keepdims=True) + 1e-9)
-    store.drop(root_id)  # worker-side RAM cache would only grow
+    store.drop(root_id, lod)  # worker-side RAM cache would only grow
     return v, vn.astype("f4"), f
 
 
@@ -367,17 +369,38 @@ class MeshStore:
             lru_bytes = (int(mb) << 20) if mb else self.MESH_LRU_BYTES
         self._budget = int(lru_bytes)
 
-    def get(self, root_id: str) -> tuple[np.ndarray, np.ndarray]:
-        """(vertices_nm float32 [N,3], faces int32 [M,3])."""
-        hit = self._meshes.get(root_id)
+    def get(self, root_id: str, lod: int = 0) -> tuple[np.ndarray, np.ndarray]:
+        """(vertices_nm float32 [N,3], faces int32 [M,3]) at a level of detail.
+
+        The source is multi-resolution (`neuroglancer_multilod_draco`), and
+        which levels a segment has varies -- measured ranges were 0..1 and
+        0..2. `lod` is a REQUEST for the coarsest level at or below it: the
+        fetch walks down until one decodes, so a caller can ask for a coarse
+        mesh without knowing the segment's depth.
+
+        Latency scales with it, which is the point: 0.71 s median at lod 0
+        against 0.29-0.48 s at the coarsest, where Chrome's own mesh misses
+        land in ~0.08-0.35 s.
+        """
+        key = (root_id, lod)
+        hit = self._meshes.get(key)
         if hit is not None:
-            self._meshes.move_to_end(root_id)
+            self._meshes.move_to_end(key)
             return hit
-        m = self._vol.mesh.get(int(root_id))
-        mesh = m[int(root_id)] if hasattr(m, "get") or isinstance(m, dict) else m
+        mesh = None
+        for want in range(lod, -1, -1):
+            try:
+                m = self._vol.mesh.get(int(root_id), lod=want)
+            except Exception:      # noqa: BLE001 - level absent for this id
+                continue
+            mesh = m[int(root_id)] if hasattr(m, "get") or isinstance(m, dict) else m
+            break
+        if mesh is None:
+            m = self._vol.mesh.get(int(root_id))
+            mesh = m[int(root_id)] if hasattr(m, "get") or isinstance(m, dict) else m
         entry = (np.asarray(mesh.vertices, dtype="f4"),
                  np.asarray(mesh.faces, dtype="i4"))
-        self._meshes[root_id] = entry
+        self._meshes[key] = entry
         self._bytes += entry[0].nbytes + entry[1].nbytes
         # Never evict the entry just inserted, even if it alone exceeds the
         # budget — the caller is about to render it.
@@ -386,8 +409,8 @@ class MeshStore:
             self._bytes -= old[0].nbytes + old[1].nbytes
         return entry
 
-    def drop(self, root_id: str) -> None:
-        old = self._meshes.pop(root_id, None)
+    def drop(self, root_id: str, lod: int = 0) -> None:
+        old = self._meshes.pop((root_id, lod), None)
         if old is not None:
             self._bytes -= old[0].nbytes + old[1].nbytes
 

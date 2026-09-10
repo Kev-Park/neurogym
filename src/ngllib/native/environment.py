@@ -200,6 +200,8 @@ class NativeEnvironment(gym.Env):
         # 3D pane on whichever step its mesh lands, the way Chrome streams.
         self._mesh_futs: dict[str, Any] = {}
         self._mesh_due: dict[str, int] = {}
+        # Segments showing a COARSE mesh, still owed the full-resolution one.
+        self._mesh_fine: set[str] = set()
         self._steps = 0
         # NGL_NATIVE_MESH_LAG_STEPS: hold a landed mesh until this many steps
         # after the selection. Default 0 -- show it as soon as it arrives.
@@ -355,6 +357,7 @@ class NativeEnvironment(gym.Env):
             fut.cancel()
         self._mesh_futs.clear()
         self._mesh_due.clear()
+        self._mesh_fine.clear()
         self._steps = 0
         # RANDOM mode: one latency draw per episode, so an episode has a
         # consistent "network speed" rather than per-step jitter.
@@ -956,34 +959,45 @@ class NativeEnvironment(gym.Env):
         tiles["left_canvas"], tiles["left_vis"] = canvas, vis
         return canvas
 
+    # Coarsest level requested first; MeshStore.get walks down to whatever
+    # the segment actually has. NG streams meshes the same way.
+    MESH_COARSE_LOD = 2
+
     def _ensure_meshes(self, segments, block: bool = False) -> None:
-        """Make selected segments' meshes resident, STREAMING like Chrome.
+        """Make selected segments' meshes resident, STREAMING like Chrome:
+        a COARSE level first, refined when the full one lands.
 
-        A mesh fetch is submitted to the tile pool and adopted on whichever
-        later step it lands, so the segment appears in the 3D pane some steps
-        after the click -- which is what Neuroglancer does, since it downloads
-        the mesh too. An inline blocking fetch here instead made the simulator
-        strictly FASTER than Chrome: measured response step 0 against Chrome's
-        ~9 (probe_select_dynamics, 883367), i.e. a policy would learn that
-        selecting a neuron reveals it instantly.
+        Both halves are measured. Fetching inline made the simulator strictly
+        faster than Chrome (response step 0 against ~9); fetching only the full
+        mesh made it much slower -- 71.5 steps against Chrome's 2.0 under
+        production stepping, ~1.0 s against ~0.08 s (883638). The cause is that
+        NG requests the coarsest adequate level of the multi-resolution mesh
+        and refines later, while we fetched 73k-340k vertices every time:
+        measured 0.71 s median at lod 0 against 0.29-0.48 s at the coarsest,
+        and Chrome's own misses land in ~0.08-0.35 s.
 
-        `block=True` at reset, where the first observation has to be complete
-        and Chrome has likewise settled before the episode starts.
+        So a select shows a coarse mesh at roughly Chrome's latency and sharpens
+        after, instead of showing nothing for a second. `block=True` at reset
+        goes straight to the full mesh: the first observation has to be
+        complete, and Chrome has likewise settled before an episode starts.
         """
         if self._service is not None:
             return
-        want = [r for r in self._seg_key(segments)
-                if not self._renderer.has_mesh(r)]
-        for rid in want:
-            if rid not in self._mesh_futs:
-                try:
-                    self._mesh_futs[rid] = self._tile_pool().submit(
-                        worker_mesh, self._cache_dir, rid)
-                    self._mesh_due[rid] = self._steps + self._mesh_lag
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("mesh submit for %s failed (%s)", rid, e)
+        for rid in self._seg_key(segments):
+            if rid in self._mesh_futs or (self._renderer.has_mesh(rid)
+                                          and rid not in self._mesh_fine):
+                continue
+            # lod 0 when blocking (reset) or when this is the refinement
+            # pass for a segment already showing its coarse level.
+            lod = 0 if (block or rid in self._mesh_fine) else self.MESH_COARSE_LOD
+            try:
+                self._mesh_futs[rid] = (lod, self._tile_pool().submit(
+                    worker_mesh, self._cache_dir, rid, lod))
+                self._mesh_due[rid] = self._steps + self._mesh_lag
+            except Exception as e:  # noqa: BLE001
+                logger.warning("mesh submit for %s failed (%s)", rid, e)
         for rid in list(self._mesh_futs):
-            fut = self._mesh_futs[rid]
+            lod, fut = self._mesh_futs[rid]
             if not (block or fut.done()):
                 continue
             if not block and self._steps < self._mesh_due.get(rid, 0):
@@ -992,9 +1006,16 @@ class NativeEnvironment(gym.Env):
             self._mesh_due.pop(rid, None)
             try:
                 v, vn, f = fut.result(timeout=240 if block else None)
-                self._renderer.load_mesh(rid, v, f, normals=vn)
+                self._renderer.load_mesh(rid, v, f, normals=vn,
+                                         replace=lod == 0)
             except Exception as e:  # noqa: BLE001
                 logger.warning("mesh fetch for segment %s failed (%s)", rid, e)
+                continue
+            if lod == 0:
+                self._mesh_fine.discard(rid)
+            else:
+                # Coarse level is on screen; queue the refinement.
+                self._mesh_fine.add(rid)
 
     def _render_right(self, tiles: dict[str, Any]) -> np.ndarray:
         st = self._json_state
