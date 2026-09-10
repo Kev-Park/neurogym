@@ -199,6 +199,24 @@ class NativeEnvironment(gym.Env):
         # root_id -> in-flight mesh fetch; a selected segment appears in the
         # 3D pane on whichever step its mesh lands, the way Chrome streams.
         self._mesh_futs: dict[str, Any] = {}
+        self._mesh_due: dict[str, int] = {}
+        self._steps = 0
+        # NGL_NATIVE_MESH_LAG_STEPS: hold a landed mesh until this many steps
+        # after the selection. Default 0 -- show it as soon as it arrives.
+        #
+        # This exists because mesh lag CANNOT be matched to Chrome in both
+        # units at once. Measured (probe_select_dynamics 883469,
+        # probe_mesh_latency): our cold fetch is 0.77 s median against Chrome's
+        # ~0.67 s end-to-end, so in WALL TIME the two already agree -- but a
+        # simulator step costs 0.007 s against Chrome's 0.031 s, so the same
+        # latency spans ~110 of our steps and ~21 of Chrome's. Steps are what
+        # the policy experiences. Closing that would mean either slowing the
+        # simulator down, which defeats its purpose, or modelling the lag in
+        # step units, which is what this lever does (Chrome's median was ~21).
+        # Left OFF by default: the pane-mode campaign found fidelity to
+        # Chrome's streaming does not by itself predict transfer, so this is a
+        # science question to A/B, not an infrastructure default.
+        self._mesh_lag = int(os.environ.get("NGL_NATIVE_MESH_LAG_STEPS", "0"))
         self._meshes: MeshStore | None = None
         self._mesh_budget = mesh_budget_bytes
 
@@ -336,6 +354,8 @@ class NativeEnvironment(gym.Env):
         for fut in self._mesh_futs.values():
             fut.cancel()
         self._mesh_futs.clear()
+        self._mesh_due.clear()
+        self._steps = 0
         # RANDOM mode: one latency draw per episode, so an episode has a
         # consistent "network speed" rather than per-step jitter.
         self._adopt_delay = (int(self._rng.integers(0, 5))
@@ -380,6 +400,7 @@ class NativeEnvironment(gym.Env):
         return obs, {"task_info": task_info, "json_state": copy.deepcopy(st), "step": 0}
 
     def step(self, action):
+        self._steps += 1
         action_type = int(action["action_type"])
         if action_type == 0:
             # mousedown0 is a DRAG binding on both panes -- translate on the
@@ -958,13 +979,17 @@ class NativeEnvironment(gym.Env):
                 try:
                     self._mesh_futs[rid] = self._tile_pool().submit(
                         worker_mesh, self._cache_dir, rid)
+                    self._mesh_due[rid] = self._steps + self._mesh_lag
                 except Exception as e:  # noqa: BLE001
                     logger.warning("mesh submit for %s failed (%s)", rid, e)
         for rid in list(self._mesh_futs):
             fut = self._mesh_futs[rid]
             if not (block or fut.done()):
                 continue
+            if not block and self._steps < self._mesh_due.get(rid, 0):
+                continue      # landed early; hold it to the modelled lag
             del self._mesh_futs[rid]
+            self._mesh_due.pop(rid, None)
             try:
                 v, vn, f = fut.result(timeout=240 if block else None)
                 self._renderer.load_mesh(rid, v, f, normals=vn)
