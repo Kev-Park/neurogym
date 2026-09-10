@@ -14,7 +14,7 @@ a browser baseline that re-renders pixel-identically):
 - clicks: ~2 screen px lateral; along-view residual traced to NG's
   per-chunk LOD pick mesh (we pick against the full-res mesh + section
   plane).
-Calibrated constants below (SCALE_CAL_NM, EM_GAIN, LEFT_SHIFT_PX) come from
+Calibrated constants (SCALE_CAL_NM, EM_GAIN, LEFT_SHIFT_PX, all in pane2d) come from
 that campaign — change them only with a parity-harness re-run.
 
 Geometry is fixed at the calibrated capture: window 1800x900 CSS at
@@ -44,7 +44,8 @@ from .em import (
     MeshStore,
     worker_mesh,
     worker_tile,
-    worker_visuals,
+    unpack_ids,
+    worker_pane_parts,
 )
 from .render3d import MeshRenderer
 
@@ -57,7 +58,6 @@ from .pane2d import (  # noqa: E402
     CSS_PANE,
     CSS_VIEW_H,
     EM_GAIN,
-    LEFT_SHIFT_PX,
     PANE,
     PANE_H,
     PANEL_CX_CLICK,
@@ -66,7 +66,7 @@ from .pane2d import (  # noqa: E402
     SCALE_CAL_NM,
     TOOLBAR,
     VOXEL_NM,
-    tint_all,
+    compose_left_parts,
 )
 
 _noop_reward_factory = lambda task_info: (  # noqa: E731
@@ -183,9 +183,11 @@ class NativeEnvironment(gym.Env):
             # this runner's fetch process pool, shipped to the service only
             # when it changes. In-service compose starved the actor's GIL
             # at fleet click rates.
-            self._svc_key = None       # canvas key the service holds for us
+            # (tile geometry key, visible set) the service already holds
+            self._svc_key = (None, None)
             self._svc_fut = None
             self._svc_futkey = None
+            self._svc_parts = None     # last landed (em, ids, plane)
         self._image_shape = self._compute_image_shape()
         self.observation_space = self._build_observation_space()
         self.action_space = self._build_action_space()
@@ -193,6 +195,9 @@ class NativeEnvironment(gym.Env):
         # GL/data backends are lazy (first reset) so construction stays cheap
         # and importable off-GPU, mirroring the browser env's lazy launch.
         self._renderer: MeshRenderer | None = None
+        # root_id -> in-flight mesh fetch; a selected segment appears in the
+        # 3D pane on whichever step its mesh lands, the way Chrome streams.
+        self._mesh_futs: dict[str, Any] = {}
         self._meshes: MeshStore | None = None
         self._mesh_budget = mesh_budget_bytes
 
@@ -325,6 +330,7 @@ class NativeEnvironment(gym.Env):
         self._json_state = st
         self._tile_key = None
         self._coarse_pending = None
+        self._mesh_futs.clear()
         # RANDOM mode: one latency draw per episode, so an episode has a
         # consistent "network speed" rather than per-step jitter.
         self._adopt_delay = (int(self._rng.integers(0, 5))
@@ -349,7 +355,7 @@ class NativeEnvironment(gym.Env):
                 self._renderer.load_mesh(rid, v, f, normals=vn)
             # A reset state may already carry several selected segments; only
             # the first one has a prefetched mesh.
-            self._ensure_meshes(st["segments"])
+            self._ensure_meshes(st["segments"], block=True)
         if pf is not None and pf.get("tiles") is not None:
             # Adopt the prefetched tile group; the blocking gather below
             # resolves it (usually already done).
@@ -552,7 +558,7 @@ class NativeEnvironment(gym.Env):
         ids = self._seg_key(st["segments"])
         if not ids:
             return None
-        self._ensure_meshes(ids)
+        self._ensure_meshes(ids)   # non-blocking: pick what has arrived
         pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
         zoom_nm = float(st["projectionScale"]) * SCALE_CAL_NM
         best, best_d = None, 0.9999
@@ -679,17 +685,22 @@ class NativeEnvironment(gym.Env):
         """
         return tuple(str(s) for s in segments if not str(s).startswith("!"))
 
-    def _tile_key_for(self, pos, xs, rid):
-        rid_key = rid if isinstance(rid, (str, int)) else self._seg_key(rid)
+    def _tile_key_for(self, pos, xs):
+        """GEOMETRY only -- deliberately not the selection.
+
+        The fetched parts (EM raster, id map, plane tile) depend on where the
+        viewer is, not on which segments are highlighted; the tint is applied
+        client-side in _render_left. Keying on the selection instead forced a
+        full refetch per click.
+        """
         return (round(pos[0], 2), round(pos[1], 2), round(pos[2], 2),
-                round(float(xs), 5), rid_key, self.left_pane)
+                round(float(xs), 5), self.left_pane)
 
     def _tile_state_key(self):
         st = self._json_state
-        return self._tile_key_for(st["position"], st["crossSectionScale"],
-                                  self._seg_key(st["segments"]))
+        return self._tile_key_for(st["position"], st["crossSectionScale"])
 
-    def _submit_tile_group(self, pos, xs, rid, stage: str = "fine") -> tuple:
+    def _submit_tile_group(self, pos, xs, stage: str = "fine") -> tuple:
         """(key, futs, ext, stage) for an arbitrary state — used for the
         current state and for reset-ahead prefetch. stage='coarse' fetches
         the fast low-mip untinted preview; 'fine' the full tile."""
@@ -711,20 +722,19 @@ class NativeEnvironment(gym.Env):
             # pane2d.compose_left and probe_obs_equivalence measures
             # l2rel=0.0000 / cos=1.0000 against local's inline _render_left.
             mx = 256 if stage == "coarse" else 1024
-            futs = {"visuals": pool.submit(
-                worker_visuals, cd, list(pos), float(xs), rid, mx,
+            futs = {"parts": pool.submit(
+                worker_pane_parts, cd, list(pos), float(xs), mx,
                 stage != "coarse")}
         else:
             mx = 256 if stage == "coarse" else 1024
             futs = {"plane": pool.submit(
                 worker_tile, cd, pos_nm, ext[0], ext[1], mx, False)}
-        return (self._tile_key_for(pos, xs, rid), futs, ext, stage)
+        return (self._tile_key_for(pos, xs), futs, ext, stage)
 
     def _submit_tile_fetch(self, key, stage: str = "fine"):
         st = self._json_state
         self._pending = self._submit_tile_group(
-            st["position"], st["crossSectionScale"],
-            self._seg_key(st["segments"]), stage)
+            st["position"], st["crossSectionScale"], stage)
 
     def _submit_visuals(self, state):
         """Future of (canvas, plane_tile). One worker job for both when the
@@ -738,9 +748,8 @@ class NativeEnvironment(gym.Env):
                 worker_tile, self._cache_dir, pos_nm, ext[0], ext[1], 1024, False)
             return _PlaneOnly(fut)
         return self._tile_pool().submit(
-            worker_visuals, self._cache_dir, list(state["position"]),
-            float(state["crossSectionScale"]),
-            self._seg_key(state["segments"]))
+            worker_pane_parts, self._cache_dir, list(state["position"]),
+            float(state["crossSectionScale"]))
 
     def _service_visuals(self, block: bool):
         """(canvas, plane_tile) when they changed (else (None, None) ->
@@ -752,28 +761,39 @@ class NativeEnvironment(gym.Env):
         pane stale 85% of steps — measured by probe_obs_equivalence.py.
         Local mode never had this because _fetch_tiles keeps its pending
         group; this mirrors that.
+
+        The cached PARTS are recomposed whenever the selection changes, so a
+        click re-tints without a fetch here too.
         """
-        key = self._tile_state_key()
+        key = (self._tile_state_key(), self._seg_key(self._json_state["segments"]))
         if key == self._svc_key:
             return None, None
+        if self._svc_parts is not None and key[0] == self._svc_key[0]:
+            # Same geometry, different selection: re-tint what we already have.
+            self._svc_key = key
+            em_gray, ids, plane = self._svc_parts
+            return compose_left_parts(em_gray, ids, key[1]), plane
         if self._svc_fut is not None:
             if not (block or self._svc_fut.done()):
                 return None, None  # let it land; do NOT resubmit
-            canvas = plane = None
+            parts = None
             try:
-                canvas, plane = self._svc_fut.result(timeout=180)
+                em_gray, ids_packed, plane = self._svc_fut.result(timeout=180)
+                parts = (em_gray, unpack_ids(ids_packed), plane)
             except Exception as e:
                 logger.warning("client visuals failed (%s); stale", e)
             landed_key, self._svc_fut = self._svc_futkey, None
-            if canvas is not None:
+            if parts is not None and parts[0] is not None:
                 # Ship it even if the state moved on: a canvas one step
                 # behind beats an arbitrarily old one, and the next step
                 # submits for the then-current key.
-                self._svc_key = landed_key
-                return canvas, plane
+                self._svc_parts = parts
+                vis = self._seg_key(self._json_state["segments"])
+                self._svc_key = (landed_key, vis)
+                return compose_left_parts(parts[0], parts[1], vis), parts[2]
             return None, None
         self._svc_fut = self._submit_visuals(self._json_state)
-        self._svc_futkey = key
+        self._svc_futkey = key[0]
         if block:
             return self._service_visuals(block=True)
         return None, None
@@ -805,8 +825,7 @@ class NativeEnvironment(gym.Env):
                         else self._tile_pool().submit(
                             worker_mesh, self._cache_dir, rid))
             tiles = self._submit_tile_group(
-                state["position"], state["crossSectionScale"],
-                self._seg_key(state["segments"]))
+                state["position"], state["crossSectionScale"])
         except Exception as e:
             logger.warning("reset-ahead prefetch submit failed (%s)", e)
             mesh_fut, tiles = None, None
@@ -821,14 +840,16 @@ class NativeEnvironment(gym.Env):
 
     def _adopt_group(self, key, futs, ext, stage,
                      timeout_s: float = 180.0) -> None:
-        tiles: dict[str, Any] = {"ext": ext, "plane": None, "left": None,
-                                 "label": None}
+        tiles: dict[str, Any] = {"ext": ext, "plane": None, "em": None,
+                                 "ids": None}
         for name, fut in futs.items():
             try:
-                if name == "visuals":
-                    # (composed 2D canvas, 3D section-plane tile)
-                    tiles["left_canvas"], tiles["plane"] = fut.result(
+                if name == "parts":
+                    # (EM raster, packed id map, 3D section-plane tile)
+                    em_gray, ids_packed, tiles["plane"] = fut.result(
                         timeout=timeout_s)
+                    tiles["em"] = em_gray
+                    tiles["ids"] = unpack_ids(ids_packed)
                 else:
                     tiles[name] = fut.result(timeout=timeout_s)
             except FuturesTimeout:
@@ -876,8 +897,7 @@ class NativeEnvironment(gym.Env):
             if mode == "concurrent" and not block:
                 st = self._json_state
                 self._coarse_pending = self._submit_tile_group(
-                    st["position"], st["crossSectionScale"],
-                    str(st["segments"][0]), "coarse")
+                    st["position"], st["crossSectionScale"], "coarse")
         if block or all(f.done() for f in self._pending[1].values()):
             # RANDOM: hold a landed tile for a per-episode number of extra
             # steps. Fetch latency is a networking artifact -- Chrome's own
@@ -895,68 +915,56 @@ class NativeEnvironment(gym.Env):
         return self._tiles
 
     def _render_left(self, tiles: dict[str, Any]) -> np.ndarray:
-        """2D xy EM pane: browser-matched filter chain + tint + crosshair.
-        Memoized on the tile set — the pane only changes when tiles do, and
-        the PIL chain is the priciest per-step CPU otherwise."""
-        if "left_canvas" in tiles:
-            return tiles["left_canvas"]
-        canvas = np.zeros((PANE, PANE, 3), dtype=np.uint8)
-        if tiles["left"] is None:
-            tiles["left_canvas"] = canvas
-            return canvas
-        # Filter chain (calibrated): subpixel-phase tile -> GL-linear resample
-        # to the 900x867 CSS pane -> Chrome's area-average capture downscale.
-        big = Image.fromarray(tiles["left"]).resize((900, 867), Image.BILINEAR)
-        img = np.asarray(big.resize((PANE, PANE_H), Image.BOX)
-                         ).astype(np.float32) * EM_GAIN
-        rgb = np.repeat(img[..., None], 3, axis=2)
-        if tiles["label"] is not None:
-            # NG segmentation 2D: selectedAlpha 0.5 over the image, one colour
-            # per selected segment (`label` is a {root_id: mask} dict when the
-            # selection holds more than one).
-            lab = tiles["label"]
-            vis = self._seg_key(self._json_state["segments"])
-            if isinstance(lab, dict):
-                pairs = [(int(r), lab[int(r)]) for r in vis
-                         if lab.get(int(r)) is not None]
-            elif lab.dtype != bool:
-                tint_all(rgb, lab)   # SHOW_ALL_SEGMENTS: nothing visible
-                pairs = []
-            else:
-                pairs = [(int(vis[0]), lab)] if vis else []
-            for _rid, m in pairs:
-                col = np.asarray(segment_color(_rid)) * 255.0
-                rgb[m] = 0.5 * col[None, :] + 0.5 * rgb[m]
-        # One-sided crosshair (red +x, green +y), alpha 0.5.
-        cy, cx = PANE_H // 2, PANE // 2
-        length = int(min(900, 867) / 4 / 2)
-        row = rgb[cy, cx:cx + length]
-        rgb[cy, cx:cx + length] = 0.5 * np.array([255, 0, 0]) + 0.5 * row
-        colm = rgb[cy:cy + length, cx]
-        rgb[cy:cy + length, cx] = 0.5 * np.array([0, 255, 0]) + 0.5 * colm
-        canvas[TOOLBAR:] = np.clip(rgb, 0, 255).astype(np.uint8)
-        tiles["left_canvas"] = canvas
+        """2D xy EM pane, composed from the cached raster + id map.
+
+        Memoized on the VISIBLE SET, not just on the tiles: a selection change
+        re-tints from data already in hand, with no fetch, which is what
+        Neuroglancer does. The EM resample (the priciest per-step CPU) already
+        happened in the fetch worker, so this is a mask-and-blend.
+        """
+        vis = self._seg_key(self._json_state["segments"])
+        cached = tiles.get("left_canvas")
+        if cached is not None and tiles.get("left_vis") == vis:
+            return cached
+        canvas = compose_left_parts(tiles.get("em"), tiles.get("ids"), vis)
+        tiles["left_canvas"], tiles["left_vis"] = canvas, vis
         return canvas
 
-    def _ensure_meshes(self, segments) -> None:
-        """Load the mesh of every selected segment that is not resident.
+    def _ensure_meshes(self, segments, block: bool = False) -> None:
+        """Make selected segments' meshes resident, STREAMING like Chrome.
 
-        Selecting a segment is rare (one action), so the fetch is inline
-        rather than pooled; a mesh that fails to load is skipped and the pane
-        renders the rest, matching Chrome's behaviour of drawing what has
-        arrived rather than blanking the view.
+        A mesh fetch is submitted to the tile pool and adopted on whichever
+        later step it lands, so the segment appears in the 3D pane some steps
+        after the click -- which is what Neuroglancer does, since it downloads
+        the mesh too. An inline blocking fetch here instead made the simulator
+        strictly FASTER than Chrome: measured response step 0 against Chrome's
+        ~9 (probe_select_dynamics, 883367), i.e. a policy would learn that
+        selecting a neuron reveals it instantly.
+
+        `block=True` at reset, where the first observation has to be complete
+        and Chrome has likewise settled before the episode starts.
         """
         if self._service is not None:
             return
-        for rid in self._seg_key(segments):
-            if self._renderer.has_mesh(rid):
+        want = [r for r in self._seg_key(segments)
+                if not self._renderer.has_mesh(r)]
+        for rid in want:
+            if rid not in self._mesh_futs:
+                try:
+                    self._mesh_futs[rid] = self._tile_pool().submit(
+                        worker_mesh, self._cache_dir, rid)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("mesh submit for %s failed (%s)", rid, e)
+        for rid in list(self._mesh_futs):
+            fut = self._mesh_futs[rid]
+            if not (block or fut.done()):
                 continue
+            del self._mesh_futs[rid]
             try:
-                v, f = self._meshes.get(rid)
-                self._renderer.load_mesh(rid, v, f)
+                v, vn, f = fut.result(timeout=240 if block else None)
+                self._renderer.load_mesh(rid, v, f, normals=vn)
             except Exception as e:  # noqa: BLE001
-                logger.warning("mesh fetch for selected segment %s failed (%s)",
-                               rid, e)
+                logger.warning("mesh fetch for segment %s failed (%s)", rid, e)
 
     def _render_right(self, tiles: dict[str, Any]) -> np.ndarray:
         st = self._json_state

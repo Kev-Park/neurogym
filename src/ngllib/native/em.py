@@ -236,20 +236,51 @@ def worker_label_tile(cache_dir, pos_nm, extent_x_nm, extent_y_nm, root_id,
         np.asarray(pos_nm), extent_x_nm, extent_y_nm, root_id, out_px)
 
 
-def worker_visuals(cache_dir, pos, xs_scale, root_id, max_px=1024,
-                   with_label=True):
-    """(2D canvas, 3D section-plane tile) in ONE worker call: the two share
-    the same EM chunks, so a single job reuses the in-worker chunk LRU and
-    halves the client's pool dispatches per position change.
+def pack_ids(ids):
+    """Palette-compress an id tile for the trip back from the worker process.
+
+    Root ids are 64-bit and a pane holds only a few hundred distinct ones, so
+    shipping uint16 indices plus the table costs ~390 KB instead of ~1.6 MB.
+    Falls back to the raw array in the (unseen) case of >65535 segments.
+    """
+    if ids is None:
+        return None
+    uniq, inv = np.unique(ids, return_inverse=True)
+    if uniq.size > 65535:
+        return ("raw", ids)
+    return ("pal", uniq, inv.reshape(ids.shape).astype(np.uint16))
+
+
+def unpack_ids(payload):
+    if payload is None:
+        return None
+    if payload[0] == "raw":
+        return payload[1]
+    _, uniq, idx = payload
+    return uniq[idx]
+
+
+def worker_pane_parts(cache_dir, pos, xs_scale, max_px=1024, with_label=True):
+    """(EM raster, packed id map, 3D section-plane tile) in ONE worker call:
+    all three share the same EM chunks, so a single job reuses the in-worker
+    chunk LRU and keeps the client to one pool dispatch per position change.
+
+    Deliberately returns the pane's PARTS rather than a composed canvas, and
+    takes no segment argument at all. The tint is applied by the client from
+    the id map, so changing the selection re-renders with NO fetch -- which is
+    what Neuroglancer does, since the segmentation chunk it needs is already
+    loaded. Composing here instead put the selection in the fetch key and cost
+    a click a step of lag, or never resolved at all on the deselect-to-
+    SHOW_ALL transition (probe_select_dynamics, 883367).
 
     `max_px` is the resolution dial -- EMTiles.tile picks the coarsest mip
     whose extent/res fits in max_px, so 256 fetches ~16x fewer voxels than
     1024 and lands proportionally sooner. `with_label=False` additionally
-    skips the segmentation cutout. Together they make the cheap PREVIEW
-    stage of the progressive pipeline (see NativeEnvironment._fetch_tiles):
-    Chrome streams coarse mips first and paints segmentation after the EM,
-    so a blurry untinted preview of the RIGHT location is closer to it than
-    a sharp view of the previous one.
+    skips the segmentation cutout. Together they make the cheap PREVIEW stage
+    of the progressive pipeline (see NativeEnvironment._fetch_tiles): Chrome
+    streams coarse mips first and paints segmentation after the EM, so a
+    blurry untinted preview of the RIGHT location is closer to it than a sharp
+    view of the previous one.
     """
     from . import pane2d
 
@@ -258,21 +289,10 @@ def worker_visuals(cache_dir, pos, xs_scale, root_id, max_px=1024,
     ext = pane2d.pane_extents_nm(xs_scale)
     shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
     tile = em.tile(shifted, ext[0], ext[1], max_px, True)
-    # root_id may be a single id or the whole selected SET (NG's `select`
-    # toggles segments into a set); label_tile returns a mask or a
-    # {root_id: mask} dict accordingly, and compose_left tints each.
-    if not with_label:
-        label = None
-    elif not isinstance(root_id, (int, str, np.integer)) and len(root_id) == 0:
-        # Nothing visible: NG shows the whole slice colourized.
-        label = em.label_ids(shifted, ext[0], ext[1],
-                             (pane2d.PANE, pane2d.PANE_H))
-    else:
-        label = em.label_tile(shifted, ext[0], ext[1], root_id,
-                              (pane2d.PANE, pane2d.PANE_H))
-    canvas = pane2d.compose_left(tile, label, root_id)
+    ids = (em.label_ids(shifted, ext[0], ext[1], (pane2d.PANE, pane2d.PANE_H))
+           if with_label else None)
     plane = em.tile(pos_nm, ext[0], ext[1], max_px, False)
-    return canvas, plane
+    return pane2d.resample_em(tile), pack_ids(ids), plane
 
 
 def worker_left_canvas(cache_dir, pos, xs_scale, root_id):

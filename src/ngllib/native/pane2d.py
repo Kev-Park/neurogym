@@ -56,6 +56,60 @@ def shifted_fetch_center_nm(pos_nm: np.ndarray, ext: tuple[float, float]):
         LEFT_SHIFT_PX[0] * ext[1] / PANE_H, 0.0])
 
 
+def resample_em(tile) -> np.ndarray:
+    """EM tile -> the pane's greyscale raster (PANE_H x PANE uint8).
+
+    Calibrated chain: subpixel-phase tile -> GL-linear resample to the 900x867
+    CSS pane -> Chrome's area-average capture downscale, then EM_GAIN.
+    """
+    big = Image.fromarray(tile).resize((900, 867), Image.BILINEAR)
+    img = np.asarray(big.resize((PANE, PANE_H), Image.BOX)).astype(np.float32)
+    return np.clip(img * EM_GAIN, 0, 255).astype(np.uint8)
+
+
+def draw_crosshair(rgb: np.ndarray) -> None:
+    """One-sided crosshair (red +x, green +y) at alpha 0.5, in place."""
+    cy, cx = PANE_H // 2, PANE // 2
+    length = int(min(900, 867) / 4 / 2)
+    row = rgb[cy, cx:cx + length]
+    rgb[cy, cx:cx + length] = 0.5 * np.array([255, 0, 0]) + 0.5 * row
+    colm = rgb[cy:cy + length, cx]
+    rgb[cy:cy + length, cx] = 0.5 * np.array([0, 255, 0]) + 0.5 * colm
+
+
+def compose_left_parts(em_gray, ids, visible) -> np.ndarray:
+    """2D pane canvas from the CACHED raster + id map and the CURRENT selection.
+
+    Splitting composition this way is what lets a selection change render with
+    no fetch at all, which is what Chrome does: it already holds the
+    segmentation chunk and only re-tints. Keying the tile fetch on the
+    selection instead made the simulator's 2D pane lag a click by a step in the
+    ordinary case and never respond at all on the deselect-to-SHOW_ALL
+    transition (probe_select_dynamics, 883367).
+
+    `visible` is the visible segment set; empty means NG's SHOW_ALL_SEGMENTS,
+    where every segment paints. Draw order matches compose_left: EM, then tint,
+    then crosshair.
+    """
+    canvas = np.zeros((PANE, PANE, 3), dtype=np.uint8)
+    if em_gray is None:
+        return canvas
+    rgb = np.repeat(np.asarray(em_gray, dtype=np.float32)[..., None], 3, axis=2)
+    if ids is not None:
+        vis = [int(v) for v in visible]
+        if not vis:
+            tint_all(rgb, ids)
+        else:
+            for rid in vis:
+                m = ids == rid
+                if m.any():
+                    col = np.asarray(segment_color(rid)) * 255.0
+                    rgb[m] = 0.5 * col[None, :] + 0.5 * rgb[m]
+    draw_crosshair(rgb)
+    canvas[TOOLBAR:] = np.clip(rgb, 0, 255).astype(np.uint8)
+    return canvas
+
+
 def tint_all(rgb: np.ndarray, ids: np.ndarray) -> None:
     """Colour every segment in an id tile, in place.
 
