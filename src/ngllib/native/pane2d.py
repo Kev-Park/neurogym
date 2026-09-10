@@ -40,6 +40,22 @@ def shifted_fetch_center_nm(pos_nm: np.ndarray, ext: tuple[float, float]):
         LEFT_SHIFT_PX[0] * ext[1] / PANE_H, 0.0])
 
 
+def tint_all(rgb: np.ndarray, ids: np.ndarray) -> None:
+    """Colour every segment in an id tile, in place.
+
+    One LUT pass rather than a mask per id: a pane at this zoom holds hundreds
+    of distinct segments, and this path runs whenever the selection is empty.
+    """
+    uniq, inv = np.unique(ids, return_inverse=True)
+    lut = np.zeros((uniq.size, 3), dtype=np.float32)
+    for k, seg in enumerate(uniq):
+        if seg:
+            lut[k] = segment_color(int(seg))
+    col = lut[inv].reshape(ids.shape + (3,)) * 255.0
+    nz = ids != 0
+    rgb[nz] = 0.5 * col[nz] + 0.5 * rgb[nz]
+
+
 def compose_left(tile, label_mask, root_id) -> np.ndarray:
     """2D xy EM pane canvas (PANE x PANE x 3 uint8): calibrated filter chain
     + segment tint + one-sided crosshair + toolbar strip.
@@ -47,7 +63,9 @@ def compose_left(tile, label_mask, root_id) -> np.ndarray:
     Neuroglancer's `select` toggles segments into a SET and tints each with its
     own colour, so `root_id` may be a single id or a sequence, and
     `label_mask` correspondingly a single mask or a {root_id: mask} dict.
-    Single-id callers keep working unchanged.
+    Single-id callers keep working unchanged. With NOTHING visible, NG colours
+    the whole slice instead (SHOW_ALL_SEGMENTS): pass the id tile from
+    EMTiles.label_ids as `label_mask` and an empty `root_id`.
     """
     canvas = np.zeros((PANE, PANE, 3), dtype=np.uint8)
     if tile is None:
@@ -63,6 +81,12 @@ def compose_left(tile, label_mask, root_id) -> np.ndarray:
             ids = [int(r) for r in root_id] if not isinstance(
                 root_id, (int, str)) else [int(root_id)]
             pairs = [(r, label_mask[r]) for r in ids if label_mask.get(r) is not None]
+        elif label_mask.dtype != bool:
+            # SHOW_ALL_SEGMENTS: nothing is visible, so `label_mask` is the id
+            # tile and every non-zero segment paints in its own colour at the
+            # same selectedAlpha (hideSegmentZero keeps 0 as background).
+            tint_all(rgb, label_mask)
+            pairs = []
         else:
             rid0 = root_id[0] if not isinstance(root_id, (int, str)) else root_id
             pairs = [(int(rid0), label_mask)]

@@ -211,10 +211,12 @@ class MeshRenderer:
         self.prog["mvp"].write(mvp_b)
         self.prog["light"].value = (*(ldir * 0.8), 0.2)
         ids = self._as_ids(root_id)
-        colors = ([color] * len(ids) if isinstance(root_id, (str, int))
-                  or not isinstance(color[0], (list, tuple, np.ndarray))
-                  else list(color))
-        self._draw_meshes(ids, colors)
+        # `color` is one RGB triple (single-id callers) or one per id. An empty
+        # selection draws no mesh at all -- NG's state with everything hidden.
+        single = isinstance(root_id, (str, int)) or (
+            len(color) > 0 and not isinstance(color[0],
+                                              (list, tuple, np.ndarray)))
+        self._draw_meshes(ids, [color] * len(ids) if single else list(color))
 
         if em_tile is not None:
             self._draw_plane(mvp_b, pos, em_tile, em_extent_nm,

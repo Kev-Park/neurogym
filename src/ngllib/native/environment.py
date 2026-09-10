@@ -64,6 +64,7 @@ from .pane2d import (  # noqa: E402
     SCALE_CAL_NM,
     TOOLBAR,
     VOXEL_NM,
+    tint_all,
 )
 
 _noop_reward_factory = lambda task_info: (  # noqa: E731
@@ -515,7 +516,10 @@ class NativeEnvironment(gym.Env):
         world = [st["position"][0] + (x_css - cx_css) * xs,
                  st["position"][1] + (y_css - cy_css) * xs,
                  st["position"][2]]
-        res_nm = xs * CSS_PANE * 4.0 / PANE   # == label_tile's extent/out_px
+        # NG picks against the slice it RENDERS, which is the CSS-resolution
+        # pane (900 px wide), not the downscaled capture -- so the pick mip is
+        # 4*xs nm/px, one step finer than label_tile's capture-sized tile.
+        res_nm = xs * 4.0
         return self._pick_em_tiles().segment_at(
             np.asarray(world, dtype=np.float64) * VOXEL_NM, res_nm)
 
@@ -904,6 +908,9 @@ class NativeEnvironment(gym.Env):
             if isinstance(lab, dict):
                 pairs = [(int(r), lab[int(r)]) for r in vis
                          if lab.get(int(r)) is not None]
+            elif lab.dtype != bool:
+                tint_all(rgb, lab)   # SHOW_ALL_SEGMENTS: nothing visible
+                pairs = []
             else:
                 pairs = [(int(vis[0]), lab)] if vis else []
             for _rid, m in pairs:

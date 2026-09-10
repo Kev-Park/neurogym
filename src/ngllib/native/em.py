@@ -81,6 +81,41 @@ class EMTiles:
                 SEG_URL, agglomerate=False, mip=mip)
         return self._vols[("seg", mip)]
 
+    def _label_cutout(self, pos_nm, extent_x_nm, extent_y_nm, out_px):
+        """Raw segmentation ids on the z-slice covering the pane, or None if
+        the static label chunks are unreadable. Shared by the per-segment
+        masks and the show-all id tile."""
+        vol = self._seg_vol(extent_x_nm / out_px[0])
+        if vol is None:
+            return None
+        res = vol.resolution  # nm per voxel
+        cx = int(pos_nm[0] / res[0]); cy = int(pos_nm[1] / res[1])
+        z = int(pos_nm[2] / res[2])
+        hx = int(extent_x_nm / res[0] / 2); hy = int(extent_y_nm / res[1] / 2)
+        if hx < 1 or hy < 1:
+            return None
+        cut = vol[cx - hx:cx + hx, cy - hy:cy + hy, z:z + 1]
+        return np.asarray(cut)[:, :, 0, 0].T
+
+    def label_ids(self, pos_nm, extent_x_nm, extent_y_nm, out_px=(450, 433)):
+        """Segmentation ids per output pixel, for NG's SHOW_ALL_SEGMENTS mode.
+
+        When `visibleSegments` is empty and `ignoreNullVisibleSet` is on (the
+        default), the shader forces `has = true` for every voxel
+        (sliceview/volume/segmentation_renderlayer.ts), so the pane colours the
+        WHOLE slice at selectedAlpha instead of showing bare EM. Reproducing
+        that needs the ids themselves, not a per-segment mask.
+        """
+        try:
+            lab = self._label_cutout(pos_nm, extent_x_nm, extent_y_nm, out_px)
+            if lab is None:
+                return None
+            # NEAREST, like the masks: ids must not be interpolated.
+            img = Image.fromarray(lab.astype(np.int64), mode="I")
+            return np.asarray(img.resize(out_px, Image.NEAREST)).astype(np.int64)
+        except Exception:
+            return None
+
     def label_tile(self, pos_nm, extent_x_nm, extent_y_nm, root_id,
                    out_px=(450, 433)):
         """Boolean mask of the root segment on the z-slice, or None if the
@@ -93,17 +128,9 @@ class EMTiles:
         """
         multi = not isinstance(root_id, (int, str, np.integer))
         try:
-            vol = self._seg_vol(extent_x_nm / out_px[0])
-            if vol is None:
+            lab = self._label_cutout(pos_nm, extent_x_nm, extent_y_nm, out_px)
+            if lab is None:
                 return None
-            res = vol.resolution  # nm per voxel
-            cx = int(pos_nm[0] / res[0]); cy = int(pos_nm[1] / res[1])
-            z = int(pos_nm[2] / res[2])
-            hx = int(extent_x_nm / res[0] / 2); hy = int(extent_y_nm / res[1] / 2)
-            if hx < 1 or hy < 1:
-                return None
-            cut = vol[cx - hx:cx + hx, cy - hy:cy + hy, z:z + 1]
-            lab = np.asarray(cut)[:, :, 0, 0].T
 
             def _mask_for(rid):
                 mask = (lab == int(rid)).astype(np.uint8) * 255
@@ -230,9 +257,15 @@ def worker_visuals(cache_dir, pos, xs_scale, root_id, max_px=1024,
     # root_id may be a single id or the whole selected SET (NG's `select`
     # toggles segments into a set); label_tile returns a mask or a
     # {root_id: mask} dict accordingly, and compose_left tints each.
-    label = (em.label_tile(shifted, ext[0], ext[1], root_id,
-                           (pane2d.PANE, pane2d.PANE_H))
-             if with_label else None)
+    if not with_label:
+        label = None
+    elif not isinstance(root_id, (int, str, np.integer)) and len(root_id) == 0:
+        # Nothing visible: NG shows the whole slice colourized.
+        label = em.label_ids(shifted, ext[0], ext[1],
+                             (pane2d.PANE, pane2d.PANE_H))
+    else:
+        label = em.label_tile(shifted, ext[0], ext[1], root_id,
+                              (pane2d.PANE, pane2d.PANE_H))
     canvas = pane2d.compose_left(tile, label, root_id)
     plane = em.tile(pos_nm, ext[0], ext[1], max_px, False)
     return canvas, plane
