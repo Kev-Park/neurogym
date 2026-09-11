@@ -222,7 +222,7 @@ def _add_env_kwargs(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_env(args: argparse.Namespace):
-    from ..environment import Environment
+    from ..chrome import Environment
     return Environment(
         headless=args.headless,
         renderer=args.renderer,

@@ -2,7 +2,7 @@
 
 from . import distributed
 from .distributed.remote import RemoteEnv
-from .environment import Environment, RewardFactory, TerminationFactory
+from .chrome import Environment, RewardFactory, TerminationFactory
 from .errors import (
     BrowserError,
     ConnectionLost,

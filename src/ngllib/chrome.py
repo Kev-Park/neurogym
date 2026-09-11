@@ -1067,7 +1067,7 @@ class Environment(gym.Env):
         # image_size set the browser would silently skip it while the native
         # backend still masked -- reintroducing exactly the difference this
         # removes.
-        from .native.pane2d import mask_ui, mask_ui_enabled
+        from .simulator.pane2d import mask_ui, mask_ui_enabled
 
         if (mask_ui_enabled() and image.ndim == 3
                 and image.shape[:2] == (450, 900)):
