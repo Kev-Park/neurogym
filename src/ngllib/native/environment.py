@@ -217,6 +217,8 @@ class NativeEnvironment(gym.Env):
         # the shipping fidelity for roughly half the voxels, and `progressive`
         # was measured with the BLURRIEST one (0.7394) when it cost 11pp. That
         # verdict does not necessarily carry to a 0.8730 preview.
+        self._parallel_parts = os.environ.get(
+            "NGL_NATIVE_PARALLEL_PARTS", "1") != "0"
         self._fine_px = int(os.environ.get("NGL_NATIVE_FINE_MAX_PX", "1024"))
         self._coarse_px = int(os.environ.get("NGL_NATIVE_COARSE_MAX_PX", "256"))
         # Background chunk-cache warming: costs bandwidth, changes no pixel.
@@ -783,10 +785,19 @@ class NativeEnvironment(gym.Env):
             # 2D pane wait 1.77 s for 0.92 s of work (probe_parts_breakdown).
             # The plane stays with the EM tile: it reuses those chunks and
             # costs 0.01 s there against 0.84 s anywhere else.
-            futs = {"emplane": pool.submit(
-                worker_em_plane, cd, list(pos), float(xs), mx)}
-            if stage != "coarse":
-                futs["ids"] = pool.submit(worker_ids, cd, list(pos), float(xs))
+            if self._parallel_parts:
+                futs = {"emplane": pool.submit(
+                    worker_em_plane, cd, list(pos), float(xs), mx)}
+                if stage != "coarse":
+                    futs["ids"] = pool.submit(
+                        worker_ids, cd, list(pos), float(xs))
+            else:
+                # NGL_NATIVE_PARALLEL_PARTS=0: the old single bundled job, kept
+                # so the split can be A/B'd on identical states rather than
+                # argued from the fetch timings alone.
+                futs = {"parts": pool.submit(
+                    worker_pane_parts, cd, list(pos), float(xs), mx,
+                    stage != "coarse")}
         else:
             mx = self._coarse_px if stage == "coarse" else self._fine_px
             futs = {"plane": pool.submit(
@@ -906,7 +917,12 @@ class NativeEnvironment(gym.Env):
                                  "ids": None}
         for name, fut in futs.items():
             try:
-                if name == "emplane":
+                if name == "parts":
+                    em_gray, ids_packed, tiles["plane"] = fut.result(
+                        timeout=timeout_s)
+                    tiles["em"] = em_gray
+                    tiles["ids"] = unpack_ids(ids_packed)
+                elif name == "emplane":
                     tiles["em"], tiles["plane"] = fut.result(timeout=timeout_s)
                 elif name == "ids":
                     tiles["ids"] = unpack_ids(fut.result(timeout=timeout_s))
