@@ -219,6 +219,11 @@ class NativeEnvironment(gym.Env):
         # the shipping fidelity for roughly half the voxels, and `progressive`
         # was measured with the BLURRIEST one (0.7394) when it cost 11pp. That
         # verdict does not necessarily carry to a 0.8730 preview.
+        # Stable shard for this env, so its fetches keep landing on the same
+        # worker and that worker's chunk LRU stays relevant to it.
+        cls = type(self)
+        self._pool_shard = cls._POOL_SEQ
+        cls._POOL_SEQ += 1
         self._parallel_parts = os.environ.get(
             "NGL_NATIVE_PARALLEL_PARTS", "1") != "0"
         self._fine_px = int(os.environ.get("NGL_NATIVE_FINE_MAX_PX", "1024"))
@@ -483,18 +488,39 @@ class NativeEnvironment(gym.Env):
     # 16 threaded envs): GIL-isolates chunk download/decode and dedupes the
     # workers' chunk LRUs across envs. Spawn context — fork would inherit
     # CUDA/EGL state.
-    _TILE_POOL: ProcessPoolExecutor | None = None
+    _TILE_POOLS: list | None = None
+    _POOL_SEQ: int = 0
 
     @classmethod
-    def _tile_pool(cls) -> ProcessPoolExecutor:
-        if cls._TILE_POOL is None:
-            # Tune down (NGL_NATIVE_FETCH_WORKERS) when many runner
-            # processes share a node — fetch workers multiply per runner.
-            cls._TILE_POOL = ProcessPoolExecutor(
-                max_workers=int(os.environ.get(
-                    "NGL_NATIVE_FETCH_WORKERS", "6")),
-                mp_context=multiprocessing.get_context("spawn"))
-        return cls._TILE_POOL
+    def _pools(cls) -> list:
+        """N single-worker pools, NOT one N-worker pool.
+
+        The chunk LRU lives in the worker PROCESS, so which worker serves a
+        fetch decides whether a move costs 0.03 s (chunks resident) or 0.20 s+
+        (refetch). Sharing one N-worker pool scatters an env's consecutive
+        fetches across all N, and the cache is useless. Measured with the verb
+        sweep at n=8, 2D response to move-to-mouse-position:
+
+          shared 6-worker pool   32.5 steps  (21-35)
+          one worker, affine     5.0  steps  (5,5,5,5,6,5,5,5)
+
+        Partitioning keeps the SAME total worker count -- no extra processes --
+        while giving each env a stable worker, so its own chunk history is
+        worth something. Envs sharing a shard still interleave, which is why
+        this is a shard count and not a global switch.
+        """
+        if cls._TILE_POOLS is None:
+            n = max(1, int(os.environ.get("NGL_NATIVE_FETCH_WORKERS", "6")))
+            cls._TILE_POOLS = [
+                ProcessPoolExecutor(
+                    max_workers=1,
+                    mp_context=multiprocessing.get_context("spawn"))
+                for _ in range(n)]
+        return cls._TILE_POOLS
+
+    def _tile_pool(self) -> ProcessPoolExecutor:
+        pools = self._pools()
+        return pools[self._pool_shard % len(pools)]
 
     def _ensure_backends(self) -> None:
         if self._service_factory is not None:
