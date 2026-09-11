@@ -10,10 +10,11 @@ from ngllib import ChromeRenderer, Environment, Renderer, SimulatorRenderer
 from ngllib.errors import RendererError
 
 
-def _edit(dpos=(0, 0, 0), dps=0.0):
+def _edit(dpos=(0, 0, 0), dps=0.0, n=4):
+    """n = orientation dim: 4 for the default quaternion mode, 3 for euler."""
     return {"action_type": 3, "mouse_xy": np.zeros(2, np.float32),
             "modifiers": np.zeros(3, np.int8), "delta_pos": np.asarray(dpos, np.float32),
-            "delta_xs_scale": np.zeros(1, np.float32), "delta_orient": np.zeros(3, np.float32),
+            "delta_xs_scale": np.zeros(1, np.float32), "delta_orient": np.zeros(n, np.float32),
             "delta_proj_scale": np.asarray([dps], np.float32)}
 
 
@@ -56,7 +57,7 @@ def test_reset_and_step_skeleton(fake_renderer):
     assert obs["image"].shape == (900, 900, 3)
     assert obs["proj_scale"][0] == 1000.0
 
-    obs, reward, term, trunc, info = env.step(_edit(dpos=(10, 0, 0), dps=-500))
+    obs, reward, term, trunc, info = env.step(_edit(dpos=(10, 0, 0), dps=-500, n=3))
     assert r.calls[-1][0] == "set_state"
     assert obs["position"].tolist() == [10.0, 0.0, 0.0]
     assert obs["proj_scale"][0] == 500.0
