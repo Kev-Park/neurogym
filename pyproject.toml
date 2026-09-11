@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ngllib"
 version = "0.2.0"
-description = "RL-style environment that drives Neuroglancer via Playwright browser automation"
+description = "RL environment over Neuroglancer with pluggable Chrome and simulator renderers"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Seung Lab" }]
-keywords = ["neuroglancer", "reinforcement-learning", "connectomics", "playwright"]
+keywords = ["neuroglancer", "reinforcement-learning", "connectomics", "playwright", "moderngl"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -28,6 +28,11 @@ dependencies = [
     "Pillow",
     "gymnasium>=1.0",
     "psutil",
+    # Simulator backend (ngllib.simulator): offscreen GL + FlyWire data access.
+    # Main dependencies, not an extra -- the imports stay lazy, so a Chrome-only
+    # install pays nothing at import time.
+    "moderngl>=5.10",
+    "cloud-volume>=8.0",
 ]
 
 [project.urls]
