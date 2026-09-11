@@ -163,8 +163,7 @@ def compose_left_parts(em_gray, ids, visible) -> np.ndarray:
     transition (probe_select_dynamics, 883367).
 
     `visible` is the visible segment set; empty means NG's SHOW_ALL_SEGMENTS,
-    where every segment paints. Draw order matches compose_left: EM, then tint,
-    then crosshair.
+    where every segment paints. Draw order: EM, then tint, then crosshair.
     """
     canvas = np.zeros((PANE, PANE, 3), dtype=np.uint8)
     if em_gray is None:
@@ -199,53 +198,6 @@ def tint_all(rgb: np.ndarray, ids: np.ndarray) -> None:
     col = lut[inv].reshape(ids.shape + (3,)) * 255.0
     nz = ids != 0
     rgb[nz] = 0.5 * col[nz] + 0.5 * rgb[nz]
-
-
-def compose_left(tile, label_mask, root_id) -> np.ndarray:
-    """2D xy EM pane canvas (PANE x PANE x 3 uint8): calibrated filter chain
-    + segment tint + one-sided crosshair + toolbar strip.
-
-    Neuroglancer's `select` toggles segments into a SET and tints each with its
-    own colour, so `root_id` may be a single id or a sequence, and
-    `label_mask` correspondingly a single mask or a {root_id: mask} dict.
-    Single-id callers keep working unchanged. With NOTHING visible, NG colours
-    the whole slice instead (SHOW_ALL_SEGMENTS): pass the id tile from
-    EMTiles.label_ids as `label_mask` and an empty `root_id`.
-    """
-    canvas = np.zeros((PANE, PANE, 3), dtype=np.uint8)
-    if tile is None:
-        return canvas
-    big = Image.fromarray(tile).resize((900, 867), Image.BILINEAR)
-    img = np.asarray(big.resize((PANE, PANE_H), Image.BOX)
-                     ).astype(np.float32) * EM_GAIN
-    rgb = np.repeat(img[..., None], 3, axis=2)
-    if label_mask is not None:
-        if isinstance(label_mask, dict):
-            # Painted in the selection's own order so overlaps resolve the way
-            # a caller listed them, not by dict iteration accident.
-            ids = [int(r) for r in root_id] if not isinstance(
-                root_id, (int, str)) else [int(root_id)]
-            pairs = [(r, label_mask[r]) for r in ids if label_mask.get(r) is not None]
-        elif label_mask.dtype != bool:
-            # SHOW_ALL_SEGMENTS: nothing is visible, so `label_mask` is the id
-            # tile and every non-zero segment paints in its own colour at the
-            # same selectedAlpha (hideSegmentZero keeps 0 as background).
-            tint_all(rgb, label_mask)
-            pairs = []
-        else:
-            rid0 = root_id[0] if not isinstance(root_id, (int, str)) else root_id
-            pairs = [(int(rid0), label_mask)]
-        for rid, m in pairs:
-            col = np.asarray(segment_color(int(rid))) * 255.0
-            rgb[m] = 0.5 * col[None, :] + 0.5 * rgb[m]
-    cy, cx = PANE_H // 2, PANE // 2
-    length = int(min(900, 867) / 4 / 2)
-    row = rgb[cy, cx:cx + length]
-    rgb[cy, cx:cx + length] = 0.5 * np.array([255, 0, 0]) + 0.5 * row
-    colm = rgb[cy:cy + length, cx]
-    rgb[cy:cy + length, cx] = 0.5 * np.array([0, 255, 0]) + 0.5 * colm
-    canvas[TOOLBAR:] = np.clip(rgb, 0, 255).astype(np.uint8)
-    return canvas
 
 
 # Regions of the CAPTURE where Chrome draws UI and the simulator cannot.
@@ -290,11 +242,4 @@ def mask_ui(image: np.ndarray) -> np.ndarray:
     for y0, y1, x0, x1 in UI_REGIONS:
         if y0 < out.shape[0] and x0 < out.shape[1]:
             out[y0:min(y1, out.shape[0]), x0:min(x1, out.shape[1])] = 0
-    return out
-
-
-def paste_right(pane_below_toolbar: np.ndarray) -> np.ndarray:
-    """3D pane (PANE_H x PANE) -> PANE x PANE canvas with toolbar strip."""
-    out = np.zeros((PANE, PANE, 3), dtype=np.uint8)
-    out[TOOLBAR:] = pane_below_toolbar
     return out

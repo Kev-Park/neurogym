@@ -256,12 +256,6 @@ def worker_tile(source, pos_nm, extent_x_nm, extent_y_nm, max_px,
         np.asarray(pos_nm), extent_x_nm, extent_y_nm, max_px, subpixel)
 
 
-def worker_label_tile(source, pos_nm, extent_x_nm, extent_y_nm, root_id,
-                      out_px):
-    return _worker_em(source).label_tile(
-        np.asarray(pos_nm), extent_x_nm, extent_y_nm, root_id, out_px)
-
-
 def pack_ids(ids):
     """Palette-compress an id tile for the trip back from the worker process.
 
@@ -387,22 +381,6 @@ def worker_pane_parts(source, pos, xs_scale, max_px=1024,
            if with_label else None)
     plane = em.tile(pos_nm, ext[0], ext[1], max_px, False)
     return pane2d.resample_em(tile), pack_ids(ids), plane
-
-
-def worker_left_canvas(source, pos, xs_scale, root_id):
-    """Fully composed 2D pane canvas for a state, built inside the fetch
-    worker (tile + label fetch AND the PIL chain — all off the GIL of the
-    caller). pos in voxels."""
-    from . import pane2d
-
-    em = _worker_em(source)
-    pos_nm = np.asarray(pos, dtype=np.float64) * source.voxel_nm
-    ext = pane2d.pane_extents_nm(xs_scale, source.canonical_nm)
-    shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
-    tile = em.tile(shifted, ext[0], ext[1], 1024, True)
-    label = em.label_tile(shifted, ext[0], ext[1], root_id,
-                          (pane2d.PANE, pane2d.PANE_H))
-    return pane2d.compose_left(tile, label, root_id)
 
 
 _WORKER_MESHES: dict = {}
