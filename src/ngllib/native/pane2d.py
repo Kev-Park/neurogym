@@ -45,6 +45,14 @@ PANEL_CX_CLICK = CSS_PANE / 2.0
 PANEL_CY_CLICK = PANEL_TOP_CLICK + PANEL_H_CLICK / 2.0   # 449.5
 
 
+# Multiplier on the 3D section plane's extent only (not the 2D pane's). 1.0
+# ships; exposed so the quad's size can be swept against Chrome's silhouettes
+# independently of the camera, which the calibration sweep showed are separate
+# failures -- mesh IoU moved 0.442-0.588 with camera scale while plane IoU
+# barely moved at all.
+PLANE_EXT_SCALE = 1.0
+
+
 def pane_extents_nm(xs_scale: float) -> tuple[float, float]:
     return float(xs_scale) * CSS_PANE * 4.0, float(xs_scale) * CSS_VIEW_H * 4.0
 

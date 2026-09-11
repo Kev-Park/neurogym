@@ -51,6 +51,7 @@ from .em import (
     worker_pane_parts,
     worker_warm,
 )
+from . import pane2d as pane2d_mod
 from .render3d import MeshRenderer
 
 logger = logging.getLogger(__name__)
@@ -1173,7 +1174,9 @@ class NativeEnvironment(gym.Env):
             ids, pos_nm, st["projectionOrientation"],
             float(st["projectionScale"]) * SCALE_CAL_NM,
             [segment_color(int(r)) for r in ids],
-            em_tile=plane, em_extent_nm=tiles["ext"],
+            em_tile=plane,
+            em_extent_nm=(tiles["ext"][0] * pane2d_mod.PLANE_EXT_SCALE,
+                          tiles["ext"][1] * pane2d_mod.PLANE_EXT_SCALE),
             em_gain=EM_GAIN)
         out = np.zeros((PANE, PANE, 3), dtype=np.uint8)
         out[TOOLBAR:] = pane
