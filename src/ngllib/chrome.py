@@ -294,15 +294,23 @@ class ChromeRenderer:
                 self._needs_browser_restart = True
             raise
         except Exception as e:
+            # Anything a Playwright interaction raises is a browser failure and
+            # leaves here as BrowserError, so the environment (and the agent's
+            # ResilientStepWrapper) only ever see RendererError. Playwright's
+            # own hierarchy is not enough: after a watchdog kill the next
+            # `page.goto` raises a PLAIN `Exception` ("Connection closed while
+            # reading from the driver"), which escaped the old env and retired
+            # a whole RLlib runner (gate 6, job 884011, 2026-09-11).
+            self._note_step_failure(
+                (f"watchdog hang >{self.step_timeout_s}s: " if wd.fired else "")
+                + f"{type(e).__name__}: {str(e)[:100]}")
+            if wd.fired or self._consecutive_step_failures >= self.restart_after_consecutive_failures:
+                self._needs_browser_restart = True
             if wd.fired:
-                self._note_step_failure(
-                    f"watchdog hang >{self.step_timeout_s}s: {str(e)[:100]}")
-                if self._consecutive_step_failures >= self.restart_after_consecutive_failures:
-                    self._needs_browser_restart = True
                 raise BrowserError(
                     f"step hung >{self.step_timeout_s}s; browser killed by watchdog: {e}"
                 ) from e
-            raise
+            raise BrowserError(f"{type(e).__name__}: {e}") from e
         finally:
             wd.cancel()
 
