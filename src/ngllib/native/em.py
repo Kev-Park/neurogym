@@ -319,6 +319,7 @@ def worker_pane_parts(cache_dir, pos, xs_scale, max_px=1024,
     em = _worker_em(cache_dir)
     pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
     ext = pane2d.pane_extents_nm(xs_scale)
+    shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
     tile = em.tile(shifted, ext[0], ext[1], max_px, True)
     ids = (em.label_ids(shifted, ext[0], ext[1], (pane2d.PANE, pane2d.PANE_H))
            if with_label else None)
