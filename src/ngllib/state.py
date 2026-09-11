@@ -73,9 +73,16 @@ def next_projection_scale(previous: float, requested: float) -> float:
     different rule, and Chrome carried none at all: navigating to a URL with a
     non-positive zoom just failed to parse. Both backends now get this.
 
-    Gate 4 still owes one measurement: whether Neuroglancer discards the
-    OTHER components of a rejected edit as well. If it does, the rule moves
-    from this function to `apply_state_edit` -- nowhere else.
+    MEASURED 2026-09-11 (native/probe_zoom_boundary, job 883828): Neuroglancer
+    does neither "reject only the zoom" nor "reject the whole edit". A URL
+    with projectionScale 0 or -500 leaves `viewer.state` with NO position and
+    no scales for as long as we watched (10 s), so the old Chrome env never had
+    a state transition here at all -- it raised "viewer state missing fields"
+    and truncated the episode (part of its KeyError('position') glitch class).
+    Keeping the previous zoom is therefore not a faithful copy of Chrome; it is
+    the one rule under which both backends have a defined, identical answer,
+    and it removes an episode-killing failure from Chrome training. The
+    partial-vs-whole question is moot.
     """
     if not (requested > 0.0) or not math.isfinite(requested):
         return float(previous)
