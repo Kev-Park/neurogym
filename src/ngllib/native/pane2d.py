@@ -56,15 +56,47 @@ def shifted_fetch_center_nm(pos_nm: np.ndarray, ext: tuple[float, float]):
         LEFT_SHIFT_PX[0] * ext[1] / PANE_H, 0.0])
 
 
-def resample_em(tile) -> np.ndarray:
+def resample_em(tile, overscan: float = 1.0) -> np.ndarray:
     """EM tile -> the pane's greyscale raster (PANE_H x PANE uint8).
 
     Calibrated chain: subpixel-phase tile -> GL-linear resample to the 900x867
     CSS pane -> Chrome's area-average capture downscale, then EM_GAIN.
+
+    With `overscan` > 1 the tile covers a proportionally larger region and the
+    raster is scaled up by the same factor, so the nm-per-pixel is unchanged
+    and a pane-sized crop out of it is the same pixel grid a direct fetch would
+    have produced. That is what lets a viewer move re-crop locally instead of
+    refetching -- see NativeEnvironment._tile_cache.
     """
-    big = Image.fromarray(tile).resize((900, 867), Image.BILINEAR)
-    img = np.asarray(big.resize((PANE, PANE_H), Image.BOX)).astype(np.float32)
+    w = int(round(900 * overscan))
+    h = int(round(867 * overscan))
+    ow = int(round(PANE * overscan))
+    oh = int(round(PANE_H * overscan))
+    big = Image.fromarray(tile).resize((w, h), Image.BILINEAR)
+    img = np.asarray(big.resize((ow, oh), Image.BOX)).astype(np.float32)
     return np.clip(img * EM_GAIN, 0, 255).astype(np.uint8)
+
+
+def crop_pane(raster, centre_nm, ext_nm, want_centre_nm):
+    """Pane-sized window out of an overscanned raster, or None if it does not
+    fit entirely inside.
+
+    `raster` covers `ext_nm` about `centre_nm`; the window is PANE x PANE_H
+    about `want_centre_nm`. Offsets round to whole raster pixels, which is at
+    most half a raster pixel of registration error -- under a quarter of a
+    captured pixel at the shipping resolution, and so below the level the
+    parity metric resolves.
+    """
+    h, w = raster.shape[:2]
+    nm_per_px_x = ext_nm[0] / w
+    nm_per_px_y = ext_nm[1] / h
+    dx = int(round((want_centre_nm[0] - centre_nm[0]) / nm_per_px_x))
+    dy = int(round((want_centre_nm[1] - centre_nm[1]) / nm_per_px_y))
+    x0 = w // 2 + dx - PANE // 2
+    y0 = h // 2 + dy - PANE_H // 2
+    if x0 < 0 or y0 < 0 or x0 + PANE > w or y0 + PANE_H > h:
+        return None
+    return raster[y0:y0 + PANE_H, x0:x0 + PANE]
 
 
 def draw_crosshair(rgb: np.ndarray) -> None:

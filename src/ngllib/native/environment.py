@@ -27,6 +27,7 @@ import copy
 import logging
 import multiprocessing
 import os
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Callable, Literal
@@ -67,6 +68,8 @@ from .pane2d import (  # noqa: E402
     TOOLBAR,
     VOXEL_NM,
     compose_left_parts,
+    crop_pane,
+    shifted_fetch_center_nm,
     tint_plane,
 )
 
@@ -200,6 +203,13 @@ class NativeEnvironment(gym.Env):
         # 3D pane on whichever step its mesh lands, the way Chrome streams.
         self._mesh_futs: dict[str, Any] = {}
         self._mesh_due: dict[str, int] = {}
+        # Fetched OVERSCANNED regions, newest last; the stand-in for Chrome's
+        # chunk cache. NGL_NATIVE_TILE_OVERSCAN sizes each one (1.0 = off,
+        # i.e. refetch on every move), NGL_NATIVE_TILE_CACHE how many are kept.
+        self._tile_overscan = float(
+            os.environ.get("NGL_NATIVE_TILE_OVERSCAN", "1.5"))
+        self._tile_cache_n = int(os.environ.get("NGL_NATIVE_TILE_CACHE", "6"))
+        self._tile_cache: OrderedDict[Any, Any] = OrderedDict()
         # Segments showing a COARSE mesh, still owed the full-resolution one.
         self._mesh_fine: set[str] = set()
         self._steps = 0
@@ -358,6 +368,7 @@ class NativeEnvironment(gym.Env):
         self._mesh_futs.clear()
         self._mesh_due.clear()
         self._mesh_fine.clear()
+        self._tile_cache.clear()
         self._steps = 0
         # RANDOM mode: one latency draw per episode, so an episode has a
         # consistent "network speed" rather than per-step jitter.
@@ -753,7 +764,7 @@ class NativeEnvironment(gym.Env):
             mx = 256 if stage == "coarse" else 1024
             futs = {"parts": pool.submit(
                 worker_pane_parts, cd, list(pos), float(xs), mx,
-                stage != "coarse")}
+                stage != "coarse", self._tile_overscan)}
         else:
             mx = 256 if stage == "coarse" else 1024
             futs = {"plane": pool.submit(
@@ -807,8 +818,14 @@ class NativeEnvironment(gym.Env):
                 return None, None  # let it land; do NOT resubmit
             parts = None
             try:
-                em_gray, ids_packed, plane = self._svc_fut.result(timeout=180)
-                parts = (em_gray, unpack_ids(ids_packed), plane)
+                (em_big, ids_packed, plane,
+                 centre, ext_big) = self._svc_fut.result(timeout=180)
+                ids_big = unpack_ids(ids_packed)
+                want = self._fetch_centre_nm()
+                parts = (crop_pane(em_big, centre, ext_big, want),
+                         None if ids_big is None else
+                         crop_pane(ids_big, centre, ext_big, want),
+                         plane)
             except Exception as e:
                 logger.warning("client visuals failed (%s); stale", e)
             landed_key, self._svc_fut = self._svc_futkey, None
@@ -874,11 +891,16 @@ class NativeEnvironment(gym.Env):
         for name, fut in futs.items():
             try:
                 if name == "parts":
-                    # (EM raster, packed id map, 3D section-plane tile)
-                    em_gray, ids_packed, tiles["plane"] = fut.result(
-                        timeout=timeout_s)
-                    tiles["em"] = em_gray
-                    tiles["ids"] = unpack_ids(ids_packed)
+                    (em_big, ids_packed, tiles["plane"],
+                     centre, ext_big) = fut.result(timeout=timeout_s)
+                    ids_big = unpack_ids(ids_packed)
+                    self._remember_region(em_big, ids_big, centre, ext_big,
+                                          key)
+                    tiles["em"] = crop_pane(em_big, centre, ext_big,
+                                            self._fetch_centre_nm())
+                    tiles["ids"] = (None if ids_big is None else
+                                    crop_pane(ids_big, centre, ext_big,
+                                              self._fetch_centre_nm()))
                 else:
                     tiles[name] = fut.result(timeout=timeout_s)
             except FuturesTimeout:
@@ -888,13 +910,82 @@ class NativeEnvironment(gym.Env):
         self._tile_key, self._tiles = key, tiles
         self._tile_stage = stage
 
+    def _fetch_centre_nm(self):
+        """Where the CURRENT pane is centred, in the fetch's own convention."""
+        st = self._json_state
+        pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
+        ext = self._pane_extents_nm()
+        return shifted_fetch_center_nm(pos_nm, ext)
+
+    def _remember_region(self, em_big, ids_big, centre, ext_big, key) -> None:
+        """Keep a fetched region so later positions can crop it.
+
+        This is the client-side stand-in for Chrome's chunk cache. Chrome
+        re-renders a 200 px move instantly because the surrounding chunks are
+        already loaded; we refetched the whole tile on every position change
+        and showed the old location for ~0.8 s (probe_action_dynamics 883689:
+        2D response step 61 against Chrome's 0). Regions are keyed by
+        crossSectionScale because a different zoom is a different nm-per-pixel
+        and cannot be cropped from this raster.
+        """
+        if em_big is None:
+            return
+        xs = round(float(self._json_state["crossSectionScale"]), 5)
+        self._tile_cache[(xs, tuple(np.round(centre, 1)))] = (
+            em_big, ids_big, np.asarray(centre, dtype=np.float64),
+            tuple(ext_big))
+        while len(self._tile_cache) > self._tile_cache_n:
+            self._tile_cache.popitem(last=False)
+
+    def _region_crop(self):
+        """(em, ids) for the current pane out of a cached region, or None.
+
+        Only regions at the SAME crossSectionScale can serve, and only when
+        the pane fits entirely inside one -- a partial overlap would show a
+        black margin, which Chrome never does.
+        """
+        want = self._fetch_centre_nm()
+        xs = round(float(self._json_state["crossSectionScale"]), 5)
+        for k in reversed(list(self._tile_cache)):
+            if k[0] != xs:
+                continue
+            em_big, ids_big, centre, ext_big = self._tile_cache[k]
+            em = crop_pane(em_big, centre, ext_big, want)
+            if em is None:
+                continue
+            ids = (None if ids_big is None else
+                   crop_pane(ids_big, centre, ext_big, want))
+            self._tile_cache.move_to_end(k)
+            return em, ids
+        return None
+
     def _fetch_tiles(self, block: bool) -> dict[str, Any]:
         """Tiles for the current state. block=True (reset) waits for exact
         tiles; block=False (step) returns the last completed set while the
         fetch streams in — see the pipeline note in __init__."""
         key = self._tile_state_key()
+        # Drain a finished fetch FIRST, whatever else happens: it refreshes the
+        # plane and adds its region to the cache, and leaving it pending would
+        # block every later fetch (only one is in flight at a time).
+        if (self._pending is not None
+                and all(f.done() for f in self._pending[1].values())):
+            self._adopt_pending()
         if key == self._tile_key and self._tile_stage == "fine":
             return self._tiles  # settled at full resolution
+        hit = self._region_crop()
+        if hit is not None:
+            # Already have the pixels: re-crop rather than refetch, so a move
+            # lands on the SAME step it was made, as it does in Chrome. The
+            # plane tile is still centred where it was fetched, so ask for a
+            # refresh in the background -- without holding up the pane.
+            em, ids = hit
+            self._tiles = {"ext": self._pane_extents_nm(), "em": em,
+                           "ids": ids,
+                           "plane": (self._tiles or {}).get("plane")}
+            self._tile_key, self._tile_stage = key, "fine"
+            if self._pending is None and not block:
+                self._submit_tile_fetch(key, "fine")
+            return self._tiles
         if self._pending is not None and self._pending[0] != key:
             # Superseded in-flight fetch: adopt it only if it already
             # finished (warms the LRU either way), then refetch.
