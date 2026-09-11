@@ -1059,6 +1059,19 @@ class Environment(gym.Env):
         self._last_settle_polls = polls
         image = self._get_screenshot()
         image = self._crop_panes(image)
+        # BEFORE any resize, and in that order on both backends. Chrome draws a
+        # toolbar, a scale bar and pane buttons inside the capture that no
+        # renderer can reproduce; blanking them in both is what stops a policy
+        # telling the two apart by UI rather than by data. Masking after a
+        # resize would apply capture-space regions to a scaled image, so with
+        # image_size set the browser would silently skip it while the native
+        # backend still masked -- reintroducing exactly the difference this
+        # removes.
+        from .native.pane2d import mask_ui, mask_ui_enabled
+
+        if (mask_ui_enabled() and image.ndim == 3
+                and image.shape[:2] == (450, 900)):
+            image = mask_ui(image)
         if self.image_size is not None:
             image = self._resize_image(image, self.image_size)
 
@@ -1070,15 +1083,6 @@ class Environment(gym.Env):
         else:
             orient = np.asarray(orient_raw, dtype=np.float32)
         proj_scale = np.asarray([json_state["projectionScale"]], dtype=np.float32)
-
-        from .native.pane2d import mask_ui, mask_ui_enabled
-
-        if mask_ui_enabled() and image.ndim == 3 and image.shape[1] >= 900:
-            # Same mask the native backend applies, so a policy cannot tell the
-            # two apart by Chrome's toolbar, scale bar or pane buttons. Masking
-            # only ONE backend would leave the other showing data where this
-            # one shows chrome -- the same problem mirrored.
-            image = mask_ui(image)
 
         obs = {
             "position": position,

@@ -1206,10 +1206,12 @@ class NativeEnvironment(gym.Env):
         if self.right_pane:
             panes.append(self._render_right(tiles))
         image = panes[0] if len(panes) == 1 else np.concatenate(panes, axis=1)
-        if self.mask_ui and len(panes) == 2:
-            # Blank what Chrome draws as UI, so the two backends cannot be told
-            # apart by it. Only meaningful for the full two-pane capture the
-            # regions were measured against.
+        if self.mask_ui and image.shape[:2] == (PANE, 2 * PANE):
+            # Blank what Chrome draws as UI, so the two backends cannot be
+            # told apart by it. Guarded on the exact capture shape the regions
+            # were measured against, and applied BEFORE any resize -- the same
+            # order the browser backend uses, or the two would diverge again
+            # whenever image_size is set.
             image = mask_ui(image)
         if self.image_size is not None:
             image = np.asarray(Image.fromarray(image).resize(self.image_size))
