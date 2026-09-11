@@ -212,7 +212,6 @@ def _add_env_kwargs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--screenshot-format", choices=["jpeg", "png"], default="jpeg")
     parser.add_argument("--no-right-pane", dest="right_pane", action="store_false", default=True)
     parser.add_argument("--left-pane", dest="left_pane", action="store_true", default=False)
-    parser.add_argument("--draw-mouse", action="store_true", default=False)
     parser.add_argument("--browser-restart-every", type=int, default=90,
                         help="Restart browser every N episodes; 0 to disable.")
     parser.add_argument("--retry-on-reset", type=int, default=3)
@@ -222,20 +221,22 @@ def _add_env_kwargs(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_env(args: argparse.Namespace):
-    from ..chrome import Environment
+    from ..chrome import ChromeRenderer
+    from ..environment import Environment
     return Environment(
-        headless=args.headless,
-        renderer=args.renderer,
+        backend=ChromeRenderer(
+            headless=args.headless,
+            renderer=args.renderer,
+            window_size=_parse_size(args.window_size),
+            image_size=_parse_size(args.image_size),
+            screenshot_format=args.screenshot_format,
+            right_pane=args.right_pane,
+            left_pane=args.left_pane,
+            browser_restart_every=args.browser_restart_every or None,
+            retry_on_reset=args.retry_on_reset,
+            config_path=args.config_path,
+        ),
         orientation=args.orientation,
-        window_size=_parse_size(args.window_size),
-        image_size=_parse_size(args.image_size),
-        screenshot_format=args.screenshot_format,
-        right_pane=args.right_pane,
-        left_pane=args.left_pane,
-        draw_mouse=args.draw_mouse,
-        browser_restart_every=args.browser_restart_every or None,
-        retry_on_reset=args.retry_on_reset,
-        config_path=args.config_path,
         verbose=args.verbose,
     )
 

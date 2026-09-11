@@ -10,7 +10,7 @@ import os
 import numpy as np
 from PIL import Image
 
-from ngllib import Environment
+from ngllib import ChromeRenderer, Environment
 
 
 def main() -> None:
@@ -18,11 +18,10 @@ def main() -> None:
     # would handle truncation in real use). Euler orientation matches the demo
     # action shape below.
     env = Environment(
-        headless=True,
+        # Self-healing knobs are on by default; disable here to keep the demo simple.
+        backend=ChromeRenderer(headless=True, browser_restart_every=None),
         orientation="euler",
         verbose=False,
-        # Self-healing knobs are on by default; disable here to keep the demo simple.
-        browser_restart_every=None,
     )
 
     obs, info = env.reset(seed=0)

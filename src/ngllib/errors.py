@@ -11,7 +11,16 @@ class NgllibError(Exception):
     """Base class for all ngllib-raised exceptions."""
 
 
-class BrowserError(NgllibError):
+class RendererError(NgllibError):
+    """A renderer failed to apply or observe a viewer state.
+
+    The environment never catches anything more specific: each backend fails
+    in its own way (a hung browser, a dead GL context) and recovers on its own
+    terms, so the shared core only ever sees this.
+    """
+
+
+class BrowserError(RendererError):
     """Chromium failed to launch, hung, or crashed."""
 
 

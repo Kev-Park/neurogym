@@ -1,24 +1,27 @@
-"""Browser-free drop-in for `ngllib.Environment` (native renderer).
+"""Simulator renderer: CloudVolume + moderngl/EGL, no browser.
 
-Same Gymnasium contract as the browser env — Dict observation
-{position, xs_scale, orientation, proj_scale, image}, Dict action
-(action_type 1 = right_click -> move-to-mouse-position, 3 = edit_state),
-provider/reward/termination hooks, info {task_info, json_state} — but the
-frame comes from CloudVolume + moderngl/EGL instead of Playwright + Chrome.
+Same panes as Chrome -- a 2D xy EM slice on the left, the 3D projection on
+the right -- produced from the data directly instead of through Neuroglancer.
+The environment owns the state; this class holds the copy it renders from,
+answers what Neuroglancer would do to a click (`pick`, `select`), and streams
+tiles and meshes the way Chrome streams chunks.
 
-Parity provenance (2026-08-27/28 campaign, 300 states / 320 input probes vs
-a browser baseline that re-renders pixel-identically):
-- 3D pane block-SSIM 0.845 median; mesh tol-IoU 0.885.
-- 2D pane block-SSIM 0.898 median, registration pixel-exact (jitter sd 0).
-- rotate/zoom state edits bit-exact (identical arithmetic, 0.00 error).
-- clicks: ~2 screen px lateral; along-view residual traced to NG's
-  per-chunk LOD pick mesh (we pick against the full-res mesh + section
-  plane).
-Calibrated constants (SCALE_CAL_NM, EM_GAIN, LEFT_SHIFT_PX, all in pane2d) come from
-that campaign — change them only with a parity-harness re-run.
+Parity provenance (2026-08-27..09-10 campaigns, against a Chrome baseline that
+reproduces itself exactly on settled frames):
+- input parity 72/72 (same state + same click pixel -> same selection, both
+  panes); rotate/zoom state edits bit-exact.
+- 2D pane block-SSIM 0.970 interior / 0.899 whole; 3D pane 0.836 whole,
+  0.40 over content blocks (NG's per-chunk mesh LOD, not implemented here);
+  mesh silhouette IoU 0.58, section plane IoU 0.75.
+Calibrated constants live in pane2d with the measurement that fixes each.
 
-Geometry is fixed at the calibrated capture: window 1800x900 CSS at
-capture_scale 0.5 -> two 450x450 panes, 17 captured px of toolbar.
+Geometry is calibrated at window 1800x900 CSS, capture_scale 0.5 -> two
+450x450 panes with 17 captured px of toolbar. Other geometries render but warn.
+
+Operational knobs stay environment variables (they are per-process or per-node
+budgets set by launchers, not per-env choices): NGL_NATIVE_FETCH_WORKERS,
+NGL_NATIVE_MESH_LRU_MB, NGL_NATIVE_FINE_MAX_PX, NGL_NATIVE_COARSE_MAX_PX,
+NGL_NATIVE_WARM_FACTOR, NGL_NATIVE_PARALLEL_PARTS, NGL_NATIVE_MESH_LAG_STEPS.
 """
 
 from __future__ import annotations
@@ -28,40 +31,33 @@ import logging
 import multiprocessing
 import os
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
-import gymnasium as gym
 import numpy as np
-from gymnasium import spaces
-from PIL import Image
 
-from ..errors import ProviderError
-from ..providers import StateProvider
-from ..utils.geom import euler_to_quaternion, quaternion_to_euler
+from .. import state as S
+from ..dataset import DatasetSpec, default_start_url, ngl_state_from_viewer, split_state_url
+from ..events import EventLog
+from ..renderer import PaneLayout
 from .colors import segment_color
 from .em import (
     MeshStore,
-    worker_mesh,
-    worker_tile,
+    Source,
     unpack_ids,
     worker_em_plane,
     worker_ids,
+    worker_mesh,
     worker_pane_parts,
+    worker_tile,
     worker_warm,
 )
 from . import pane2d as pane2d_mod
-from .render3d import MeshRenderer
-
-logger = logging.getLogger(__name__)
-
-# Calibrated constants + capture geometry live in pane2d (shared with the
-# per-node render service); re-exported names keep this module's code and
-# external references stable.
-from .pane2d import (  # noqa: E402
+from .pane2d import (
+    CALIBRATED_DATASET,
     CSS_PANE,
-    CSS_VIEW_H,
     EM_GAIN,
     PANE,
     PANE_H,
@@ -70,151 +66,112 @@ from .pane2d import (  # noqa: E402
     PANEL_TOP_CLICK,
     SCALE_CAL_NM,
     TOOLBAR,
-    VOXEL_NM,
     compose_left_parts,
-    mask_ui,
-    mask_ui_enabled,
+    pane_extents_nm,
     tint_plane,
 )
+from .render3d import MeshRenderer
 
-_noop_reward_factory = lambda task_info: (  # noqa: E731
-    lambda obs, action, prev_obs, terminated: 0.0)
-_noop_termination_factory = lambda task_info: (  # noqa: E731
-    lambda obs, action, prev_obs: False)
+logger = logging.getLogger(__name__)
 
-
-class _PlaneOnly:
-    """Adapts a plane-tile future to the (canvas, plane) contract used by the
-    2D-pane path, so callers need no branch."""
-
-    def __init__(self, fut):
-        self._f = fut
-
-    def done(self):
-        return self._f.done()
-
-    def result(self, timeout=None):
-        return None, self._f.result(timeout=timeout)
+PaneMode = Literal["atomic", "progressive", "concurrent", "random"]
+PANE_MODES = ("atomic", "progressive", "concurrent", "random")
 
 
-# ---------------------------------------------------------------------------
-# OPEN ISSUE - 2D-PANE DE-SYNC (must be handled before re-enabling left_pane)
-# ---------------------------------------------------------------------------
-# The 2D EM pane needs a CloudVolume fetch (~1s uncached, 3-7s cached-on-NFS)
-# while a step takes 20-200ms, so after every position change the pane shows
-# the PREVIOUS location for several steps. Measured freshness under
-# click-heavy stepping: local 2/40 steps (5%), service 20/40 after the
-# one-in-flight fix.
-# Why it matters: the pane is NOT task-essential but IS task-correlated, so a
-# policy trained on FRESH panes will take a dependency on 384 of its 768
-# visual dims - exactly the dims whose appearance differs most between the
-# simulator and Chrome. Stale panes may therefore have been accidental domain
-# randomization (see native-v9-test).
-# Options when re-enabling, none yet chosen:
-#   (a) block on the exact canvas each step (correct, costs throughput);
-#   (b) feed a staleness/age channel so the policy can discount it;
-#   (c) deliberately randomize the pane (explicit DR) rather than leaving
-#       staleness as an uncontrolled accident;
-#   (d) render the 2D pane from already-resident chunks only (never stale,
-#       sometimes lower-res).
-# Until one is chosen, runs use right_pane only.
+class SimulatorRenderer:
+    """Browser-free backend for `ngllib.Environment`.
 
+    `pane_mode` is the 2D-pane fill policy after a move -- the one controlled
+    experiment this project has on pane dynamics (plan 7.2, four modes trained
+    at pace740's config, k=5 on the 200-pair holdout):
+      atomic      one fine fetch, swapped in when it lands; the PREVIOUS
+                  location shows meanwhile. Default: 94.0% on Chrome.
+      random      atomic plus a per-episode random adopt delay (0-4 steps),
+                  i.e. domain randomization over fetch latency. 92.9%.
+      concurrent  coarse and fine fetched together, as Neuroglancer does
+                  (filterVisibleSources yields every scale). 92.3%.
+      progressive coarse preview, then fine, sequentially. 81.5% at k=1:
+                  the policy preferred a sharp stale pane to a blurry current
+                  one. The mechanism is the DURATION of a degraded pane.
+    Fidelity to Chrome's fill behaviour does not predict transfer, so the
+    criterion for a mode is measured transfer, not resemblance.
 
-class NativeEnvironment(gym.Env):
-    """Native (browser-free) Neuroglancer-equivalent environment.
-
-    Accepts the browser `Environment`'s core kwargs; browser-lifecycle
-    options (self-healing timeouts, restart cadence, launch args) have no
-    native counterpart and are intentionally not part of this signature —
-    `ngllib_agent.env_build` only forwards them to the browser backend.
+    `cache_dir` opts into a CloudVolume DISK cache. Default None: on bucket
+    NFS the cache's write-through metadata taxed every cold fetch 4-30x
+    (2026-08-28); the in-RAM chunk LRU covers repeats. Pass a LOCAL-disk dir
+    only. `mesh_budget_bytes` bounds the GPU-resident mesh LRU.
     """
 
-    metadata = {"render_modes": []}
+    # The simulator's warm work is a background prefetch; nothing is gained by
+    # delaying it, so the environment warms right after reset.
+    warm_after_steps = 0
+
+    # One fetch pool per PROCESS, shared by all renderers in it (a runner hosts
+    # many threaded envs): GIL-isolates chunk download/decode. Spawn context --
+    # fork would inherit CUDA/EGL state.
+    _TILE_POOLS: list | None = None
+    _POOL_SEQ: int = 0
+
+    # Coarse level requested first; MeshStore.get walks down to whatever the
+    # segment actually has. NG streams meshes the same way.
+    #
+    # 1, not 2, even though 2 is coarser: the walk-down costs a failed
+    # round-trip when a level is absent, and segments vary (measured ranges
+    # 0..1 and 0..2). Requesting lod<=2 measured 0.52 s against lod<=1 at
+    # 0.44 s -- asking for the coarsest level available anywhere is slower on
+    # average than asking for one every segment has.
+    MESH_COARSE_LOD = 1
 
     def __init__(
         self,
         *,
         window_size: tuple[int, int] = (1800, 900),
+        capture_scale: float = 0.5,
         image_size: tuple[int, int] | None = None,
         left_pane: bool = False,
         right_pane: bool = True,
-        capture_scale: float = 0.5,
-        orientation: Literal["quaternion", "euler"] = "quaternion",
-        reset_state_provider: StateProvider | None = None,
-        reward_factory: Callable | None = None,
-        termination_factory: Callable | None = None,
         cache_dir: str | None = None,
         mesh_budget_bytes: int = 2 << 30,
-        reset_ahead: bool = True,
-        render_service: Callable[[], Any] | None = None,
-        service_feature_dim: int = 384,
+        pane_mode: PaneMode = "atomic",
+        dataset: DatasetSpec | None = None,
+        config_path: str | None = None,
     ):
-        super().__init__()
-        if tuple(window_size) != (1800, 900) or capture_scale != 0.5:
-            raise ValueError(
-                "NativeEnvironment is calibrated for window_size=(1800, 900) "
-                f"at capture_scale=0.5; got {window_size} @ {capture_scale}")
-        if not (left_pane or right_pane):
-            raise ValueError("At least one of `left_pane`/`right_pane` must be True.")
-        if orientation not in ("quaternion", "euler"):
-            raise ValueError(f"orientation must be 'quaternion' or 'euler'; got {orientation!r}")
+        if pane_mode not in PANE_MODES:
+            raise ValueError(f"`pane_mode` must be one of {PANE_MODES}; got {pane_mode!r}")
+        self.layout = PaneLayout(
+            window_size=window_size, capture_scale=capture_scale, image_size=image_size,
+            left_pane=left_pane, right_pane=right_pane)
+        self.layout.warn_if_uncalibrated("SimulatorRenderer")
+        self.events = EventLog(path_template="")  # replaced by the environment
+        self.pane_mode: str = pane_mode
 
-        self.window_size = tuple(window_size)
-        self.image_size = tuple(image_size) if image_size else None
-        self.left_pane = left_pane
-        self.right_pane = right_pane
-        self.capture_scale = capture_scale
-        # NGL_MASK_UI=0 disables it for BOTH backends. On by default: Chrome draws a toolbar,
-        # a scale bar and pane buttons inside the capture that no renderer can
-        # reproduce, and probe_gap_map measured the toolbar strip at 0.010
-        # block_ssim against Chrome while the 2D interior scores 0.967 -- the
-        # frame's worst disagreements are UI, not data, and a policy would key
-        # on them long before the neuron.
-        self.mask_ui = mask_ui_enabled()
-        self.orientation = orientation
-        # None = no CloudVolume disk cache (default; NFS caches tax cold
-        # fetches 4-30x — see em.py). Pass a LOCAL-disk dir to opt in.
-        self._cache_dir = cache_dir
+        # Deployment identity: the same start URL Chrome navigates to. The
+        # dataset is what the simulator reads; the URL's viewer state is the
+        # default start state, exactly as for Chrome.
+        self._url_prefix, self._base_state = split_state_url(default_start_url(config_path))
+        self.dataset = dataset or DatasetSpec.from_state(self._base_state)
+        if self.dataset != CALIBRATED_DATASET:
+            warnings.warn(
+                f"SimulatorRenderer: dataset {self.dataset} is not the one the parity "
+                f"constants were fitted on ({CALIBRATED_DATASET}); it will render, but "
+                "no parity claim holds.", stacklevel=2)
+        self.source = Source(self.dataset, cache_dir)
+        self._voxel_nm = self.source.voxel_nm
+        self._canonical_nm = self.source.canonical_nm
 
-        self._reset_state_provider = reset_state_provider
-        self._reward_factory = reward_factory or _noop_reward_factory
-        self._termination_factory = termination_factory or _noop_termination_factory
-
-        # Service mode: rendering + encoding happen in the per-node
-        # render service (ngllib.native.service); this env is a pure state
-        # machine exchanging states for features. `render_service` is a
-        # zero-arg factory (resolved lazily inside the worker process)
-        # returning a handle with .features(client_id, state, block_canvas)
-        # and .pick(state, px, py). Prefetch/tile pipelines are moot here —
-        # the service caches meshes/canvases across ALL clients.
-        self._service_factory = render_service
-        self._service = None
-        self._service_feature_dim = int(service_feature_dim)
-        if render_service is not None:
-            import uuid
-
-            self._client_id = uuid.uuid4().hex
-            # Client-side 2D canvas pipeline (service mode): composed in
-            # this runner's fetch process pool, shipped to the service only
-            # when it changes. In-service compose starved the actor's GIL
-            # at fleet click rates.
-            # (tile geometry key, visible set) the service already holds
-            self._svc_key = (None, None)
-            self._svc_fut = None
-            self._svc_futkey = None
-            self._svc_parts = None     # last landed (em, ids, plane)
-        self._image_shape = self._compute_image_shape()
-        self.observation_space = self._build_observation_space()
-        self.action_space = self._build_action_space()
-
-        # GL/data backends are lazy (first reset) so construction stays cheap
-        # and importable off-GPU, mirroring the browser env's lazy launch.
+        # GL/data backends are lazy (open()) so construction stays cheap and
+        # importable off-GPU.
         self._renderer: MeshRenderer | None = None
-        # root_id -> in-flight mesh fetch; a selected segment appears in the
-        # 3D pane on whichever step its mesh lands, the way Chrome streams.
-        self._mesh_futs: dict[str, Any] = {}
-        self._mesh_due: dict[str, int] = {}
-        self._mesh_t0: dict[str, tuple] = {}
+        self._meshes: MeshStore | None = None
+        self._mesh_budget = mesh_budget_bytes
+        self._pick_em = None
+
+        # Stable shard for this renderer, so its fetches keep landing on the
+        # same worker and that worker's chunk LRU stays relevant to it.
+        cls = type(self)
+        self._pool_shard = cls._POOL_SEQ
+        cls._POOL_SEQ += 1
+        self._parallel_parts = os.environ.get("NGL_NATIVE_PARALLEL_PARTS", "1") != "0"
         # Stage resolutions. Defaults are the shipping values; both are levers
         # for an A/B the pane-mode campaign could not run, because mip
         # selection is DISCRETE and it only ever tested the extremes.
@@ -225,172 +182,99 @@ class NativeEnvironment(gym.Env):
         #   max_px 1024               0.8877             0.86x
         #
         # 512 and 768 resolve to the SAME mip, as do 256 and 384 -- so there
-        # are three operating points, not five. The middle one keeps 98.3% of
-        # the shipping fidelity for roughly half the voxels, and `progressive`
-        # was measured with the BLURRIEST one (0.7394) when it cost 11pp. That
-        # verdict does not necessarily carry to a 0.8730 preview.
-        # Stable shard for this env, so its fetches keep landing on the same
-        # worker and that worker's chunk LRU stays relevant to it.
-        cls = type(self)
-        self._pool_shard = cls._POOL_SEQ
-        cls._POOL_SEQ += 1
-        self._parallel_parts = os.environ.get(
-            "NGL_NATIVE_PARALLEL_PARTS", "1") != "0"
+        # are three operating points, not five.
         self._fine_px = int(os.environ.get("NGL_NATIVE_FINE_MAX_PX", "1024"))
         self._coarse_px = int(os.environ.get("NGL_NATIVE_COARSE_MAX_PX", "256"))
         # Background chunk-cache warming: costs bandwidth, changes no pixel.
-        self._warm_factor = float(
-            os.environ.get("NGL_NATIVE_WARM_FACTOR", "1.6"))
-        self._warm_fut = None
-        # Segments showing a COARSE mesh, still owed the full-resolution one.
-        self._mesh_fine: set[str] = set()
-        self._steps = 0
+        self._warm_factor = float(os.environ.get("NGL_NATIVE_WARM_FACTOR", "1.6"))
         # NGL_NATIVE_MESH_LAG_STEPS: hold a landed mesh until this many steps
         # after the selection. Default 0 -- show it as soon as it arrives.
         #
-        # This exists because mesh lag CANNOT be matched to Chrome in both
-        # units at once. Measured (probe_select_dynamics 883469,
-        # probe_mesh_latency): our cold fetch is 0.77 s median against Chrome's
-        # ~0.67 s end-to-end, so in WALL TIME the two already agree -- but a
-        # simulator step costs 0.007 s against Chrome's 0.031 s, so the same
-        # latency spans ~110 of our steps and ~21 of Chrome's. Steps are what
-        # the policy experiences. Closing that would mean either slowing the
-        # simulator down, which defeats its purpose, or modelling the lag in
-        # step units, which is what this lever does (Chrome's median was ~21).
-        # Left OFF by default: the pane-mode campaign found fidelity to
-        # Chrome's streaming does not by itself predict transfer, so this is a
-        # science question to A/B, not an infrastructure default.
+        # Mesh lag CANNOT be matched to Chrome in both units at once. Measured
+        # (probe_select_dynamics 883469, probe_mesh_latency): our cold fetch is
+        # 0.77 s median against Chrome's ~0.67 s end-to-end, so in WALL TIME
+        # the two already agree -- but a simulator step costs 0.007 s against
+        # Chrome's 0.031 s, so the same latency spans ~110 of our steps and
+        # ~21 of Chrome's. Steps are what the policy experiences. Closing that
+        # means either slowing the simulator down, which defeats its purpose,
+        # or modelling the lag in step units, which is what this lever does.
+        # Off by default: the pane-mode campaign found fidelity to Chrome's
+        # streaming does not by itself predict transfer.
         self._mesh_lag = int(os.environ.get("NGL_NATIVE_MESH_LAG_STEPS", "0"))
-        self._meshes: MeshStore | None = None
-        self._mesh_budget = mesh_budget_bytes
 
-        self._rng: np.random.Generator = np.random.default_rng()
-        self._json_state: dict[str, Any] | None = None
-        self._prev_obs: dict[str, Any] | None = None
-        self._task_info: dict[str, Any] = {}
-        self._reward_fn: Callable | None = None
-        self._terminated_fn: Callable | None = None
+        self._state: dict[str, Any] | None = None
+        self._steps = 0
+        self._block_next = False
         # Tile pipeline: `_tiles` is the last COMPLETED tile set (memo-keyed);
-        # `_pending` is an in-flight fetch group. reset() blocks on it (the
-        # first observation is exact); step() adopts it when done and renders
-        # with the previous tiles meanwhile — Neuroglancer-equivalent
-        # semantics (Chrome renders whatever chunks are loaded; a frame after
-        # a move shows the previous slice until streaming catches up). Cold
-        # chunk fetches are 3-7s serial from S3; blocking per step on that
-        # was the density-probe wall.
+        # `_pending` is an in-flight fetch group. The first observation after
+        # reset_to blocks on it (exact); a step observation adopts it when done
+        # and renders with the previous tiles meanwhile -- Neuroglancer-
+        # equivalent semantics (Chrome renders whatever chunks are loaded).
         self._tile_key = None
         self._tiles: dict[str, Any] = {}
-        self._pending: tuple | None = None  # (key, {name: Fut}, ext, stage)
-        # 2D-pane fill policy (NGL_NATIVE_PANE_MODE), default 'atomic':
-        #   atomic      one fine fetch, swapped in when it lands. Shows the
-        #               PREVIOUS location meanwhile. The shipped behaviour
-        #               (native-pace740, 92.5% on Chrome).
-        #   progressive coarse preview -> then fine. Sequential. MEASURED
-        #               WORSE: native-prog740 81.5%, -11pp vs atomic,
-        #               paired p=0.0016 -- the policy preferred a sharp
-        #               stale pane to a blurry current one.
-        #   concurrent  coarse AND fine submitted together, as Neuroglancer
-        #               does (filterVisibleSources yields every scale).
-        #   random      atomic, but a per-episode random adopt delay -- DR
-        #               over fetch latency, which is a networking artifact
-        #               (Chrome's own step-0 fidelity spans 38-80% on
-        #               identical states).
-        self._pane_mode: str = os.environ.get("NGL_NATIVE_PANE_MODE", "atomic")
+        self._pending: tuple | None = None  # (key, {name: Fut}, ext, stage, t0)
         self._tile_stage: str = "fine"
         self._coarse_pending: tuple | None = None
         self._adopt_delay: int = 0   # random mode: steps still to wait
-        # Reset-ahead prefetch (native analog of the browser env's M5):
-        # measured 38s reset tail = mesh download/decode/normals + cold
-        # tiles for the NEXT episode's neuron — all prefetchable during the
-        # current episode. The provider draw for the next episode is taken
-        # from the SAME rng stream at the same point it would be inline, so
-        # sampling is unchanged (the wall-clock curriculum sees it ~one
-        # episode early — negligible). seed/options resets discard it.
-        # In service mode the prefetch is a pre-drawn state + fire-and-forget
-        # warm RPC (the service preloads mesh+canvas); local mode prefetches
-        # mesh/tiles itself. Without it, short-episode phases stall vector
-        # barriers on 1-3s blocking resets (measured: 2.2s/vector-step).
-        self.reset_ahead = reset_ahead
+        self._warm_fut = None
+        # root_id -> in-flight mesh fetch; a selected segment appears in the
+        # 3D pane on whichever step its mesh lands, the way Chrome streams.
+        self._mesh_futs: dict[str, Any] = {}
+        self._mesh_due: dict[str, int] = {}
+        self._mesh_t0: dict[str, tuple] = {}
+        # Segments showing a COARSE mesh, still owed the full-resolution one.
+        self._mesh_fine: set[str] = set()
+        # Reset-ahead prefetch for the state the environment said comes next:
+        # measured 38 s reset tail = mesh download/decode/normals + cold tiles,
+        # all prefetchable during the current episode.
         self._prefetch: dict[str, Any] | None = None
 
-    # ------------------------------------------------------------------ spaces
+    # ------------------------------------------------------------------ protocol
 
-    def _compute_image_shape(self) -> tuple[int, int, int]:
-        if self.image_size is not None:
-            iw, ih = self.image_size
-            return (ih, iw, 3)
-        if self.left_pane and self.right_pane:
-            return (PANE, 2 * PANE, 3)
-        return (PANE, PANE, 3)
+    def open(self) -> None:
+        if self._renderer is None:
+            self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget)
+            logger.info("simulator GL: %s", self._renderer.ctx.info["GL_RENDERER"])
+        if self._meshes is None:
+            self._meshes = MeshStore(self.source)
 
-    def _build_observation_space(self) -> spaces.Dict:
-        orient_dim = 3 if self.orientation == "euler" else 4
-        base = {
-            "position": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-            "xs_scale": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
-            "orientation": spaces.Box(low=-np.inf, high=np.inf, shape=(orient_dim,), dtype=np.float32),
-            "proj_scale": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
-        }
-        if self._service_factory is not None:
-            n_panes = (1 if self.left_pane else 0) + (1 if self.right_pane else 0)
-            base["image_features"] = spaces.Box(
-                low=-np.inf, high=np.inf,
-                shape=(n_panes * self._service_feature_dim,), dtype=np.float32)
-        else:
-            base["image"] = spaces.Box(
-                low=0, high=255, shape=self._image_shape, dtype=np.uint8)
-        return spaces.Dict(base)
-
-    def _build_action_space(self) -> spaces.Dict:
-        W, H = self.window_size
-        orient_dim = 3 if self.orientation == "euler" else 4
-        return spaces.Dict({
-            "action_type": spaces.Discrete(4),
-            "mouse_xy": spaces.Box(
-                low=np.array([0, 0], dtype=np.float32),
-                high=np.array([W, H], dtype=np.float32), dtype=np.float32),
-            "modifiers": spaces.MultiBinary(3),
-            "delta_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-            "delta_xs_scale": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
-            "delta_orient": spaces.Box(low=-np.inf, high=np.inf, shape=(orient_dim,), dtype=np.float32),
-            "delta_proj_scale": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
-        })
-
-    # ------------------------------------------------------------------ gym API
-
-    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
-        super().reset(seed=seed)
-        if seed is not None:
-            self._rng = np.random.default_rng(seed)
-        options = options or {}
-        self._ensure_backends()
-
-        pf = None
-        if (self.reset_ahead and self._prefetch is not None
-                and seed is None and not options):
-            pf = self._prefetch  # adopt: state pre-drawn from the same rng stream
+    def close(self) -> None:
+        # The class-level tile pools outlive individual renderers on purpose
+        # (shared by the process's env fleet; reaped at interpreter exit).
+        self._pending = None
         self._prefetch = None
-        if pf is not None:
-            start_state, task_info = pf["state"], pf["task_info"]
-        else:
-            start_state, task_info = self._resolve_reset_state(options)
-        if start_state is None or not isinstance(start_state, dict):
-            raise ValueError(
-                "NativeEnvironment requires an explicit NglState dict from the "
-                "provider or reset options (no default-URL fallback).")
-        try:
-            self._reward_fn = self._reward_factory(task_info)
-            self._terminated_fn = self._termination_factory(task_info)
-        except Exception as e:
-            raise ProviderError(f"factory raised at reset: {e}") from e
-        self._task_info = task_info
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
+        self._meshes = None
 
-        st = copy.deepcopy(start_state)
-        st.setdefault("projectionOrientation", [0.0, 0.0, 0.0, 1.0])
-        for k in ("position", "projectionScale", "crossSectionScale", "segments"):
-            if k not in st:
-                raise ValueError(f"reset state missing required field {k!r}")
-        self._json_state = st
+    def default_state(self) -> dict[str, Any]:
+        return ngl_state_from_viewer(self._base_state)
+
+    def warm(self, state: dict[str, Any]) -> None:
+        """Start the next episode's mesh and tile fetches now."""
+        if self._renderer is None:
+            return
+        try:
+            rid = self._first_segment(state)
+            mesh_fut = (None if rid is None or self._renderer.has_mesh(rid)
+                        else self._tile_pool().submit(worker_mesh, self.source, rid))
+            tiles = self._submit_tile_group(state["position"], state["crossSectionScale"])
+        except Exception as e:
+            logger.warning("reset-ahead prefetch submit failed (%s)", e)
+            return
+        self._prefetch = {"state": state, "mesh_fut": mesh_fut, "tiles": tiles}
+
+    def reset_to(self, state: dict[str, Any] | str) -> None:
+        if isinstance(state, str):
+            state = ngl_state_from_viewer(split_state_url(state)[1])
+        st = S.coerce(state)
+        self.open()
+        pf = self._prefetch
+        self._prefetch = None
+        if pf is not None and pf["state"] != st:
+            pf = None  # warmed something else; pay the cold path
+        self._state = st
         self._tile_key = None
         self._coarse_pending = None
         # Cancel, don't just drop: an abandoned mesh fetch would keep a pool
@@ -406,100 +290,95 @@ class NativeEnvironment(gym.Env):
             self._warm_fut = None
         self._steps = 0
         # RANDOM mode: one latency draw per episode, so an episode has a
-        # consistent "network speed" rather than per-step jitter.
-        self._adopt_delay = (int(self._rng.integers(0, 5))
-                             if self._pane_mode == "random" else 0)
+        # consistent "network speed" rather than per-step jitter. Seeded from
+        # the state itself, so a seeded eval replays the same draw for the
+        # same episode without the renderer needing the environment's rng.
+        self._adopt_delay = 0
+        if self.pane_mode == "random":
+            seed = hash((tuple(st["position"]), tuple(st["segments"]))) & 0xFFFFFFFF
+            self._adopt_delay = int(np.random.default_rng(seed).integers(0, 5))
 
-        _vis = self._seg_key(st["segments"])
-        rid = _vis[0] if _vis else str(st["segments"][0]).lstrip("!")
-        if self._service is not None and pf is not None:
-            pass  # service caches were warmed by the prefetch RPC
-        elif self._service is None:
-            if not self._renderer.has_mesh(rid):
-                v = vn = f = None
-                if pf is not None and pf.get("mesh_fut") is not None:
-                    try:
-                        v, vn, f = pf["mesh_fut"].result(timeout=240)
-                    except Exception as e:
-                        logger.warning("prefetched mesh failed (%s); inline fetch", e)
-                        v = None
-                if v is None:
-                    v, f = self._meshes.get(rid)
-                    vn = None
-                self._renderer.load_mesh(rid, v, f, normals=vn)
-            # A reset state may already carry several selected segments; only
-            # the first one has a prefetched mesh.
-            self._ensure_meshes(st["segments"], block=True)
+        rid = self._first_segment(st)
+        if rid is not None and not self._renderer.has_mesh(rid):
+            v = vn = f = None
+            if pf is not None and pf.get("mesh_fut") is not None:
+                try:
+                    v, vn, f = pf["mesh_fut"].result(timeout=240)
+                except Exception as e:
+                    logger.warning("prefetched mesh failed (%s); inline fetch", e)
+                    v = None
+            if v is None:
+                v, f = self._meshes.get(rid)
+                vn = None
+            self._renderer.load_mesh(rid, v, f, normals=vn)
+        # A reset state may already carry several selected segments; only
+        # the first one has a prefetched mesh.
+        self._ensure_meshes(st["segments"], block=True)
         if pf is not None and pf.get("tiles") is not None:
-            # Adopt the prefetched tile group; the blocking gather below
-            # resolves it (usually already done).
+            # Adopt the prefetched tile group; the blocking observe resolves
+            # it (usually already done).
             self._pending = pf["tiles"]
-        if pf is not None and pf.get("visual_fut") is not None:
-            # Adopt the pre-fetched canvas+plane for the service-mode gather.
-            self._svc_fut = pf["visual_fut"]
-            self._svc_futkey = self._tile_state_key()
+        self._block_next = True
 
-        obs = self._gather_observation(block_tiles=True)
-        self._prev_obs = obs
-        # Only provider-driven resets prefetch: an explicit-state reset
-        # (eval) must not consume provider rng draws for episodes that will
-        # never run.
-        if self.reset_ahead and seed is None and not options:
-            self._schedule_prefetch()
-        return obs, {"task_info": task_info, "json_state": copy.deepcopy(st), "step": 0}
+    def set_state(self, state: dict[str, Any]) -> None:
+        self._state = S.coerce(state)
 
-    def step(self, action):
-        self._steps += 1
-        action_type = int(action["action_type"])
-        if action_type == 0:
-            # mousedown0 is a DRAG binding on both panes -- translate on the
-            # slice view, rotate on the perspective view
-            # (default_input_event_bindings.ts) -- so a click with no drag
-            # applies a zero delta and the browser env's left_click is a state
-            # no-op too. Accepted, not rejected, so both backends take the
-            # identical action space.
-            pass
-        elif action_type in (1, 2):
-            self._apply_click(action)
-        elif action_type == 3:
-            self._apply_state_edit(action)
+    def click(self, kind: str, x: float, y: float, modifiers: str) -> None:
+        """NG bindings on a rendered data panel (default_input_event_bindings):
+        `at:mousedown0` (left_click) -> a DRAG binding, so a click with no
+        drag is a state no-op on both panes; `at:mousedown2` (right_click) ->
+        move-to-mouse-position; `at:dblclick0` (double_click) -> select.
+        Background = no-op. Modifiers are accepted for signature parity with
+        Chrome and ignored: no default binding on these events uses them."""
+        if kind == "left_click":
+            return
+        if y < PANEL_TOP_CLICK:
+            return
+        st = self._state
+        if kind == "double_click":
+            rid = (self._segment_under_3d(x, y) if x >= CSS_PANE
+                   else self._segment_under_2d(x, y))
+            if rid is not None:
+                self._state = S.toggle_select(st, rid)
+            return
+        if kind != "right_click":
+            raise ValueError(f"unknown click kind {kind!r}")
+        if x >= CSS_PANE:
+            hit = self._pick_3d_world(x, y)
+            if hit is not None:
+                self._state = S.move_to(st, hit)
         else:
-            raise NotImplementedError(
-                f"action_type must be 0, 1, 2, or 3; got {action_type}")
+            # 2D xy slice: orthographic -- clicked point maps linearly to the
+            # z-plane at crossSectionScale canonical units per CSS px, about
+            # the PANEL centre in click coordinates (see pane2d).
+            xs = float(st["crossSectionScale"])
+            self._state = S.move_to(st, [
+                st["position"][0] + (x - PANEL_CX_CLICK) * xs,
+                st["position"][1] + (y - PANEL_CY_CLICK) * xs,
+                st["position"][2]])
 
-        obs = self._gather_observation()
-        try:
-            terminated = bool(self._terminated_fn(obs, action, self._prev_obs))
-        except Exception as e:
-            raise ProviderError(f"termination_function raised: {e}") from e
-        try:
-            reward = float(self._reward_fn(obs, action, self._prev_obs, terminated))
-        except Exception as e:
-            raise ProviderError(f"reward_function raised: {e}") from e
+    def observe(self) -> tuple[dict[str, Any], np.ndarray]:
+        block = self._block_next
+        self._block_next = False
+        if not block:
+            self._steps += 1
+        return copy.deepcopy(self._state), self._render(block_tiles=block)
 
-        info = {"task_info": self._task_info,
-                "json_state": copy.deepcopy(self._json_state)}
-        self._prev_obs = obs
-        return obs, reward, terminated, False, info
+    @property
+    def state(self) -> dict[str, Any] | None:
+        """The state currently rendered from (a copy)."""
+        return copy.deepcopy(self._state)
 
-    def close(self):
-        # The class-level tile pool outlives individual envs on purpose
-        # (shared by the process's env fleet; reaped at interpreter exit).
-        self._pending = None
-        self._prefetch = None
-        if self._renderer is not None:
-            self._renderer.close()
-            self._renderer = None
-        self._meshes = None
+    @staticmethod
+    def _first_segment(state: dict[str, Any]) -> str | None:
+        """The segment whose mesh a reset needs first: the first VISIBLE one,
+        else the first listed (hidden), else none."""
+        vis = S.visible_segments(state["segments"])
+        if vis:
+            return vis[0]
+        return str(state["segments"][0]).lstrip("!") if state["segments"] else None
 
-    # ------------------------------------------------------------------ internals
-
-    # One fetch pool per PROCESS, shared by all envs in it (a runner hosts
-    # 16 threaded envs): GIL-isolates chunk download/decode and dedupes the
-    # workers' chunk LRUs across envs. Spawn context — fork would inherit
-    # CUDA/EGL state.
-    _TILE_POOLS: list | None = None
-    _POOL_SEQ: int = 0
+    # ------------------------------------------------------------------ pools
 
     @classmethod
     def _pools(cls) -> list:
@@ -523,8 +402,7 @@ class NativeEnvironment(gym.Env):
             n = max(1, int(os.environ.get("NGL_NATIVE_FETCH_WORKERS", "6")))
             cls._TILE_POOLS = [
                 ProcessPoolExecutor(
-                    max_workers=1,
-                    mp_context=multiprocessing.get_context("spawn"))
+                    max_workers=1, mp_context=multiprocessing.get_context("spawn"))
                 for _ in range(n)]
         return cls._TILE_POOLS
 
@@ -532,101 +410,23 @@ class NativeEnvironment(gym.Env):
         pools = self._pools()
         return pools[self._pool_shard % len(pools)]
 
-    def _ensure_backends(self) -> None:
-        if self._service_factory is not None:
-            if self._service is None:
-                self._service = self._service_factory()
-            return
-        if self._renderer is None:
-            self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget)
-            logger.info("native renderer GL: %s",
-                        self._renderer.ctx.info["GL_RENDERER"])
-        if self._meshes is None:
-            self._meshes = MeshStore(self._cache_dir)
-
-    def _resolve_reset_state(self, options: dict[str, Any]):
-        if "state" in options:
-            start_state = options["state"]
-            if "task_info" in options:
-                task_info = options["task_info"]
-            elif self._reset_state_provider is not None:
-                try:
-                    task_info = self._reset_state_provider.task_info_from_state(start_state)
-                except Exception as e:
-                    raise ProviderError(f"provider.task_info_from_state raised: {e}") from e
-            else:
-                task_info = {}
-            return start_state, task_info
-        if self._reset_state_provider is not None:
-            try:
-                return self._reset_state_provider(self._rng, options)
-            except Exception as e:
-                raise ProviderError(f"reset_state_provider raised: {e}") from e
-        return None, {}
-
-    # ---- actions
-
-    def _apply_click(self, action: dict[str, Any]) -> None:
-        """NG bindings on a rendered data panel (default_input_event_bindings):
-        `at:mousedown2` -> move-to-mouse-position (action_type 1),
-        `at:dblclick0`  -> select (action_type 2). Background = no-op."""
-        x_css, y_css = (float(v) for v in action["mouse_xy"])
-        st = self._json_state
-        if int(action.get("action_type", 1)) == 2:
-            self._apply_select(x_css, y_css)
-            return
-        if x_css >= CSS_PANE:
-            self._click_3d(x_css, y_css)
-        else:
-            # 2D xy slice: orthographic — clicked point maps linearly to the
-            # z-plane at crossSectionScale canonical (4nm) units per CSS px,
-            # about the PANEL centre in click coordinates (see pane2d).
-            if y_css < PANEL_TOP_CLICK:
-                return
-            xs = float(st["crossSectionScale"])
-            st["position"][0] += (x_css - PANEL_CX_CLICK) * xs
-            st["position"][1] += (y_css - PANEL_CY_CLICK) * xs
-
-    def _apply_select(self, x_css: float, y_css: float) -> None:
-        """NG `select`: toggle the segment under the cursor in/out of the
-        selected set. Both panes follow automatically -- _render_right reads
-        st["segments"] each frame and the 2D tile key includes the selection,
-        so the mesh loads and the label tint refreshes without extra plumbing.
-        """
-        if y_css < PANEL_TOP_CLICK:
-            return
-        rid = (self._segment_under_3d(x_css, y_css) if x_css >= CSS_PANE
-               else self._segment_under_2d(x_css, y_css))
-        if rid is None:
-            return                      # clicked background: NG selects nothing
-        # Toggle VISIBILITY, NG-style: a hidden segment stays in the list
-        # under a "!" prefix (it is still *selected*), and re-selecting it
-        # unhides it rather than appending a duplicate.
-        segs = [str(s) for s in self._json_state["segments"]]
-        rid_s = str(rid)
-        if rid_s in segs:
-            segs[segs.index(rid_s)] = "!" + rid_s          # visible -> hidden
-        elif "!" + rid_s in segs:
-            segs[segs.index("!" + rid_s)] = rid_s          # hidden -> visible
-        else:
-            segs.append(rid_s)                             # newly selected
-        self._json_state["segments"] = segs
+    # ------------------------------------------------------------------ picking
 
     def _segment_under_2d(self, x_css: float, y_css: float):
         """Segment id under a 2D-pane pixel via a point query on the
         segmentation volume, at the SAME mip the pane displays (label_tile
         uses extent/out_px) so a pick agrees with the tint that is drawn."""
-        st = self._json_state
+        st = self._state
         xs = float(st["crossSectionScale"])
         world = [st["position"][0] + (x_css - PANEL_CX_CLICK) * xs,
                  st["position"][1] + (y_css - PANEL_CY_CLICK) * xs,
                  st["position"][2]]
         # NG picks against the slice it RENDERS, which is the CSS-resolution
         # pane (900 px wide), not the downscaled capture -- so the pick mip is
-        # 4*xs nm/px, one step finer than label_tile's capture-sized tile.
-        res_nm = xs * 4.0
+        # canonical*xs nm/px, one step finer than label_tile's capture-sized tile.
+        res_nm = xs * self._canonical_nm
         return self._pick_em_tiles().segment_at(
-            np.asarray(world, dtype=np.float64) * VOXEL_NM, res_nm)
+            np.asarray(world, dtype=np.float64) * self._voxel_nm, res_nm)
 
     def _segment_under_3d(self, x_css: float, y_css: float):
         """Segment id under a 3D-pane pixel: the front-most SELECTED mesh at
@@ -637,25 +437,16 @@ class NativeEnvironment(gym.Env):
         the hit lies ON a mesh surface, where a single-voxel lookup easily
         lands in the neighbouring segment or in background.
         """
-        if self._service is not None:
-            world = self._service.pick(
-                self._json_state,
-                int(round(x_css * self.capture_scale - PANE)),
-                int(round(y_css * self.capture_scale - TOOLBAR)))
-            if world is None:
-                return None
-            return self._pick_em_tiles().segment_at(
-                np.asarray(world, dtype=np.float64) * VOXEL_NM)
-        st = self._json_state
-        ix = int(round(x_css * self.capture_scale - PANE))
-        iy = int(round(y_css * self.capture_scale - TOOLBAR))
+        st = self._state
+        ix = int(round(x_css * self.layout.capture_scale - PANE))
+        iy = int(round(y_css * self.layout.capture_scale - TOOLBAR))
         if not (0 <= ix < PANE and 0 <= iy < PANE_H):
             return None
-        ids = self._seg_key(st["segments"])
+        ids = S.visible_segments(st["segments"])
         if not ids:
             return None
         self._ensure_meshes(ids)   # non-blocking: pick what has arrived
-        pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
+        pos_nm = np.asarray(st["position"], dtype=np.float64) * self._voxel_nm
         zoom_nm = float(st["projectionScale"]) * SCALE_CAL_NM
         best, best_d = None, 0.9999
         for rid in ids:
@@ -672,22 +463,17 @@ class NativeEnvironment(gym.Env):
     def _pick_em_tiles(self):
         """EMTiles handle for client-side point queries (selecting is rare, so
         this deliberately does not go through the fetch pool)."""
-        if getattr(self, "_pick_em", None) is None:
+        if self._pick_em is None:
             from .em import EMTiles
-            self._pick_em = EMTiles(self._cache_dir)
-        return self._pick_em
 
-    def _click_3d(self, x_css: float, y_css: float) -> None:
-        """NG right-click on the 3D pane: move-to-mouse-position."""
-        hit = self._pick_3d_world(x_css, y_css)
-        if hit is not None:
-            self._json_state["position"] = [float(v) for v in hit]
+            self._pick_em = EMTiles(self.source)
+        return self._pick_em
 
     def _pick_3d_world(self, x_css: float, y_css: float):
         """World point (voxels) under a 3D-pane pixel, or None for background.
 
-        Shared by move-to-mouse-position (action 1) and select (action 2) so
-        the two cannot drift on what "under the cursor" means.
+        Shared by move-to-mouse-position and select so the two cannot drift on
+        what "under the cursor" means.
 
         NOTE (2026-09-10): the `- TOOLBAR` below carries the same off-by-17-CSS-px
         error the 2D branch had before PANEL_*_CLICK -- the DOM measurement says
@@ -697,20 +483,15 @@ class NativeEnvironment(gym.Env):
         every 3D click lands and so alters every existing run, and unlike the 2D
         pick it has no measurement backing it yet. Fix behind its own gate.
         """
-        st = self._json_state
-        if self._service is not None:
-            ix = int(round(x_css * self.capture_scale - PANE))
-            iy = int(round(y_css * self.capture_scale - TOOLBAR))
-            return self._service.pick(st, ix, iy)
-        pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
+        st = self._state
+        pos_nm = np.asarray(st["position"], dtype=np.float64) * self._voxel_nm
         quat = st["projectionOrientation"]
         zoom_nm = float(st["projectionScale"]) * SCALE_CAL_NM
-        ext = self._pane_extents_nm()
+        ext = pane_extents_nm(st["crossSectionScale"], self._canonical_nm)
         depth, view, proj = self._renderer.pick_depth(
-            self._seg_key(st["segments"]), pos_nm, quat, zoom_nm,
-            plane_extent_nm=ext)
-        fx = x_css * self.capture_scale - PANE
-        fy = y_css * self.capture_scale - TOOLBAR
+            S.visible_segments(st["segments"]), pos_nm, quat, zoom_nm, plane_extent_nm=ext)
+        fx = x_css * self.layout.capture_scale - PANE
+        fy = y_css * self.layout.capture_scale - TOOLBAR
         ix, iy = int(round(fx)), int(round(fy))
         if not (0 <= ix < PANE and 0 <= iy < PANE_H):
             return None
@@ -730,56 +511,9 @@ class NativeEnvironment(gym.Env):
                         1 - 2 * (py + 0.5) / PANE_H,
                         2 * d - 1, 1.0])
         w = np.linalg.inv(proj @ view) @ ndc
-        return [float(v) for v in (w[:3] / w[3]) / VOXEL_NM]
+        return [float(v) for v in (w[:3] / w[3]) / self._voxel_nm]
 
-    def _apply_state_edit(self, action: dict[str, Any]) -> None:
-        """Bit-exact port of the browser env's `_apply_state_edit`."""
-        new_state = self._json_state
-        dpos = action["delta_pos"]
-        new_state["position"][0] += float(dpos[0])
-        new_state["position"][1] += float(dpos[1])
-        new_state["position"][2] += float(dpos[2])
-        new_state["crossSectionScale"] += float(action["delta_xs_scale"][0])
-
-        d = action["delta_orient"]
-        if self.orientation == "euler":
-            old_euler = quaternion_to_euler(new_state["projectionOrientation"])
-            new_state["projectionOrientation"] = euler_to_quaternion([
-                old_euler[0] + float(d[0]),
-                old_euler[1] + float(d[1]),
-                old_euler[2] + float(d[2]),
-            ])
-        else:
-            for i in range(4):
-                new_state["projectionOrientation"][i] += float(d[i])
-
-        # Floor at 1.0 (deviation from the browser arithmetic ONLY at the
-        # degenerate point): repeated zoom-ins can hit projectionScale == 0
-        # exactly (14000 - 7x2000), which makes the camera matrix singular
-        # here — Chrome just renders garbage and carries on.
-        new_state["projectionScale"] = max(1.0, min(
-            500_000,
-            new_state["projectionScale"] + float(action["delta_proj_scale"][0]),
-        ))
-
-    # ---- observation
-
-    def _pane_extents_nm(self) -> tuple[float, float]:
-        xs = float(self._json_state["crossSectionScale"])
-        return xs * CSS_PANE * 4.0, xs * CSS_VIEW_H * 4.0
-
-    @staticmethod
-    def _seg_key(segments):
-        """VISIBLE segments, as a stable hashable key.
-
-        NG keeps two sets (layer/segmentation/index.ts): `selectedSegments`,
-        everything in the list, and `visibleSegments`, the subset that is
-        drawn. `select` (dblclick0) toggles VISIBILITY, and a selected-but-
-        hidden segment serializes as "!<id>" rather than being dropped. Only
-        the visible ones produce a 2D tint or a 3D mesh, so both the tile key
-        and every draw path key on this.
-        """
-        return tuple(str(s) for s in segments if not str(s).startswith("!"))
+    # ------------------------------------------------------------------ tiles
 
     def _tile_key_for(self, pos, xs):
         """GEOMETRY only -- deliberately not the selection.
@@ -790,176 +524,58 @@ class NativeEnvironment(gym.Env):
         full refetch per click.
         """
         return (round(pos[0], 2), round(pos[1], 2), round(pos[2], 2),
-                round(float(xs), 5), self.left_pane)
+                round(float(xs), 5), self.layout.left_pane)
 
     def _tile_state_key(self):
-        st = self._json_state
+        st = self._state
         return self._tile_key_for(st["position"], st["crossSectionScale"])
 
     def _submit_tile_group(self, pos, xs, stage: str = "fine") -> tuple:
-        """(key, futs, ext, stage) for an arbitrary state — used for the
+        """(key, futs, ext, stage, t0) for an arbitrary state -- used for the
         current state and for reset-ahead prefetch. stage='coarse' fetches
         the fast low-mip untinted preview; 'fine' the full tile."""
-        pos_nm = np.asarray(pos, dtype=np.float64) * VOXEL_NM
-        ext = (float(xs) * CSS_PANE * 4.0, float(xs) * CSS_VIEW_H * 4.0)
+        pos_nm = np.asarray(pos, dtype=np.float64) * self._voxel_nm
+        ext = pane_extents_nm(xs, self._canonical_nm)
         pool = self._tile_pool()
-        cd = self._cache_dir
-        if self.left_pane:
-            # ONE combined job, not three (2026-09-03). Submitting plane +
-            # left + label separately needs TWO waves through the default
-            # NGL_NATIVE_FETCH_WORKERS=2 pool, so `all(f.done())` was
-            # essentially never true within a step and the 2D pane NEVER
-            # refreshed: probe_obs_equivalence measured LOCAL fresh=0/40 vs
-            # SERVICE fresh=8/40, and the local-mode policy scored 81.0% on
-            # Chrome vs service's 90.5% (paired p=0.0019). worker_visuals
-            # does the same fetches in one call (shared chunk LRU) and
-            # returns the COMPOSED canvas, which _render_left uses directly.
-            # Pixel-identical: the service path already composes via
-            # pane2d.compose_left and probe_obs_equivalence measures
-            # l2rel=0.0000 / cos=1.0000 against local's inline _render_left.
-            mx = self._coarse_px if stage == "coarse" else self._fine_px
+        src = self.source
+        mx = self._coarse_px if stage == "coarse" else self._fine_px
+        if self.layout.left_pane:
             # TWO jobs, run in PARALLEL, adopted independently. They read
             # different volumes and share no chunks -- 0.84 s for the EM half
             # and 0.92 s for the ids -- so running them back to back made the
             # 2D pane wait 1.77 s for 0.92 s of work (probe_parts_breakdown).
             # The plane stays with the EM tile: it reuses those chunks and
-            # costs 0.01 s there against 0.84 s anywhere else.
+            # costs 0.01 s there against 0.84 s anywhere else. Two jobs fit one
+            # wave through a 2-worker pool; the three-way split that preceded
+            # this needed two and left the pane never refreshing (1ee8cef).
             if self._parallel_parts:
-                futs = {"emplane": pool.submit(
-                    worker_em_plane, cd, list(pos), float(xs), mx)}
+                futs = {"emplane": pool.submit(worker_em_plane, src, list(pos), float(xs), mx)}
                 if stage != "coarse":
-                    futs["ids"] = pool.submit(
-                        worker_ids, cd, list(pos), float(xs))
+                    futs["ids"] = pool.submit(worker_ids, src, list(pos), float(xs))
             else:
                 # NGL_NATIVE_PARALLEL_PARTS=0: the old single bundled job, kept
                 # so the split can be A/B'd on identical states rather than
                 # argued from the fetch timings alone.
                 futs = {"parts": pool.submit(
-                    worker_pane_parts, cd, list(pos), float(xs), mx,
-                    stage != "coarse")}
+                    worker_pane_parts, src, list(pos), float(xs), mx, stage != "coarse")}
         else:
-            mx = self._coarse_px if stage == "coarse" else self._fine_px
-            futs = {"plane": pool.submit(
-                worker_tile, cd, pos_nm, ext[0], ext[1], mx, False)}
-        return (self._tile_key_for(pos, xs), futs, ext, stage,
-                time.monotonic())
+            futs = {"plane": pool.submit(worker_tile, src, pos_nm, ext[0], ext[1], mx, False)}
+        return (self._tile_key_for(pos, xs), futs, ext, stage, time.monotonic())
 
-    def _submit_tile_fetch(self, key, stage: str = "fine"):
-        st = self._json_state
-        self._pending = self._submit_tile_group(
-            st["position"], st["crossSectionScale"], stage)
-
-    def _submit_visuals(self, state):
-        """Future of (canvas, plane_tile). One worker job for both when the
-        2D pane is on (they share EM chunks). With the 2D pane OFF we fetch
-        ONLY the section-plane tile - no canvas compose, no label cutout."""
-        if not self.left_pane:
-            pos_nm = np.asarray(state["position"], dtype=np.float64) * VOXEL_NM
-            xs = float(state["crossSectionScale"])
-            ext = (xs * CSS_PANE * 4.0, xs * CSS_VIEW_H * 4.0)
-            fut = self._tile_pool().submit(
-                worker_tile, self._cache_dir, pos_nm, ext[0], ext[1], 1024, False)
-            return _PlaneOnly(fut)
-        return self._tile_pool().submit(
-            worker_pane_parts, self._cache_dir, list(state["position"]),
-            float(state["crossSectionScale"]))
-
-    def _service_visuals(self, block: bool):
-        """(canvas, plane_tile) when they changed (else (None, None) ->
-        service reuses the last set). Stale-tolerant like local-mode tiles.
-
-        ONE fetch in flight at a time, always allowed to finish: resubmitting
-        on every key change starved the pool under click-heavy stepping (a
-        fetch takes ~1s, clicks land every few tens of ms), leaving the 2D
-        pane stale 85% of steps — measured by probe_obs_equivalence.py.
-        Local mode never had this because _fetch_tiles keeps its pending
-        group; this mirrors that.
-
-        The cached PARTS are recomposed whenever the selection changes, so a
-        click re-tints without a fetch here too.
-        """
-        key = (self._tile_state_key(), self._seg_key(self._json_state["segments"]))
-        if key == self._svc_key:
-            return None, None
-        if self._svc_parts is not None and key[0] == self._svc_key[0]:
-            # Same geometry, different selection: re-tint what we already have.
-            self._svc_key = key
-            em_gray, ids, plane = self._svc_parts
-            return compose_left_parts(em_gray, ids, key[1]), plane
-        if self._svc_fut is not None:
-            if not (block or self._svc_fut.done()):
-                return None, None  # let it land; do NOT resubmit
-            parts = None
-            try:
-                em_gray, ids_packed, plane = self._svc_fut.result(timeout=180)
-                parts = (em_gray, unpack_ids(ids_packed), plane)
-            except Exception as e:
-                logger.warning("client visuals failed (%s); stale", e)
-            landed_key, self._svc_fut = self._svc_futkey, None
-            if parts is not None and parts[0] is not None:
-                # Ship it even if the state moved on: a canvas one step
-                # behind beats an arbitrarily old one, and the next step
-                # submits for the then-current key.
-                self._svc_parts = parts
-                vis = self._seg_key(self._json_state["segments"])
-                self._svc_key = (landed_key, vis)
-                return compose_left_parts(parts[0], parts[1], vis), parts[2]
-            return None, None
-        self._svc_fut = self._submit_visuals(self._json_state)
-        self._svc_futkey = key[0]
-        if block:
-            return self._service_visuals(block=True)
-        return None, None
-
-    def _schedule_prefetch(self) -> None:
-        """Pre-draw the next episode and start its mesh/tile fetches."""
-        if self._reset_state_provider is None or self._prefetch is not None:
-            return
-        try:
-            state, task_info = self._reset_state_provider(self._rng, {})
-        except Exception as e:
-            logger.warning("reset-ahead pre-sample failed (%s)", e)
-            return
-        if self._service is not None:
-            # Warm the service's mesh cache and pre-compose the next
-            # episode's canvas client-side, so the reset blocks on neither.
-            try:
-                self._service.warm(state)
-            except Exception as e:
-                logger.warning("service warm failed (%s)", e)
-            self._prefetch = {"state": state, "task_info": task_info,
-                              "mesh_fut": None, "tiles": None,
-                              "visual_fut": self._submit_visuals(state)}
-            return
-        try:
-            vis = self._seg_key(state["segments"])
-            rid = vis[0] if vis else str(state["segments"][0]).lstrip("!")
-            mesh_fut = (None if self._renderer.has_mesh(rid)
-                        else self._tile_pool().submit(
-                            worker_mesh, self._cache_dir, rid))
-            tiles = self._submit_tile_group(
-                state["position"], state["crossSectionScale"])
-        except Exception as e:
-            logger.warning("reset-ahead prefetch submit failed (%s)", e)
-            mesh_fut, tiles = None, None
-        if tiles is None:
-            return
-        self._prefetch = {"state": state, "task_info": task_info,
-                          "mesh_fut": mesh_fut, "tiles": tiles}
+    def _submit_tile_fetch(self, stage: str = "fine"):
+        st = self._state
+        self._pending = self._submit_tile_group(st["position"], st["crossSectionScale"], stage)
 
     def _adopt_pending(self, timeout_s: float = 180.0) -> None:
         self._adopt_group(*self._pending, timeout_s=timeout_s)
         self._pending = None
 
-    def _adopt_group(self, key, futs, ext, stage, t0=None,
-                     timeout_s: float = 180.0) -> None:
-        tiles: dict[str, Any] = {"ext": ext, "plane": None, "em": None,
-                                 "ids": None}
+    def _adopt_group(self, key, futs, ext, stage, t0=None, timeout_s: float = 180.0) -> None:
+        tiles: dict[str, Any] = {"ext": ext, "plane": None, "em": None, "ids": None}
         for name, fut in futs.items():
             try:
                 if name == "parts":
-                    em_gray, ids_packed, tiles["plane"] = fut.result(
-                        timeout=timeout_s)
+                    em_gray, ids_packed, tiles["plane"] = fut.result(timeout=timeout_s)
                     tiles["em"] = em_gray
                     tiles["ids"] = unpack_ids(ids_packed)
                 elif name == "emplane":
@@ -975,33 +591,28 @@ class NativeEnvironment(gym.Env):
         self._tile_key, self._tiles = key, tiles
         self._tile_stage = stage
         if t0 is not None:
-            # submit -> on screen for the 2D pane. The per-verb probe runs ONE
-            # env, where pool sharding gives it a private worker; this is how
-            # the same latency is read at production density, where several
-            # envs share a shard and thrash each other's chunk LRU.
-            logger.info("tiles %s on screen after %.2fs", stage,
-                        time.monotonic() - t0)
+            # submit -> on screen for the 2D pane, readable at production
+            # density where several envs share a shard.
+            logger.info("tiles %s on screen after %.2fs", stage, time.monotonic() - t0)
         self._schedule_warm()
 
     def _schedule_warm(self) -> None:
-        """Pull the region AROUND the pane into the workers' chunk caches.
+        """Pull the region AROUND the pane into the worker's chunk cache.
 
         A move's cost is almost all new edge chunks: 0.20 s for a 15% move
         cold, 0.03 s once a 1.6x region is resident (probe_tile_locality). This
         buys that without touching a pixel -- the pane is still produced by the
-        exact fetch, and the warm job's output is discarded.
-
-        One in flight at a time, and never in place of a real fetch: warming
-        must not compete with the tiles the pane is actually waiting on.
+        exact fetch, and the warm job's output is discarded. One in flight at a
+        time, and never in place of a real fetch.
         """
-        if self._warm_factor <= 1.0 or self._service is not None:
+        if self._warm_factor <= 1.0:
             return
         if self._warm_fut is not None and not self._warm_fut.done():
             return
-        st = self._json_state
+        st = self._state
         try:
             self._warm_fut = self._tile_pool().submit(
-                worker_warm, self._cache_dir, list(st["position"]),
+                worker_warm, self.source, list(st["position"]),
                 float(st["crossSectionScale"]), self._warm_factor)
         except Exception as e:  # noqa: BLE001
             logger.warning("warm submit failed (%s)", e)
@@ -1009,7 +620,7 @@ class NativeEnvironment(gym.Env):
     def _fetch_tiles(self, block: bool) -> dict[str, Any]:
         """Tiles for the current state. block=True (reset) waits for exact
         tiles; block=False (step) returns the last completed set while the
-        fetch streams in — see the pipeline note in __init__."""
+        fetch streams in -- see the pipeline note in __init__."""
         key = self._tile_state_key()
         # Drain a finished fetch FIRST, whatever else happens: it refreshes the
         # plane and adds its region to the cache, and leaving it pending would
@@ -1030,7 +641,7 @@ class NativeEnvironment(gym.Env):
                 self._adopt_pending()  # drain before the exact fetch
             else:
                 return self._tiles  # keep rendering stale; let it land
-        mode = self._pane_mode
+        mode = self.pane_mode
         # CONCURRENT: a coarse companion fetch runs ALONGSIDE the fine one
         # (Neuroglancer's filterVisibleSources yields every scale at once),
         # so the preview does not delay the full tile the way the sequential
@@ -1044,11 +655,10 @@ class NativeEnvironment(gym.Env):
                     self._adopt_group(ck, cfuts, cext, cstage, ct0)
                 self._coarse_pending = None
         if self._pending is None:
-            stage = "fine" if (block or mode in ("atomic", "random",
-                                                 "concurrent")) else "coarse"
-            self._submit_tile_fetch(key, stage)
+            stage = "fine" if (block or mode in ("atomic", "random", "concurrent")) else "coarse"
+            self._submit_tile_fetch(stage)
             if mode == "concurrent" and not block:
-                st = self._json_state
+                st = self._state
                 self._coarse_pending = self._submit_tile_group(
                     st["position"], st["crossSectionScale"], "coarse")
         if block or all(f.done() for f in self._pending[1].values()):
@@ -1064,34 +674,10 @@ class NativeEnvironment(gym.Env):
             self._adopt_pending()
             if (not block and mode == "progressive"
                     and self._tile_key == key and self._tile_stage == "coarse"):
-                self._submit_tile_fetch(key, "fine")
+                self._submit_tile_fetch("fine")
         return self._tiles
 
-    def _render_left(self, tiles: dict[str, Any]) -> np.ndarray:
-        """2D xy EM pane, composed from the cached raster + id map.
-
-        Memoized on the VISIBLE SET, not just on the tiles: a selection change
-        re-tints from data already in hand, with no fetch, which is what
-        Neuroglancer does. The EM resample (the priciest per-step CPU) already
-        happened in the fetch worker, so this is a mask-and-blend.
-        """
-        vis = self._seg_key(self._json_state["segments"])
-        cached = tiles.get("left_canvas")
-        if cached is not None and tiles.get("left_vis") == vis:
-            return cached
-        canvas = compose_left_parts(tiles.get("em"), tiles.get("ids"), vis)
-        tiles["left_canvas"], tiles["left_vis"] = canvas, vis
-        return canvas
-
-    # Coarse level requested first; MeshStore.get walks down to whatever the
-    # segment actually has. NG streams meshes the same way.
-    #
-    # 1, not 2, even though 2 is coarser: the walk-down costs a failed
-    # round-trip when a level is absent, and segments vary (measured ranges
-    # 0..1 and 0..2). Requesting lod<=2 measured 0.52 s against lod<=1 at
-    # 0.44 s -- asking for the coarsest level available anywhere is slower on
-    # average than asking for one every segment has.
-    MESH_COARSE_LOD = 1
+    # ------------------------------------------------------------------ meshes
 
     def _ensure_meshes(self, segments, block: bool = False) -> None:
         """Make selected segments' meshes resident, STREAMING like Chrome:
@@ -1111,9 +697,7 @@ class NativeEnvironment(gym.Env):
         goes straight to the full mesh: the first observation has to be
         complete, and Chrome has likewise settled before an episode starts.
         """
-        if self._service is not None:
-            return
-        for rid in self._seg_key(segments):
+        for rid in S.visible_segments(segments):
             if rid in self._mesh_futs or (self._renderer.has_mesh(rid)
                                           and rid not in self._mesh_fine):
                 continue
@@ -1122,12 +706,8 @@ class NativeEnvironment(gym.Env):
             lod = 0 if (block or rid in self._mesh_fine) else self.MESH_COARSE_LOD
             try:
                 self._mesh_futs[rid] = (lod, self._tile_pool().submit(
-                    worker_mesh, self._cache_dir, rid, lod))
+                    worker_mesh, self.source, rid, lod))
                 self._mesh_due[rid] = self._steps + self._mesh_lag
-                # submit -> on screen, which is what the policy actually waits
-                # for. The isolated coarse fetch is 0.44 s but the 3D pane
-                # responds in >41 steps, so the gap is somewhere in the path
-                # rather than the download; this says where.
                 self._mesh_t0[rid] = (time.monotonic(), self._steps)
             except Exception as e:  # noqa: BLE001
                 logger.warning("mesh submit for %s failed (%s)", rid, e)
@@ -1142,12 +722,10 @@ class NativeEnvironment(gym.Env):
             t0 = self._mesh_t0.pop(rid, None)
             if t0 is not None:
                 logger.info("mesh %s lod%d on screen after %.2fs / %d steps",
-                            rid, lod, time.monotonic() - t0[0],
-                            self._steps - t0[1])
+                            rid, lod, time.monotonic() - t0[0], self._steps - t0[1])
             try:
                 v, vn, f = fut.result(timeout=240 if block else None)
-                self._renderer.load_mesh(rid, v, f, normals=vn,
-                                         replace=lod == 0)
+                self._renderer.load_mesh(rid, v, f, normals=vn, replace=lod == 0)
             except Exception as e:  # noqa: BLE001
                 logger.warning("mesh fetch for segment %s failed (%s)", rid, e)
                 continue
@@ -1157,12 +735,30 @@ class NativeEnvironment(gym.Env):
                 # Coarse level is on screen; queue the refinement.
                 self._mesh_fine.add(rid)
 
+    # ------------------------------------------------------------------ frames
+
+    def _render_left(self, tiles: dict[str, Any]) -> np.ndarray:
+        """2D xy EM pane, composed from the cached raster + id map.
+
+        Memoized on the VISIBLE SET, not just on the tiles: a selection change
+        re-tints from data already in hand, with no fetch, which is what
+        Neuroglancer does. The EM resample (the priciest per-step CPU) already
+        happened in the fetch worker, so this is a mask-and-blend.
+        """
+        vis = S.visible_segments(self._state["segments"])
+        cached = tiles.get("left_canvas")
+        if cached is not None and tiles.get("left_vis") == vis:
+            return cached
+        canvas = compose_left_parts(tiles.get("em"), tiles.get("ids"), vis)
+        tiles["left_canvas"], tiles["left_vis"] = canvas, vis
+        return canvas
+
     def _render_right(self, tiles: dict[str, Any]) -> np.ndarray:
-        st = self._json_state
-        ids = self._seg_key(st["segments"])
+        st = self._state
+        ids = S.visible_segments(st["segments"])
         # A segment selected mid-episode (double-click) has no mesh yet.
         self._ensure_meshes(ids)
-        pos_nm = np.asarray(st["position"], dtype=np.float64) * VOXEL_NM
+        pos_nm = np.asarray(st["position"], dtype=np.float64) * self._voxel_nm
         plane = tiles["plane"]
         if plane is not None and tiles.get("ids") is not None:
             key = ("plane_rgb", ids)
@@ -1182,49 +778,11 @@ class NativeEnvironment(gym.Env):
         out[TOOLBAR:] = pane
         return out
 
-    def _gather_observation(self, block_tiles: bool = False) -> dict[str, Any]:
-        st = self._json_state
-        if self._service is not None:
-            canvas, plane = self._service_visuals(block=block_tiles)
-            feats = self._service.features(self._client_id, st, canvas, plane,
-                                          with_left=self.left_pane)
-            orient_raw = st["projectionOrientation"]
-            orient = (np.asarray(quaternion_to_euler(orient_raw), dtype=np.float32)
-                      if self.orientation == "euler"
-                      else np.asarray(orient_raw, dtype=np.float32))
-            return {
-                "position": np.asarray(st["position"], dtype=np.float32),
-                "xs_scale": np.asarray([st["crossSectionScale"]], dtype=np.float32),
-                "orientation": orient,
-                "proj_scale": np.asarray([st["projectionScale"]], dtype=np.float32),
-                "image_features": np.asarray(feats, dtype=np.float32),
-            }
+    def _render(self, block_tiles: bool) -> np.ndarray:
         tiles = self._fetch_tiles(block=block_tiles)
         panes = []
-        if self.left_pane:
+        if self.layout.left_pane:
             panes.append(self._render_left(tiles))
-        if self.right_pane:
+        if self.layout.right_pane:
             panes.append(self._render_right(tiles))
-        image = panes[0] if len(panes) == 1 else np.concatenate(panes, axis=1)
-        if self.mask_ui and image.shape[:2] == (PANE, 2 * PANE):
-            # Blank what Chrome draws as UI, so the two backends cannot be
-            # told apart by it. Guarded on the exact capture shape the regions
-            # were measured against, and applied BEFORE any resize -- the same
-            # order the browser backend uses, or the two would diverge again
-            # whenever image_size is set.
-            image = mask_ui(image)
-        if self.image_size is not None:
-            image = np.asarray(Image.fromarray(image).resize(self.image_size))
-
-        orient_raw = st["projectionOrientation"]
-        if self.orientation == "euler":
-            orient = np.asarray(quaternion_to_euler(orient_raw), dtype=np.float32)
-        else:
-            orient = np.asarray(orient_raw, dtype=np.float32)
-        return {
-            "position": np.asarray(st["position"], dtype=np.float32),
-            "xs_scale": np.asarray([st["crossSectionScale"]], dtype=np.float32),
-            "orientation": orient,
-            "proj_scale": np.asarray([st["projectionScale"]], dtype=np.float32),
-            "image": image,
-        }
+        return panes[0] if len(panes) == 1 else np.concatenate(panes, axis=1)

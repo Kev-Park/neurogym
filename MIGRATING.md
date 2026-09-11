@@ -1,3 +1,28 @@
+# Migrating from 0.2 → 0.3 (the renderer seam)
+
+0.3 splits `Environment` into the env contract and a pluggable `Renderer`.
+No deprecation shim is provided; the edits are mechanical:
+
+| 0.2 | 0.3 |
+|---|---|
+| `Environment(headless=..., renderer=..., window_size=..., capture_scale=..., image_size=..., left_pane=..., right_pane=..., screenshot_format=..., retry_on_reset=..., browser_restart_every=..., ..., config_path=...)` | `Environment(backend=ChromeRenderer(<those kwargs>), ...)` |
+| `Environment(orientation=..., reset_state_provider=..., reward_factory=..., termination_factory=..., reset_ahead=..., reset_ahead_after_steps=..., verbose=...)` | unchanged -- these stay on `Environment` |
+| `ngllib.native.environment.NativeEnvironment(...)` | `Environment(backend=ngllib.simulator.SimulatorRenderer(...))` |
+| `NativeEnvironment(render_service=..., service_feature_dim=...)` | removed with the render service (the env exposes one observation contract, `image`) |
+| `NGL_NATIVE_PANE_MODE` env var | `SimulatorRenderer(pane_mode=...)` |
+| `draw_mouse=` | removed (it never did anything) |
+| `info["json_state"]` = Chrome's full viewer JSON | the five-field `NglState` on both backends (`position`, `crossSectionScale`, `projectionOrientation`, `projectionScale`, `segments`) |
+| `except BrowserError` | still works; it now subclasses `RendererError`, which is all the env itself raises through |
+
+Two state semantics changed deliberately, on both backends, to match what
+Neuroglancer does (`ngllib.state`): the orientation quaternion is normalized
+after every edit, and a `projectionScale` edit that would go to zero or
+below keeps the previous value instead of the simulator's old `max(1.0, ...)`
+floor or Chrome's old failed navigation.
+
+`Environment()` with no arguments still builds a Chrome env with every default
+it had before.
+
 # Migrating from 0.1 → 0.2
 
 `ngllib` 0.2 is a **hard breaking release** — the public surface was rewritten
@@ -40,12 +65,14 @@ env.end_session()
 ```python
 # 0.2
 env = Environment(
-    headless=True,
+    backend=ChromeRenderer(                  # renderer-level settings (0.3: the seam)
+        headless=True,
+        screenshot_format="jpeg",            # was: start_session(fast=True)
+        left_pane=False, right_pane=True,    # was: start_session(left_pane=..., right_pane=...)
+        # config_path defaults to the packaged config.json -- no need to pass one
+    ),
     orientation="euler",                 # was: start_session(euler_angles=True)
-    screenshot_format="jpeg",            # was: start_session(fast=True)
-    left_pane=False, right_pane=True,    # was: start_session(left_pane=..., right_pane=...)
     reward_factory=make_reward,          # see "Reward & termination" below
-    # config_path defaults to the packaged config.json — no need to pass one
 )
 obs, info = env.reset(seed=0)            # lazy-launches the browser here
 # ...
@@ -238,7 +265,7 @@ state, reward, done, info = client.send_actions(action_vec)
 from ngllib import Environment
 from ngllib.distributed.serve import serve
 from ngllib.distributed.transports import SocketTransport
-serve(Environment(headless=True, ...), SocketTransport.server(host="0.0.0.0", port=5555))
+serve(Environment(backend=ChromeRenderer(headless=True), ...), SocketTransport.server(host="0.0.0.0", port=5555))
 
 # 0.2: client side
 from ngllib import RemoteEnv

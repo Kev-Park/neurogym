@@ -1,13 +1,20 @@
 # ngllib
 
 `ngllib` is a [Gymnasium](https://gymnasium.farama.org/)-compliant RL environment
-that drives [Neuroglancer](https://github.com/google/neuroglancer) (a web-based
-3D connectomics viewer) through [Playwright](https://playwright.dev/python/)
-browser automation. Every `step` dispatches a mouse / keyboard / viewer-state
-action to a live (optionally headless) Neuroglancer session and returns the
-resulting viewer state plus a screenshot as a structured Dict observation.
+over a [Neuroglancer](https://github.com/google/neuroglancer) viewer (a web-based
+3D connectomics viewer). Every `step` applies a mouse / viewer-state action and
+returns the resulting viewer state plus a rendered frame as a structured Dict
+observation. Rendering is pluggable -- one `Environment`, two backends that
+differ in pixels and nothing else:
 
-Same `Environment` class works in two modes:
+- **`ChromeRenderer`** (default): a live, optionally headless Neuroglancer
+  session driven through [Playwright](https://playwright.dev/python/). The
+  deployment target, and therefore normative for what a state or a click means.
+- **`SimulatorRenderer`**: the same panes produced from the data directly
+  (CloudVolume + moderngl/EGL), no browser. Several times the throughput per
+  node; calibrated pixel-level against Chrome (see `ngllib.simulator`).
+
+Either backend works in two modes:
 
 - **Direct** (single process): standard `gym.Env`; the browser lives in your
   Python process.
@@ -50,7 +57,7 @@ PLAYWRIGHT_BROWSERS_PATH=/path/to/scratch playwright install chromium
 import numpy as np
 from ngllib import Environment
 
-env = Environment(headless=True, orientation="euler")
+env = Environment(orientation="euler")            # Chrome, today's defaults
 obs, info = env.reset(seed=0)
 
 # Edit-state action: pan +10 in X, rotate 0.2 rad around X, zoom out.
@@ -69,11 +76,22 @@ for _ in range(5):
 env.close()
 ```
 
+Renderer options live on the renderer; the simulator is a one-line swap:
+
+```python
+from ngllib import ChromeRenderer, SimulatorRenderer
+
+env = Environment(backend=ChromeRenderer(headless=True, capture_scale=0.5,
+                                         left_pane=True, right_pane=True))
+env = Environment(backend=SimulatorRenderer(left_pane=True, pane_mode="atomic"),
+                  orientation="euler", reset_ahead=True)
+```
+
 Or via `gymnasium.make` (auto-wraps with `TimeLimit`):
 
 ```python
 import gymnasium as gym
-env = gym.make("Neuroglancer-v0", headless=True, max_episode_steps=300)
+env = gym.make("Neuroglancer-v0", backend=SimulatorRenderer(), max_episode_steps=300)
 ```
 
 See [`main.py`](main.py) for a fuller example that saves screenshots.
@@ -93,7 +111,7 @@ from ngllib import Environment
 from ngllib.distributed.serve import serve
 from ngllib.distributed.transports import SocketTransport
 
-env = Environment(headless=True, orientation="euler")
+env = Environment(orientation="euler")
 serve(env, SocketTransport.server(host="0.0.0.0", port=5555))
 ```
 
@@ -116,18 +134,21 @@ client/server pairs over both transports.
 
 ## Configuration
 
-`Environment` reads a tiny JSON config (default URL, credentials slots) that's
-packaged inside the wheel. Most settings are explicit constructor kwargs, not
-config-file fields — `headless`, `renderer`, `window_size`, `image_size`,
-`orientation`, `left_pane` / `right_pane`, `retry_on_reset`,
-`browser_restart_every`, the task hooks (`reset_state_provider`,
-`reward_factory`, `termination_factory`), etc. See the `Environment.__init__`
-signature for the full list.
+The renderers read a tiny JSON config (the start URL, credentials slots) that's
+packaged inside the wheel. The start URL is the deployment identity: its viewer
+state is the default start state, and the dataset it declares (`DatasetSpec`:
+EM and segmentation sources, voxel size) is what BOTH backends render, so they
+can never silently show two datasets. Everything else is an explicit constructor
+kwarg: `Environment` takes the env-level settings (`orientation`, the task hooks
+`reset_state_provider` / `reward_factory` / `termination_factory`, `reset_ahead`),
+the renderer takes the pixel-level ones (`window_size`, `capture_scale`,
+`image_size`, `left_pane` / `right_pane`, and for Chrome `headless`, `renderer`,
+`retry_on_reset`, `browser_restart_every`, ...). See each `__init__` signature.
 
 To override the deployment defaults (URL, credentials) supply your own file:
 
 ```python
-env = Environment(headless=True, config_path="my_config.json")
+env = Environment(backend=ChromeRenderer(config_path="my_config.json"))
 ```
 
 The `google_email_address` / `google_password` fields are blank in the shipped
@@ -136,7 +157,7 @@ default and only used when you actually need a logged-in Neuroglancer session.
 
 ## Headless rendering
 
-When `headless=True`, `Environment._build_launch_args()` selects a GL backend
+When `headless=True`, `ChromeRenderer._build_launch_args()` selects a GL backend
 per OS (ANGLE + D3D11 on Windows, Metal on macOS, Vulkan on Linux), falling
 back to SwiftShader software rendering when constructed with `renderer="cpu"`.
 This is what keeps headless screenshots from coming out blank without a

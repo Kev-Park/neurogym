@@ -1,17 +1,18 @@
-"""ngllib.native — browser-free Neuroglancer-equivalent rendering (spike).
+"""ngllib.simulator — browser-free Neuroglancer-equivalent rendering.
 
 Replaces the Playwright+Chrome render path with direct data access
 (CloudVolume: precomputed EM cutouts + sharded Draco meshes) and offscreen
-GPU rendering (moderngl + EGL), eliminating the JPEG encode/decode round
-trip. Visual parity targets the exact Neuroglancer semantics ported in
-`colors` (segment color hash) and `camera` (projection-pane camera model);
-parity is validated pixel-level against browser captures of identical
-states (see neurogym-agent native/ collection tooling).
+GPU rendering (moderngl + EGL). Visual parity targets the exact Neuroglancer
+semantics ported in `colors` (segment colour hash) and `camera` (projection-
+pane camera model), validated pixel-level against Chrome captures of
+identical states (neurogym-agent `native/` probes).
 
-Status: exploration branch (native-renderer); not part of the ngllib API.
+`SimulatorRenderer` is the `ngllib.Environment` backend; the heavy imports
+(moderngl, cloud-volume) happen when it is opened, not here.
 """
 
-from .colors import segment_color
 from .camera import projection_camera
+from .colors import segment_color
+from .renderer import PANE_MODES, SimulatorRenderer
 
-__all__ = ["segment_color", "projection_camera"]
+__all__ = ["SimulatorRenderer", "PANE_MODES", "segment_color", "projection_camera"]

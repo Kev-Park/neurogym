@@ -1,18 +1,43 @@
-"""CloudVolume access for the native renderer: EM z-slice tiles + label masks.
+"""CloudVolume access for the simulator: EM z-slice tiles, label masks, meshes.
 
 Promoted from the parity spike harness (neurogym-agent native/render_pairs.py)
 after the 2D-pane SSIM 0.898 / pixel-exact-registration result — the tile and
 filter chains here are calibrated against browser captures; change them only
 with a re-run of the parity harness.
+
+Which volumes, and what a voxel measures, come from the `DatasetSpec` parsed
+out of the start URL (`ngllib.dataset`) -- the same URL Chrome navigates to --
+so repointing it can no longer leave the simulator on a different dataset.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 from PIL import Image
 
-EM_URL = "precomputed://https://bossdb-open-data.s3.amazonaws.com/flywire/fafbv14"
-SEG_URL = "precomputed://gs://flywire_v141_m783"
+from ..dataset import DatasetSpec
+
+
+@dataclass(frozen=True)
+class Source:
+    """Where a fetch worker reads from: the dataset plus an optional LOCAL-disk
+    CloudVolume cache dir (None = no disk cache, the default; see EMTiles).
+    Hashable, so workers key their per-source handles on it."""
+
+    dataset: DatasetSpec
+    cache_dir: str | None = None
+
+    @property
+    def voxel_nm(self) -> np.ndarray:
+        return np.asarray(self.dataset.voxel_nm, dtype=np.float64)
+
+    @property
+    def canonical_nm(self) -> float:
+        """NG's canonical voxel: the finest display dimension (4 nm here).
+        crossSectionScale and projectionScale are in these units."""
+        return float(min(self.dataset.voxel_nm))
 
 
 class EMTiles:
@@ -30,16 +55,18 @@ class EMTiles:
     # decode (or worse, network), and the synchronous step blocks on it.
     LRU_BYTES = 256 << 20  # per volume handle; envs each hold a few handles
 
-    def __init__(self, cache_dir: str | None = None):
+    def __init__(self, source: Source):
         from cloudvolume import CloudVolume
 
+        self.source = source
+        self.dataset = source.dataset
         self._vols: dict = {}
         self._CloudVolume = CloudVolume
         # Disk cache DEFAULT OFF (2026-08-28): on bucket NFS the cache's
         # write-through metadata ops taxed every cold fetch 4-30x (measured:
         # EM tile 3-7s cached vs 0.8-1.4s uncached; mesh 10-40s vs 0.7s).
         # The in-RAM chunk LRU covers repeats; pass a LOCAL-disk dir only.
-        self._cache = cache_dir or False
+        self._cache = source.cache_dir or False
 
     def _open(self, url: str, **kw):
         base = dict(use_https=True, cache=self._cache, progress=False,
@@ -52,7 +79,7 @@ class EMTiles:
 
     def _vol(self, mip: int):
         if mip not in self._vols:
-            self._vols[mip] = self._open(EM_URL, mip=mip)
+            self._vols[mip] = self._open(self.dataset.em_url, mip=mip)
         return self._vols[mip]
 
     def _seg_vol(self, target_res_nm: float):
@@ -61,7 +88,7 @@ class EMTiles:
         for typical pane extents."""
         if "seg_scales" not in self._vols:
             try:
-                base = self._open(SEG_URL, agglomerate=False)
+                base = self._open(self.dataset.seg_url, agglomerate=False)
                 self._vols["seg_scales"] = [
                     s["resolution"][0] for s in base.info["scales"]]
                 self._vols[("seg", 0)] = base
@@ -78,7 +105,7 @@ class EMTiles:
                 break
         if ("seg", mip) not in self._vols:
             self._vols[("seg", mip)] = self._open(
-                SEG_URL, agglomerate=False, mip=mip)
+                self.dataset.seg_url, agglomerate=False, mip=mip)
         return self._vols[("seg", mip)]
 
     def _label_cutout(self, pos_nm, extent_x_nm, extent_y_nm, out_px):
@@ -191,7 +218,7 @@ class EMTiles:
         vol = self._vol(mip)
         fx, fy = pos_nm[0] / res, pos_nm[1] / res
         cx, cy = int(fx), int(fy)
-        z = int(pos_nm[2] / 40.0)
+        z = int(pos_nm[2] / self.dataset.voxel_nm[2])
         hx = int(extent_x_nm / res / 2)
         hy = int(extent_y_nm / res / 2)
         pad = 2 if subpixel else 0
@@ -209,30 +236,29 @@ class EMTiles:
 
 # ---------------------------------------------------------------------------
 # Process-pool fetch workers. Chunk download+decode is GIL-heavy (numpy
-# assembly, zlib) — done on threads it starves the env stepping threads
+# assembly, zlib) -- done on threads it starves the env stepping threads
 # (measured: M=8 aggregate DROPPED vs M=4). Each worker process holds one
-# EMTiles per cache_dir; a per-runner pool is shared by all its envs, so
-# the in-RAM chunk LRU also dedupes across envs.
+# EMTiles per Source; envs sharing a worker share its in-RAM chunk LRU.
 
 _WORKER_EM: dict = {}
 
 
-def _worker_em(cache_dir: str) -> EMTiles:
-    em = _WORKER_EM.get(cache_dir)
+def _worker_em(source: Source) -> EMTiles:
+    em = _WORKER_EM.get(source)
     if em is None:
-        em = _WORKER_EM[cache_dir] = EMTiles(cache_dir)
+        em = _WORKER_EM[source] = EMTiles(source)
     return em
 
 
-def worker_tile(cache_dir, pos_nm, extent_x_nm, extent_y_nm, max_px,
+def worker_tile(source, pos_nm, extent_x_nm, extent_y_nm, max_px,
                 subpixel):
-    return _worker_em(cache_dir).tile(
+    return _worker_em(source).tile(
         np.asarray(pos_nm), extent_x_nm, extent_y_nm, max_px, subpixel)
 
 
-def worker_label_tile(cache_dir, pos_nm, extent_x_nm, extent_y_nm, root_id,
+def worker_label_tile(source, pos_nm, extent_x_nm, extent_y_nm, root_id,
                       out_px):
-    return _worker_em(cache_dir).label_tile(
+    return _worker_em(source).label_tile(
         np.asarray(pos_nm), extent_x_nm, extent_y_nm, root_id, out_px)
 
 
@@ -260,7 +286,7 @@ def unpack_ids(payload):
     return uniq[idx]
 
 
-def worker_warm(cache_dir, pos, xs_scale, factor=1.6, max_px=1024):
+def worker_warm(source, pos, xs_scale, factor=1.6, max_px=1024):
     """Pull a region LARGER than the pane into this worker's chunk LRU, and
     throw the pixels away.
 
@@ -278,9 +304,9 @@ def worker_warm(cache_dir, pos, xs_scale, factor=1.6, max_px=1024):
     """
     from . import pane2d
 
-    em = _worker_em(cache_dir)
-    pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
-    ext = pane2d.pane_extents_nm(xs_scale)
+    em = _worker_em(source)
+    pos_nm = np.asarray(pos, dtype=np.float64) * source.voxel_nm
+    ext = pane2d.pane_extents_nm(xs_scale, source.canonical_nm)
     k = max(1.0, float(factor))
     try:
         em.tile(pos_nm, ext[0] * k, ext[1] * k, int(max_px * k), False)
@@ -291,7 +317,7 @@ def worker_warm(cache_dir, pos, xs_scale, factor=1.6, max_px=1024):
     return True
 
 
-def worker_em_plane(cache_dir, pos, xs_scale, max_px=1024):
+def worker_em_plane(source, pos, xs_scale, max_px=1024):
     """(EM raster, 3D plane tile) -- the EM half of the pane, on its own.
 
     Kept together deliberately: the plane is read at the unshifted centre but
@@ -301,16 +327,16 @@ def worker_em_plane(cache_dir, pos, xs_scale, max_px=1024):
     """
     from . import pane2d
 
-    em = _worker_em(cache_dir)
-    pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
-    ext = pane2d.pane_extents_nm(xs_scale)
+    em = _worker_em(source)
+    pos_nm = np.asarray(pos, dtype=np.float64) * source.voxel_nm
+    ext = pane2d.pane_extents_nm(xs_scale, source.canonical_nm)
     shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
     tile = em.tile(shifted, ext[0], ext[1], max_px, True)
     plane = em.tile(pos_nm, ext[0], ext[1], max_px, False)
     return pane2d.resample_em(tile), plane
 
 
-def worker_ids(cache_dir, pos, xs_scale):
+def worker_ids(source, pos, xs_scale):
     """Packed segmentation id map, on its own.
 
     Split from the EM read because it hits a DIFFERENT volume and shares no
@@ -319,15 +345,15 @@ def worker_ids(cache_dir, pos, xs_scale):
     """
     from . import pane2d
 
-    em = _worker_em(cache_dir)
-    pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
-    ext = pane2d.pane_extents_nm(xs_scale)
+    em = _worker_em(source)
+    pos_nm = np.asarray(pos, dtype=np.float64) * source.voxel_nm
+    ext = pane2d.pane_extents_nm(xs_scale, source.canonical_nm)
     shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
     return pack_ids(em.label_ids(shifted, ext[0], ext[1],
                                  (pane2d.PANE, pane2d.PANE_H)))
 
 
-def worker_pane_parts(cache_dir, pos, xs_scale, max_px=1024,
+def worker_pane_parts(source, pos, xs_scale, max_px=1024,
                       with_label=True):
     """(EM raster, packed id map, 3D section-plane tile) in ONE worker call:
     all three share the same EM chunks, so a single job reuses the in-worker
@@ -345,16 +371,16 @@ def worker_pane_parts(cache_dir, pos, xs_scale, max_px=1024,
     whose extent/res fits in max_px, so 256 fetches ~16x fewer voxels than
     1024 and lands proportionally sooner. `with_label=False` additionally
     skips the segmentation cutout. Together they make the cheap PREVIEW stage
-    of the progressive pipeline (see NativeEnvironment._fetch_tiles): Chrome
+    of the progressive pipeline (see SimulatorRenderer._fetch_tiles): Chrome
     streams coarse mips first and paints segmentation after the EM, so a
     blurry untinted preview of the RIGHT location is closer to it than a sharp
     view of the previous one.
     """
     from . import pane2d
 
-    em = _worker_em(cache_dir)
-    pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
-    ext = pane2d.pane_extents_nm(xs_scale)
+    em = _worker_em(source)
+    pos_nm = np.asarray(pos, dtype=np.float64) * source.voxel_nm
+    ext = pane2d.pane_extents_nm(xs_scale, source.canonical_nm)
     shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
     tile = em.tile(shifted, ext[0], ext[1], max_px, True)
     ids = (em.label_ids(shifted, ext[0], ext[1], (pane2d.PANE, pane2d.PANE_H))
@@ -363,15 +389,15 @@ def worker_pane_parts(cache_dir, pos, xs_scale, max_px=1024,
     return pane2d.resample_em(tile), pack_ids(ids), plane
 
 
-def worker_left_canvas(cache_dir, pos, xs_scale, root_id):
+def worker_left_canvas(source, pos, xs_scale, root_id):
     """Fully composed 2D pane canvas for a state, built inside the fetch
     worker (tile + label fetch AND the PIL chain — all off the GIL of the
     caller). pos in voxels."""
     from . import pane2d
 
-    em = _worker_em(cache_dir)
-    pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
-    ext = pane2d.pane_extents_nm(xs_scale)
+    em = _worker_em(source)
+    pos_nm = np.asarray(pos, dtype=np.float64) * source.voxel_nm
+    ext = pane2d.pane_extents_nm(xs_scale, source.canonical_nm)
     shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
     tile = em.tile(shifted, ext[0], ext[1], 1024, True)
     label = em.label_tile(shifted, ext[0], ext[1], root_id,
@@ -382,16 +408,16 @@ def worker_left_canvas(cache_dir, pos, xs_scale, root_id):
 _WORKER_MESHES: dict = {}
 
 
-def worker_mesh(cache_dir: str, root_id: str, lod: int = 0):
+def worker_mesh(source: Source, root_id: str, lod: int = 0):
     """Fetch + decode a mesh AND its smooth vertex normals in the worker
     process (reset-ahead prefetch): download/Draco/np.add.at are the ~30s
     reset tail, all GIL-heavy — none of it belongs on the env thread.
 
     `lod` requests a coarser level; see MeshStore.get. Returns
     (vertices_nm f4 [N,3], normals f4 [N,3], faces i4 [M,3])."""
-    store = _WORKER_MESHES.get(cache_dir)
+    store = _WORKER_MESHES.get(source)
     if store is None:
-        store = _WORKER_MESHES[cache_dir] = MeshStore(cache_dir)
+        store = _WORKER_MESHES[source] = MeshStore(source)
     v, f = store.get(root_id, lod)
     e1 = v[f[:, 1]] - v[f[:, 0]]
     e2 = v[f[:, 2]] - v[f[:, 0]]
@@ -426,15 +452,15 @@ class MeshStore:
 
     MESH_LRU_BYTES = 512 << 20
 
-    def __init__(self, cache_dir: str | None = None,
-                 lru_bytes: int | None = None):
+    def __init__(self, source: Source, lru_bytes: int | None = None):
         import os
         from collections import OrderedDict
 
         from cloudvolume import CloudVolume
 
-        self._vol = CloudVolume(SEG_URL, use_https=True,
-                                cache=cache_dir or False, progress=False)
+        self.source = source
+        self._vol = CloudVolume(source.dataset.seg_url, use_https=True,
+                                cache=source.cache_dir or False, progress=False)
         self._meshes: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = (
             OrderedDict())
         self._bytes = 0

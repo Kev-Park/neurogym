@@ -1,8 +1,17 @@
-"""Shared pane geometry/constants + the calibrated 2D-pane composition.
+"""Shared pane geometry, the calibrated constants, and the 2D-pane composition.
 
-Single source of truth for the capture geometry and calibrated constants
-(previously environment.py-local) so NativeEnvironment (local mode) and the
-per-node render service compose pixel-identical panes.
+Single source of truth for the capture geometry and every constant that was
+FITTED against Chrome rather than derived. Each one below names the
+measurement that fixes it; change any of them only with a parity re-run
+(gates 5 and 7 in renderer_seam_plan.md), and keep the freeze test in
+tests/test_calibration.py in step.
+
+All of it was measured on ONE dataset and ONE geometry (CALIBRATED_DATASET,
+window 1800x900 CSS at capture_scale 0.5). Analytic derivation was tried and
+refuted (plan step 3): the DOM says the panels are 853 CSS px at y=47, and
+that geometry scores 0.55/0.44/0.32/0.25 against the shipping 867/17/433 at
+0.861 -- the capture and click frames are genuinely different coordinate
+systems, both validated independently.
 """
 
 from __future__ import annotations
@@ -10,17 +19,37 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
+from ..dataset import DatasetSpec
 from .colors import segment_color
 
-VOXEL_NM = np.array([4.0, 4.0, 40.0])
-# Calibrated: nm per projectionScale unit (parity campaign).
+# The dataset every constant in this module was fitted on. The simulator warns
+# when it is pointed anywhere else: it will render, but no parity claim holds.
+CALIBRATED_DATASET = DatasetSpec(
+    em_url="precomputed://https://bossdb-open-data.s3.amazonaws.com/flywire/fafbv14",
+    seg_url="precomputed://gs://flywire_v141_m783",
+    voxel_nm=(4.0, 4.0, 40.0),
+)
+
+# nm per projectionScale unit. Fitted on 300 browser-collected calibration
+# pairs (2026-08-27; tolerance-IoU(2px) median 0.885) and re-confirmed by
+# sweep on 2026-09-10: 3.95 and 4.19 both score worse on mesh AND plane IoU.
+# The analytic base would be the 4.0 nm canonical voxel; the 1.75% residual
+# is real (perspective camera vs NG's orthographic unit definition) and
+# has not been derived, so the fitted value ships.
 SCALE_CAL_NM = 4.07
-# Calibrated: browser/native EM intensity ratio on grey 2D-pane pixels.
+# Chrome/simulator EM intensity ratio on grey 2D-pane pixels (2026-08-28,
+# re-confirmed optimal by probe_left_pane_parity 2026-09-10). Chrome's image
+# layer opacity 0.5 does NOT halve on-screen EM; ~1.0 is right.
 EM_GAIN = 0.978
-# Calibrated: baked 2D-pane fetch-center correction in captured px (dy, dx).
+# 2D-pane fetch-centre correction in captured px (dy, dx). Registration is
+# pixel-exact with it (jitter sd 0.0) and the 2026-09-10 shift search found
+# no better offset. Absorbs the ~1.6% vertical over-extent of CSS_VIEW_H.
 LEFT_SHIFT_PX = (-3.0, 0.0)
 
-# Capture geometry at capture_scale 0.5 (the calibrated configuration).
+# CAPTURE geometry at capture_scale 0.5. TOOLBAR/CSS_VIEW_H are empirical: the
+# DOM-derived alternatives (853-px panels at y=47) were tried on 2026-09-10 and
+# lose to these by a wide margin on the 2D pane (0.55-0.25 vs 0.861), so 867 is
+# right for the CAPTURE even though 853 is right for CLICKS (below).
 PANE = 450
 TOOLBAR = 17
 PANE_H = PANE - TOOLBAR
@@ -53,8 +82,12 @@ PANEL_CY_CLICK = PANEL_TOP_CLICK + PANEL_H_CLICK / 2.0   # 449.5
 PLANE_EXT_SCALE = 1.0
 
 
-def pane_extents_nm(xs_scale: float) -> tuple[float, float]:
-    return float(xs_scale) * CSS_PANE * 4.0, float(xs_scale) * CSS_VIEW_H * 4.0
+def pane_extents_nm(xs_scale: float, canonical_nm: float) -> tuple[float, float]:
+    """World extent (x, y) of the 2D pane: crossSectionScale canonical voxels
+    per CSS px, over the CSS pane. `canonical_nm` is the dataset's finest
+    display dimension (4.0 nm for FlyWire)."""
+    return (float(xs_scale) * CSS_PANE * canonical_nm,
+            float(xs_scale) * CSS_VIEW_H * canonical_nm)
 
 
 def shifted_fetch_center_nm(pos_nm: np.ndarray, ext: tuple[float, float]):
