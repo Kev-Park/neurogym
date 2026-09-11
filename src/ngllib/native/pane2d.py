@@ -207,6 +207,51 @@ def compose_left(tile, label_mask, root_id) -> np.ndarray:
     return canvas
 
 
+# Regions of the CAPTURE where Chrome draws UI and the simulator cannot.
+# Measured with probe_gap_map (per-block SSIM, 12 states): the toolbar strip
+# scores 0.010 against Chrome while the 2D interior scores 0.967 and the 3D
+# interior 1.000 -- so the frame's biggest disagreements are not the data at
+# all, they are chrome. For a policy reading both panes those are the most
+# dangerous kind of difference: constant, structured, in a fixed place, and
+# perfectly reliable as a "which environment am I in" cue right up until
+# deployment inverts it.
+#
+# Coordinates are captured px in the 900x450 two-pane frame (capture_scale 0.5).
+UI_REGIONS = (
+    # (y0, y1, x0, x1)
+    (0, 32, 0, 900),        # top strip: layer tabs, coordinate readout, icons
+    (0, 450, 0, 16),        # 2D pane left edge (disagrees at every row)
+    (416, 450, 0, 80),      # 2D pane scale bar ("750 nm")
+    (16, 48, 868, 900),     # 3D pane top-right buttons
+    (416, 450, 820, 900),   # 3D pane "Sections" control
+)
+
+
+def mask_ui_enabled() -> bool:
+    """NGL_MASK_UI=0 turns the mask off for both backends at once."""
+    import os
+
+    return os.environ.get("NGL_MASK_UI", "1") != "0"
+
+
+def mask_ui(image: np.ndarray) -> np.ndarray:
+    """Blank the regions where Chrome draws UI, in place, on a copy.
+
+    Applied to BOTH backends so neither carries a cue the other lacks. Masking
+    only Chrome would leave the simulator showing data where Chrome shows a
+    scale bar, which is the same problem mirrored.
+
+    This costs real pixels -- the top strip and the left edge are ~7% of a pane
+    -- but they are pixels the two renderers can never agree on, and a network
+    will find them long before it finds the neuron.
+    """
+    out = np.array(image, copy=True)
+    for y0, y1, x0, x1 in UI_REGIONS:
+        if y0 < out.shape[0] and x0 < out.shape[1]:
+            out[y0:min(y1, out.shape[0]), x0:min(x1, out.shape[1])] = 0
+    return out
+
+
 def paste_right(pane_below_toolbar: np.ndarray) -> np.ndarray:
     """3D pane (PANE_H x PANE) -> PANE x PANE canvas with toolbar strip."""
     out = np.zeros((PANE, PANE, 3), dtype=np.uint8)

@@ -71,6 +71,8 @@ from .pane2d import (  # noqa: E402
     TOOLBAR,
     VOXEL_NM,
     compose_left_parts,
+    mask_ui,
+    mask_ui_enabled,
     tint_plane,
 )
 
@@ -161,6 +163,13 @@ class NativeEnvironment(gym.Env):
         self.left_pane = left_pane
         self.right_pane = right_pane
         self.capture_scale = capture_scale
+        # NGL_MASK_UI=0 disables it for BOTH backends. On by default: Chrome draws a toolbar,
+        # a scale bar and pane buttons inside the capture that no renderer can
+        # reproduce, and probe_gap_map measured the toolbar strip at 0.010
+        # block_ssim against Chrome while the 2D interior scores 0.967 -- the
+        # frame's worst disagreements are UI, not data, and a policy would key
+        # on them long before the neuron.
+        self.mask_ui = mask_ui_enabled()
         self.orientation = orientation
         # None = no CloudVolume disk cache (default; NFS caches tax cold
         # fetches 4-30x — see em.py). Pass a LOCAL-disk dir to opt in.
@@ -1194,6 +1203,11 @@ class NativeEnvironment(gym.Env):
         if self.right_pane:
             panes.append(self._render_right(tiles))
         image = panes[0] if len(panes) == 1 else np.concatenate(panes, axis=1)
+        if self.mask_ui and len(panes) == 2:
+            # Blank what Chrome draws as UI, so the two backends cannot be told
+            # apart by it. Only meaningful for the full two-pane capture the
+            # regions were measured against.
+            image = mask_ui(image)
         if self.image_size is not None:
             image = np.asarray(Image.fromarray(image).resize(self.image_size))
 

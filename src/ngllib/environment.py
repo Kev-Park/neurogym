@@ -1071,6 +1071,15 @@ class Environment(gym.Env):
             orient = np.asarray(orient_raw, dtype=np.float32)
         proj_scale = np.asarray([json_state["projectionScale"]], dtype=np.float32)
 
+        from .native.pane2d import mask_ui, mask_ui_enabled
+
+        if mask_ui_enabled() and image.ndim == 3 and image.shape[1] >= 900:
+            # Same mask the native backend applies, so a policy cannot tell the
+            # two apart by Chrome's toolbar, scale bar or pane buttons. Masking
+            # only ONE backend would leave the other showing data where this
+            # one shows chrome -- the same problem mirrored.
+            image = mask_ui(image)
+
         obs = {
             "position": position,
             "xs_scale": xs_scale,
