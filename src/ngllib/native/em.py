@@ -260,10 +260,40 @@ def unpack_ids(payload):
     return uniq[idx]
 
 
+def worker_warm(cache_dir, pos, xs_scale, factor=1.6, max_px=1024):
+    """Pull a region LARGER than the pane into this worker's chunk LRU, and
+    throw the pixels away.
+
+    Nothing rendered ever comes from here, which is the point: the pane is
+    still produced by the ordinary exact fetch, so the observation is
+    bit-identical. Only the cache state changes. Measured (probe_tile_locality):
+    a 15% move costs 0.20 s cold but 0.03 s -- resample only -- once a 1.6x
+    region has been pulled, because the move's cost is almost entirely new
+    EDGE chunks.
+
+    This is the opposite trade to cropping an overscanned raster, which was
+    just as fast but scored 0.7713 against Chrome where a direct fetch scores
+    0.8877: rounding the crop to whole raster pixels misregisters the grid by
+    about a pixel, and EM texture at membrane scale does not forgive it.
+    """
+    from . import pane2d
+
+    em = _worker_em(cache_dir)
+    pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
+    ext = pane2d.pane_extents_nm(xs_scale)
+    k = max(1.0, float(factor))
+    try:
+        em.tile(pos_nm, ext[0] * k, ext[1] * k, int(max_px * k), False)
+        em.label_ids(pos_nm, ext[0] * k, ext[1] * k,
+                     (int(pane2d.PANE * k), int(pane2d.PANE_H * k)))
+    except Exception:  # noqa: BLE001 - best effort; a miss just costs latency
+        pass
+    return True
+
+
 def worker_pane_parts(cache_dir, pos, xs_scale, max_px=1024,
-                      with_label=True, overscan=1.0):
-    """(EM raster, packed id map, plane tile, fetch centre, fetch extent) in
-    ONE worker call:
+                      with_label=True):
+    """(EM raster, packed id map, 3D section-plane tile) in ONE worker call:
     all three share the same EM chunks, so a single job reuses the in-worker
     chunk LRU and keeps the client to one pool dispatch per position change.
 
@@ -289,22 +319,11 @@ def worker_pane_parts(cache_dir, pos, xs_scale, max_px=1024,
     em = _worker_em(cache_dir)
     pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
     ext = pane2d.pane_extents_nm(xs_scale)
-    # Overscan: fetch a region LARGER than the pane, at the same nm-per-pixel
-    # (extent and max_px scale together, so the same mip is chosen). The client
-    # then re-crops it as the viewer moves instead of refetching, which is what
-    # Chrome's chunk cache does -- it re-renders a 200 px move instantly
-    # because it already holds the surrounding chunks, where we refetched and
-    # showed the old location for ~0.8 s (probe_action_dynamics, 883689).
-    k = max(1.0, float(overscan))
-    ext_big = (ext[0] * k, ext[1] * k)
-    shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
-    tile = em.tile(shifted, ext_big[0], ext_big[1], int(max_px * k), True)
-    ids = (em.label_ids(shifted, ext_big[0], ext_big[1],
-                        (int(pane2d.PANE * k), int(pane2d.PANE_H * k)))
+    tile = em.tile(shifted, ext[0], ext[1], max_px, True)
+    ids = (em.label_ids(shifted, ext[0], ext[1], (pane2d.PANE, pane2d.PANE_H))
            if with_label else None)
     plane = em.tile(pos_nm, ext[0], ext[1], max_px, False)
-    return (pane2d.resample_em(tile, k), pack_ids(ids), plane,
-            [float(v) for v in shifted], [float(v) for v in ext_big])
+    return pane2d.resample_em(tile), pack_ids(ids), plane
 
 
 def worker_left_canvas(cache_dir, pos, xs_scale, root_id):
