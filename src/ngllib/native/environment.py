@@ -206,8 +206,15 @@ class NativeEnvironment(gym.Env):
         # Fetched OVERSCANNED regions, newest last; the stand-in for Chrome's
         # chunk cache. NGL_NATIVE_TILE_OVERSCAN sizes each one (1.0 = off,
         # i.e. refetch on every move), NGL_NATIVE_TILE_CACHE how many are kept.
+        # DEFAULT OFF (1.0). Measured with overscan 1.5: a cropped pane scores
+        # block_ssim 0.7713 against the browser frame where a directly fetched
+        # one scores 0.8877 -- the cache would buy the dynamics fix at -0.12 of
+        # visual fidelity, which is not a trade worth making silently. The
+        # geometry is the cause: hx quantises to whole voxels and the crop
+        # offset to whole raster pixels, so the overscanned raster's pixel grid
+        # is about a pixel off the direct one.
         self._tile_overscan = float(
-            os.environ.get("NGL_NATIVE_TILE_OVERSCAN", "1.5"))
+            os.environ.get("NGL_NATIVE_TILE_OVERSCAN", "1.0"))
         self._tile_cache_n = int(os.environ.get("NGL_NATIVE_TILE_CACHE", "6"))
         self._tile_cache: OrderedDict[Any, Any] = OrderedDict()
         # Segments showing a COARSE mesh, still owed the full-resolution one.
