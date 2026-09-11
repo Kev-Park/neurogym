@@ -282,6 +282,14 @@ class Environment(gym.Env):
     def renderer(self) -> Renderer:
         return self._renderer
 
+    @property
+    def left_pane(self) -> bool:
+        return self._renderer.layout.left_pane
+
+    @property
+    def right_pane(self) -> bool:
+        return self._renderer.layout.right_pane
+
     def _build_observation_space(self) -> spaces.Dict:
         orient_dim = 3 if self.orientation == "euler" else 4
         return spaces.Dict(

@@ -39,6 +39,14 @@ class Source:
         crossSectionScale and projectionScale are in these units."""
         return float(min(self.dataset.voxel_nm))
 
+    @classmethod
+    def calibrated(cls, cache_dir: str | None = None) -> "Source":
+        """The dataset the parity constants were fitted on (pane2d) -- what the
+        calibration probes read."""
+        from .pane2d import CALIBRATED_DATASET
+
+        return cls(CALIBRATED_DATASET, cache_dir)
+
 
 class EMTiles:
     """z-slice tiles around a position from the public FlyWire EM volume.

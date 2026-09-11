@@ -29,6 +29,11 @@ CALIBRATED_DATASET = DatasetSpec(
     seg_url="precomputed://gs://flywire_v141_m783",
     voxel_nm=(4.0, 4.0, 40.0),
 )
+# The calibrated dataset's voxel size and canonical (finest) voxel, for the
+# calibration probes -- which are by definition about this dataset. The live
+# render path takes both from the DatasetSpec it was given (em.Source).
+VOXEL_NM = np.asarray(CALIBRATED_DATASET.voxel_nm)
+CANONICAL_NM = float(min(CALIBRATED_DATASET.voxel_nm))
 
 # nm per projectionScale unit. Fitted on 300 browser-collected calibration
 # pairs (2026-08-27; tolerance-IoU(2px) median 0.885) and re-confirmed by
@@ -82,7 +87,7 @@ PANEL_CY_CLICK = PANEL_TOP_CLICK + PANEL_H_CLICK / 2.0   # 449.5
 PLANE_EXT_SCALE = 1.0
 
 
-def pane_extents_nm(xs_scale: float, canonical_nm: float) -> tuple[float, float]:
+def pane_extents_nm(xs_scale: float, canonical_nm: float = CANONICAL_NM) -> tuple[float, float]:
     """World extent (x, y) of the 2D pane: crossSectionScale canonical voxels
     per CSS px, over the CSS pane. `canonical_nm` is the dataset's finest
     display dimension (4.0 nm for FlyWire)."""
