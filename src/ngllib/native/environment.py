@@ -831,7 +831,8 @@ class NativeEnvironment(gym.Env):
             mx = self._coarse_px if stage == "coarse" else self._fine_px
             futs = {"plane": pool.submit(
                 worker_tile, cd, pos_nm, ext[0], ext[1], mx, False)}
-        return (self._tile_key_for(pos, xs), futs, ext, stage)
+        return (self._tile_key_for(pos, xs), futs, ext, stage,
+                time.monotonic())
 
     def _submit_tile_fetch(self, key, stage: str = "fine"):
         st = self._json_state
@@ -940,7 +941,7 @@ class NativeEnvironment(gym.Env):
         self._adopt_group(*self._pending, timeout_s=timeout_s)
         self._pending = None
 
-    def _adopt_group(self, key, futs, ext, stage,
+    def _adopt_group(self, key, futs, ext, stage, t0=None,
                      timeout_s: float = 180.0) -> None:
         tiles: dict[str, Any] = {"ext": ext, "plane": None, "em": None,
                                  "ids": None}
@@ -963,6 +964,13 @@ class NativeEnvironment(gym.Env):
                 logger.warning("EM %s tile fetch failed (%s); skipped", name, e)
         self._tile_key, self._tiles = key, tiles
         self._tile_stage = stage
+        if t0 is not None:
+            # submit -> on screen for the 2D pane. The per-verb probe runs ONE
+            # env, where pool sharding gives it a private worker; this is how
+            # the same latency is read at production density, where several
+            # envs share a shard and thrash each other's chunk LRU.
+            logger.info("tiles %s on screen after %.2fs", stage,
+                        time.monotonic() - t0)
         self._schedule_warm()
 
     def _schedule_warm(self) -> None:
@@ -1018,12 +1026,12 @@ class NativeEnvironment(gym.Env):
         # so the preview does not delay the full tile the way the sequential
         # 'progressive' staging did.
         if mode == "concurrent" and not block and self._coarse_pending is not None:
-            ck, cfuts, cext, cstage = self._coarse_pending
+            ck, cfuts, cext, cstage, ct0 = self._coarse_pending
             if ck != key:
                 self._coarse_pending = None          # superseded; drop it
             elif all(f.done() for f in cfuts.values()):
                 if not (self._tile_key == key and self._tile_stage == "fine"):
-                    self._adopt_group(ck, cfuts, cext, cstage)
+                    self._adopt_group(ck, cfuts, cext, cstage, ct0)
                 self._coarse_pending = None
         if self._pending is None:
             stage = "fine" if (block or mode in ("atomic", "random",
