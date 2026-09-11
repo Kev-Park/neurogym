@@ -201,6 +201,22 @@ class NativeEnvironment(gym.Env):
         # 3D pane on whichever step its mesh lands, the way Chrome streams.
         self._mesh_futs: dict[str, Any] = {}
         self._mesh_due: dict[str, int] = {}
+        # Stage resolutions. Defaults are the shipping values; both are levers
+        # for an A/B the pane-mode campaign could not run, because mip
+        # selection is DISCRETE and it only ever tested the extremes.
+        # Measured against the browser frames (probe_mip_tradeoff):
+        #
+        #   max_px <=384   block_ssim 0.7394   sharpness 0.47x Chrome
+        #   max_px 512-768            0.8730             0.75x
+        #   max_px 1024               0.8877             0.86x
+        #
+        # 512 and 768 resolve to the SAME mip, as do 256 and 384 -- so there
+        # are three operating points, not five. The middle one keeps 98.3% of
+        # the shipping fidelity for roughly half the voxels, and `progressive`
+        # was measured with the BLURRIEST one (0.7394) when it cost 11pp. That
+        # verdict does not necessarily carry to a 0.8730 preview.
+        self._fine_px = int(os.environ.get("NGL_NATIVE_FINE_MAX_PX", "1024"))
+        self._coarse_px = int(os.environ.get("NGL_NATIVE_COARSE_MAX_PX", "256"))
         # Background chunk-cache warming: costs bandwidth, changes no pixel.
         self._warm_factor = float(
             os.environ.get("NGL_NATIVE_WARM_FACTOR", "1.6"))
@@ -758,12 +774,12 @@ class NativeEnvironment(gym.Env):
             # Pixel-identical: the service path already composes via
             # pane2d.compose_left and probe_obs_equivalence measures
             # l2rel=0.0000 / cos=1.0000 against local's inline _render_left.
-            mx = 256 if stage == "coarse" else 1024
+            mx = self._coarse_px if stage == "coarse" else self._fine_px
             futs = {"parts": pool.submit(
                 worker_pane_parts, cd, list(pos), float(xs), mx,
                 stage != "coarse")}
         else:
-            mx = 256 if stage == "coarse" else 1024
+            mx = self._coarse_px if stage == "coarse" else self._fine_px
             futs = {"plane": pool.submit(
                 worker_tile, cd, pos_nm, ext[0], ext[1], mx, False)}
         return (self._tile_key_for(pos, xs), futs, ext, stage)
