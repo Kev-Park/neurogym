@@ -45,6 +45,8 @@ from .em import (
     worker_mesh,
     worker_tile,
     unpack_ids,
+    worker_em_plane,
+    worker_ids,
     worker_pane_parts,
     worker_warm,
 )
@@ -775,9 +777,16 @@ class NativeEnvironment(gym.Env):
             # pane2d.compose_left and probe_obs_equivalence measures
             # l2rel=0.0000 / cos=1.0000 against local's inline _render_left.
             mx = self._coarse_px if stage == "coarse" else self._fine_px
-            futs = {"parts": pool.submit(
-                worker_pane_parts, cd, list(pos), float(xs), mx,
-                stage != "coarse")}
+            # TWO jobs, run in PARALLEL, adopted independently. They read
+            # different volumes and share no chunks -- 0.84 s for the EM half
+            # and 0.92 s for the ids -- so running them back to back made the
+            # 2D pane wait 1.77 s for 0.92 s of work (probe_parts_breakdown).
+            # The plane stays with the EM tile: it reuses those chunks and
+            # costs 0.01 s there against 0.84 s anywhere else.
+            futs = {"emplane": pool.submit(
+                worker_em_plane, cd, list(pos), float(xs), mx)}
+            if stage != "coarse":
+                futs["ids"] = pool.submit(worker_ids, cd, list(pos), float(xs))
         else:
             mx = self._coarse_px if stage == "coarse" else self._fine_px
             futs = {"plane": pool.submit(
@@ -897,12 +906,10 @@ class NativeEnvironment(gym.Env):
                                  "ids": None}
         for name, fut in futs.items():
             try:
-                if name == "parts":
-                    # (EM raster, packed id map, 3D section-plane tile)
-                    em_gray, ids_packed, tiles["plane"] = fut.result(
-                        timeout=timeout_s)
-                    tiles["em"] = em_gray
-                    tiles["ids"] = unpack_ids(ids_packed)
+                if name == "emplane":
+                    tiles["em"], tiles["plane"] = fut.result(timeout=timeout_s)
+                elif name == "ids":
+                    tiles["ids"] = unpack_ids(fut.result(timeout=timeout_s))
                 else:
                     tiles[name] = fut.result(timeout=timeout_s)
             except FuturesTimeout:

@@ -291,6 +291,42 @@ def worker_warm(cache_dir, pos, xs_scale, factor=1.6, max_px=1024):
     return True
 
 
+def worker_em_plane(cache_dir, pos, xs_scale, max_px=1024):
+    """(EM raster, 3D plane tile) -- the EM half of the pane, on its own.
+
+    Kept together deliberately: the plane is read at the unshifted centre but
+    from the SAME EM chunks the tile just pulled, so it costs 0.01 s here and
+    would cost a full 0.84 s in a worker that had not just read them
+    (probe_parts_breakdown).
+    """
+    from . import pane2d
+
+    em = _worker_em(cache_dir)
+    pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
+    ext = pane2d.pane_extents_nm(xs_scale)
+    shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
+    tile = em.tile(shifted, ext[0], ext[1], max_px, True)
+    plane = em.tile(pos_nm, ext[0], ext[1], max_px, False)
+    return pane2d.resample_em(tile), plane
+
+
+def worker_ids(cache_dir, pos, xs_scale):
+    """Packed segmentation id map, on its own.
+
+    Split from the EM read because it hits a DIFFERENT volume and shares no
+    chunks with it: measured 0.92 s against the EM tile's 0.84 s, and running
+    them back to back made the 2D pane wait 1.77 s for 0.92 s of work.
+    """
+    from . import pane2d
+
+    em = _worker_em(cache_dir)
+    pos_nm = np.asarray(pos, dtype=np.float64) * pane2d.VOXEL_NM
+    ext = pane2d.pane_extents_nm(xs_scale)
+    shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
+    return pack_ids(em.label_ids(shifted, ext[0], ext[1],
+                                 (pane2d.PANE, pane2d.PANE_H)))
+
+
 def worker_pane_parts(cache_dir, pos, xs_scale, max_px=1024,
                       with_label=True):
     """(EM raster, packed id map, 3D section-plane tile) in ONE worker call:
