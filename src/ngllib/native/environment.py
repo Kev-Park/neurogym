@@ -27,6 +27,7 @@ import copy
 import logging
 import multiprocessing
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Callable, Literal
@@ -203,6 +204,7 @@ class NativeEnvironment(gym.Env):
         # 3D pane on whichever step its mesh lands, the way Chrome streams.
         self._mesh_futs: dict[str, Any] = {}
         self._mesh_due: dict[str, int] = {}
+        self._mesh_t0: dict[str, tuple] = {}
         # Stage resolutions. Defaults are the shipping values; both are levers
         # for an A/B the pane-mode campaign could not run, because mip
         # selection is DISCRETE and it only ever tested the extremes.
@@ -382,6 +384,7 @@ class NativeEnvironment(gym.Env):
             fut.cancel()
         self._mesh_futs.clear()
         self._mesh_due.clear()
+        self._mesh_t0.clear()
         self._mesh_fine.clear()
         if self._warm_fut is not None:
             self._warm_fut.cancel()
@@ -1077,6 +1080,11 @@ class NativeEnvironment(gym.Env):
                 self._mesh_futs[rid] = (lod, self._tile_pool().submit(
                     worker_mesh, self._cache_dir, rid, lod))
                 self._mesh_due[rid] = self._steps + self._mesh_lag
+                # submit -> on screen, which is what the policy actually waits
+                # for. The isolated coarse fetch is 0.44 s but the 3D pane
+                # responds in >41 steps, so the gap is somewhere in the path
+                # rather than the download; this says where.
+                self._mesh_t0[rid] = (time.monotonic(), self._steps)
             except Exception as e:  # noqa: BLE001
                 logger.warning("mesh submit for %s failed (%s)", rid, e)
         for rid in list(self._mesh_futs):
@@ -1087,6 +1095,11 @@ class NativeEnvironment(gym.Env):
                 continue      # landed early; hold it to the modelled lag
             del self._mesh_futs[rid]
             self._mesh_due.pop(rid, None)
+            t0 = self._mesh_t0.pop(rid, None)
+            if t0 is not None:
+                logger.info("mesh %s lod%d on screen after %.2fs / %d steps",
+                            rid, lod, time.monotonic() - t0[0],
+                            self._steps - t0[1])
             try:
                 v, vn, f = fut.result(timeout=240 if block else None)
                 self._renderer.load_mesh(rid, v, f, normals=vn,
