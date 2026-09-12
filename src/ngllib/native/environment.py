@@ -144,7 +144,7 @@ class NativeEnvironment(gym.Env):
         reward_factory: Callable | None = None,
         termination_factory: Callable | None = None,
         cache_dir: str | None = None,
-        mesh_budget_bytes: int = 2 << 30,
+        mesh_budget_bytes: int | None = None,
         reset_ahead: bool = True,
         render_service: Callable[[], Any] | None = None,
         service_feature_dim: int = 384,

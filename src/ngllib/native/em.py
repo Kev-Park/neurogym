@@ -30,6 +30,22 @@ class EMTiles:
     # decode (or worse, network), and the synchronous step blocks on it.
     LRU_BYTES = 256 << 20  # per volume handle; envs each hold a few handles
 
+    @classmethod
+    def lru_bytes(cls) -> int:
+        """Per-handle chunk budget, sizable per node via NGL_NATIVE_CHUNK_LRU_MB.
+
+        The bound is per HANDLE and an EMTiles opens up to ~10 (one per EM mip
+        touched, one per seg scale); a runner carries one EMTiles per fetch
+        worker plus one for picking. So the node total is
+        handles x processes x this -- 64 runners x 2 envs x FW=2 reached
+        ~108 GB per GPU step within an hour (2026-09-12) and was cgroup-killed
+        with no traceback, while production 32x1 FW=1 runs a third of the
+        processes and never gets there. Size it as
+        host_RAM_MB / (processes_on_node x 10).
+        """
+        mb = os.environ.get("NGL_NATIVE_CHUNK_LRU_MB")
+        return (int(mb) << 20) if mb else cls.LRU_BYTES
+
     def __init__(self, cache_dir: str | None = None):
         from cloudvolume import CloudVolume
 
@@ -45,7 +61,7 @@ class EMTiles:
         base = dict(use_https=True, cache=self._cache, progress=False,
                     fill_missing=True, bounded=False)
         try:
-            return self._CloudVolume(url, lru_bytes=self.LRU_BYTES,
+            return self._CloudVolume(url, lru_bytes=self.lru_bytes(),
                                      **base, **kw)
         except TypeError:  # older cloud-volume without lru_bytes
             return self._CloudVolume(url, **base, **kw)

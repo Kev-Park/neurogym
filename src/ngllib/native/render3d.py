@@ -19,6 +19,7 @@ memory is statically bounded, no growth-until-restart.
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 
 import numpy as np
@@ -34,8 +35,28 @@ class MeshRenderer:
     the browser.
     """
 
+    VAO_BUDGET_BYTES = 2 << 30
+
+    @classmethod
+    def vao_budget_bytes(cls, requested: int | None = None) -> int:
+        """GPU-resident mesh budget for THIS process (NGL_NATIVE_VAO_LRU_MB).
+
+        One MeshRenderer per process, so the card carries processes x this.
+        The 2 GB default was sized for a lone renderer: at 24-32 runners per
+        3090 it is a 48-64 GB claim on a 24 GB card, and under random actions
+        (a new neuron every 300 steps, ~10 MB of VAO each) the caches filled
+        at ~1.2 GB/process/hour until the card was full (2026-09-12).
+        Production 32x1 survived only because a trained policy turns neurons
+        over far more slowly. Size it as (VRAM_MB - baseline) / processes_per_GPU;
+        ~200 MB still holds dozens of meshes for an env that shows one at a time.
+        """
+        if requested is not None:
+            return int(requested)
+        mb = os.environ.get("NGL_NATIVE_VAO_LRU_MB")
+        return (int(mb) << 20) if mb else cls.VAO_BUDGET_BYTES
+
     def __init__(self, width: int, height: int,
-                 mesh_budget_bytes: int = 2 << 30):
+                 mesh_budget_bytes: int | None = None):
         import moderngl
 
         self._moderngl = moderngl
@@ -99,7 +120,7 @@ class MeshRenderer:
         # LRU mesh VAOs: root_id -> (vao, [vbo, ibo], bytes)
         self._vaos: OrderedDict[str, tuple] = OrderedDict()
         self._vao_bytes = 0
-        self._budget = mesh_budget_bytes
+        self._budget = self.vao_budget_bytes(mesh_budget_bytes)
 
     def has_mesh(self, root_id: str) -> bool:
         return root_id in self._vaos
