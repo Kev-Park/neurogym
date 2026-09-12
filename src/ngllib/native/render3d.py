@@ -143,9 +143,12 @@ class MeshRenderer:
         # The per-mesh alloc/release LRU this replaces leaked ~half of every
         # evicted mesh to driver-side fragmentation (2026-09-12, see the
         # per-frame note above); eviction here is a dict pop, no GL call.
-        # The byte budget sets the slot COUNT; a trained policy shows one
-        # neuron at a time and only ever touches two or three slots.
-        self._n_slots = max(4, min(64, self._budget // self.SLOT_NOMINAL_BYTES))
+        # The byte budget sets the slot COUNT. Capacity floats with the
+        # largest mesh each slot has held (~95 MB average after 12 min of
+        # random neurons, 2026-09-12), so the count is what bounds VRAM:
+        # a trained policy shows one neuron at a time and needs 2-3 slots;
+        # evicting a still-selected mesh only costs an async refetch.
+        self._n_slots = max(2, min(64, self._budget // self.SLOT_NOMINAL_BYTES))
         self._slots: list[dict] = []          # created lazily, index = slot id
         # root_id -> (slot id, index count); insertion order is LRU order.
         self._vaos: OrderedDict[str, tuple[int, int]] = OrderedDict()
