@@ -135,11 +135,52 @@ class MeshRenderer:
         # EM plane textures, one per tile SHAPE ever seen (fine tile, coarse
         # tile, pick_depth's 2x2 dummy -- a handful per run), each rewritten.
         self._plane_tex: dict[tuple[int, int], object] = {}
-        self._vao_bytes = 0
         self._budget = self.vao_budget_bytes(mesh_budget_bytes)
+        # Mesh storage is a POOL OF SLOTS, not one allocation per mesh. A slot
+        # is a VBO + IBO + VAO created on first use and grown (orphaned) only
+        # when a mesh exceeds its capacity, so capacities are monotone and GL
+        # allocation events stay O(slots + growths) instead of O(episodes).
+        # The per-mesh alloc/release LRU this replaces leaked ~half of every
+        # evicted mesh to driver-side fragmentation (2026-09-12, see the
+        # per-frame note above); eviction here is a dict pop, no GL call.
+        # The byte budget sets the slot COUNT; a trained policy shows one
+        # neuron at a time and only ever touches two or three slots.
+        self._n_slots = max(4, min(64, self._budget // self.SLOT_NOMINAL_BYTES))
+        self._slots: list[dict] = []          # created lazily, index = slot id
+        # root_id -> (slot id, index count); insertion order is LRU order.
+        self._vaos: OrderedDict[str, tuple[int, int]] = OrderedDict()
+
+    SLOT_NOMINAL_BYTES = 32 << 20   # budget / this = slot count
+
+    @property
+    def _vao_bytes(self) -> int:
+        """Bytes of GL storage the slots currently hold (capacity, not use)."""
+        return sum(sl["vcap"] + sl["icap"] for sl in self._slots)
 
     def has_mesh(self, root_id: str) -> bool:
         return root_id in self._vaos
+
+    def _acquire_slot(self) -> int:
+        if len(self._slots) < self._n_slots:
+            vbo = self.ctx.buffer(reserve=1024)
+            ibo = self.ctx.buffer(reserve=1024)
+            vao = self.ctx.vertex_array(
+                self.prog, [(vbo, "3f 3f", "pos", "nrm")], index_buffer=ibo)
+            self._slots.append({"vbo": vbo, "ibo": ibo, "vao": vao,
+                                "vcap": 1024, "icap": 1024})
+            return len(self._slots) - 1
+        # Every slot holds a mesh: evict the least recently drawn.
+        _, (sid, _) = self._vaos.popitem(last=False)
+        return sid
+
+    def _fill_slot(self, sid: int, vdata: bytes, idata: bytes) -> None:
+        sl = self._slots[sid]
+        if len(vdata) > sl["vcap"]:
+            sl["vbo"].orphan(len(vdata)); sl["vcap"] = len(vdata)
+        if len(idata) > sl["icap"]:
+            sl["ibo"].orphan(len(idata)); sl["icap"] = len(idata)
+        sl["vbo"].write(vdata)
+        sl["ibo"].write(idata)
 
     def load_mesh(self, root_id: str, vertices_nm, faces,
                   normals=None, replace: bool = False) -> None:
@@ -150,15 +191,12 @@ class MeshRenderer:
         `replace=True` swaps an already-resident mesh, which is how the
         progressive path refines a coarse level once the fine one lands.
         """
+        sid = None
         if root_id in self._vaos:
             if not replace:
                 self._vaos.move_to_end(root_id)
                 return
-            old_vao, old_bufs, old_bytes = self._vaos.pop(root_id)
-            old_vao.release()
-            for b in old_bufs:
-                b.release()
-            self._vao_bytes -= old_bytes
+            sid, _ = self._vaos.pop(root_id)   # refine in place, same slot
         v = np.asarray(vertices_nm, dtype="f4")
         f = np.asarray(faces, dtype="i4")
         if normals is not None:
@@ -171,19 +209,11 @@ class MeshRenderer:
             for k in range(3):
                 np.add.at(vn, f[:, k], fn)
             vn /= (np.linalg.norm(vn, axis=1, keepdims=True) + 1e-9)
-        vbo = self.ctx.buffer(np.hstack([v, vn.astype("f4")]).tobytes())
-        ibo = self.ctx.buffer(f.tobytes())
-        vao = self.ctx.vertex_array(
-            self.prog, [(vbo, "3f 3f", "pos", "nrm")], index_buffer=ibo)
-        nbytes = vbo.size + ibo.size
-        self._vaos[root_id] = (vao, [vbo, ibo], nbytes)
-        self._vao_bytes += nbytes
-        while self._vao_bytes > self._budget and len(self._vaos) > 1:
-            _, (old_vao, old_bufs, old_bytes) = self._vaos.popitem(last=False)
-            old_vao.release()
-            for b in old_bufs:
-                b.release()
-            self._vao_bytes -= old_bytes
+        if sid is None:
+            sid = self._acquire_slot()
+        self._fill_slot(sid, np.hstack([v, vn.astype("f4")]).tobytes(),
+                        f.tobytes())
+        self._vaos[root_id] = (sid, int(f.size))
 
     @staticmethod
     def _as_ids(root_id):
@@ -201,8 +231,9 @@ class MeshRenderer:
             entry = self._vaos.get(rid)
             if entry is None:
                 continue
+            sid, n_idx = entry
             self.prog["color"].value = tuple(float(c) for c in colors[i])
-            entry[0].render(mode=4)
+            self._slots[sid]["vao"].render(mode=4, vertices=n_idx)
             self._vaos.move_to_end(rid)
 
     @staticmethod
