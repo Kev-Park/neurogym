@@ -119,6 +119,22 @@ class MeshRenderer:
         )
         # LRU mesh VAOs: root_id -> (vao, [vbo, ibo], bytes)
         self._vaos: OrderedDict[str, tuple] = OrderedDict()
+        # Per-frame geometry lives in FIXED buffers written in place. The
+        # plane quad, the axis lines and the EM texture used to be created and
+        # released on every step; the driver does not hand released VRAM back
+        # to the process (measured 2026-09-12: one env, torch allocator flat at
+        # 114 MiB and the mesh LRU bounded at 200 MiB, yet the process grew
+        # ~4.5 GB/h of GL memory -- alloc/free churn fragmenting the pool).
+        # A buffer that is only ever rewritten cannot fragment anything.
+        self._quad_vbo = self.ctx.buffer(reserve=4 * 5 * 4)
+        self._quad_vao = self.ctx.vertex_array(
+            self.plane_prog, [(self._quad_vbo, "3f 2f", "pos", "uv")])
+        self._line_vbo = self.ctx.buffer(reserve=6 * 7 * 4)
+        self._line_vao = self.ctx.vertex_array(
+            self.line_prog, [(self._line_vbo, "3f 4f", "pos", "col")])
+        # EM plane textures, one per tile SHAPE ever seen (fine tile, coarse
+        # tile, pick_depth's 2x2 dummy -- a handful per run), each rewritten.
+        self._plane_tex: dict[tuple[int, int], object] = {}
         self._vao_bytes = 0
         self._budget = self.vao_budget_bytes(mesh_budget_bytes)
 
@@ -207,14 +223,14 @@ class MeshRenderer:
 
     def _draw_plane(self, mvp_b, pos, em_tile, em_extent_nm, lfac):
         arr = np.ascontiguousarray(em_tile)
-        if arr.ndim == 3:
-            tex = self.ctx.texture((arr.shape[1], arr.shape[0]), 3,
-                                   arr.tobytes())
-        else:
+        if arr.ndim != 3:
             # Greyscale: replicate so one shader path serves both.
-            tex = self.ctx.texture((arr.shape[1], arr.shape[0]), 3,
-                                   np.repeat(arr[..., None], 3, axis=2)
-                                   .tobytes())
+            arr = np.ascontiguousarray(np.repeat(arr[..., None], 3, axis=2))
+        shape = (arr.shape[1], arr.shape[0])
+        tex = self._plane_tex.get(shape)
+        if tex is None:
+            tex = self._plane_tex[shape] = self.ctx.texture(shape, 3)
+        tex.write(arr.tobytes())
         tex.use(0)
         hx, hy = em_extent_nm[0] / 2.0, em_extent_nm[1] / 2.0
         quad = np.array([
@@ -223,13 +239,10 @@ class MeshRenderer:
             pos[0] - hx, pos[1] + hy, pos[2], 0, 1,
             pos[0] + hx, pos[1] + hy, pos[2], 1, 1,
         ], dtype="f4")
-        vbo = self.ctx.buffer(quad.tobytes())
-        vao = self.ctx.vertex_array(
-            self.plane_prog, [(vbo, "3f 2f", "pos", "uv")])
+        self._quad_vbo.write(quad.tobytes())
         self.plane_prog["mvp"].write(mvp_b)
         self.plane_prog["lfac"].value = float(lfac)
-        vao.render(mode=5)  # TRIANGLE_STRIP
-        vao.release(); vbo.release(); tex.release()
+        self._quad_vao.render(mode=5)  # TRIANGLE_STRIP
 
     def render(self, root_id, position_nm, quat, zoom_nm,
                color, em_tile=None, em_extent_nm=None,
@@ -271,12 +284,9 @@ class MeshRenderer:
                                  (0, 0, 1, 0.5)]):
             a = np.zeros(3); a[i] = al
             verts += [*pos, *col, *(pos + a), *col]
-        vbo = self.ctx.buffer(np.array(verts, dtype="f4").tobytes())
-        lvao = self.ctx.vertex_array(
-            self.line_prog, [(vbo, "3f 4f", "pos", "col")])
+        self._line_vbo.write(np.array(verts, dtype="f4").tobytes())
         self.line_prog["mvp"].write(mvp_b)
-        lvao.render(mode=1)  # LINES
-        lvao.release(); vbo.release()
+        self._line_vao.render(mode=1)  # LINES
         self.ctx.disable(self._moderngl.BLEND)
 
         px = np.frombuffer(self.fbo.read(components=4), dtype=np.uint8)
