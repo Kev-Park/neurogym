@@ -8,6 +8,8 @@ with a re-run of the parity harness.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from PIL import Image
 
@@ -444,7 +446,6 @@ class MeshStore:
 
     def __init__(self, cache_dir: str | None = None,
                  lru_bytes: int | None = None):
-        import os
         from collections import OrderedDict
 
         from cloudvolume import CloudVolume
