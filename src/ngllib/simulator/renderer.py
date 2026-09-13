@@ -99,7 +99,8 @@ class SimulatorRenderer:
     `cache_dir` opts into a CloudVolume DISK cache. Default None: on bucket
     NFS the cache's write-through metadata taxed every cold fetch 4-30x
     (2026-08-28); the in-RAM chunk LRU covers repeats. Pass a LOCAL-disk dir
-    only. `mesh_budget_bytes` bounds the GPU-resident mesh LRU.
+    only. `mesh_budget_bytes` sizes the GPU mesh slot pool (None = the
+    `NGL_NATIVE_VAO_LRU_MB` node knob, else 2 GB; see `MeshRenderer`).
     """
 
     # The simulator's warm work is a background prefetch; nothing is gained by
@@ -131,7 +132,7 @@ class SimulatorRenderer:
         left_pane: bool = False,
         right_pane: bool = True,
         cache_dir: str | None = None,
-        mesh_budget_bytes: int = 2 << 30,
+        mesh_budget_bytes: int | None = None,
         pane_mode: PaneMode = "atomic",
         dataset: DatasetSpec | None = None,
         config_path: str | None = None,
