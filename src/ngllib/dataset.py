@@ -58,6 +58,106 @@ def state_to_url(prefix: str, state: dict[str, Any]) -> str:
     return prefix + "#!" + urllib.parse.quote(json.dumps(state))
 
 
+def _rewrite_source(url: str) -> str:
+    """`graphene://https://…` -> `graphene://middleauth+https://…`.
+
+    The FlyWire deployment authenticates plain graphene URLs itself; the
+    upstream build and the lab fork do not -- a plain URL with a valid token
+    measured as 401 from prodv1 (2026-09-17). So a pasted FlyWire link has to
+    be rewritten before either of our viewers can load it.
+    """
+    if url.startswith("graphene://") and "middleauth+" not in url:
+        return "graphene://middleauth+" + url[len("graphene://"):]
+    return url
+
+
+def rewrite_graphene_sources(state: dict[str, Any]) -> dict[str, Any]:
+    """Every graphene source in `state` addressed through middleauth."""
+    out = copy.deepcopy(state)
+    for layer in out.get("layers", []) or []:
+        src = layer.get("source")
+        if isinstance(src, str):
+            layer["source"] = _rewrite_source(src)
+        elif isinstance(src, list):
+            layer["source"] = [
+                _rewrite_source(u) if isinstance(u, str)
+                else ({**u, "url": _rewrite_source(u["url"])} if isinstance(u, dict) and "url" in u else u)
+                for u in src
+            ]
+        elif isinstance(src, dict) and "url" in src:
+            layer["source"] = {**src, "url": _rewrite_source(src["url"])}
+    return out
+
+
+def is_legacy_state(state: dict[str, Any]) -> bool:
+    """A pre-2020 viewer state (`navigation.pose`, `zoomFactor`)."""
+    return "navigation" in state and "position" not in state
+
+
+def legacy_to_modern_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Convert a legacy viewer state to the format `ngllib.state` drives.
+
+    ngl.flywire.ai and neuromancer-seung-import serve the legacy format, which
+    has no `position`/`crossSectionScale`/`projectionScale` for the environment
+    to act on. The mapping below is the one used by hand to reproduce a pasted
+    FlyWire link in the modern viewer (2026-09-17):
+
+        navigation.pose.position.voxelCoordinates -> position
+        navigation.pose.position.voxelSize        -> dimensions (nm -> m)
+        navigation.zoomFactor / min(voxelSize)    -> crossSectionScale
+        perspectiveZoom                           -> projectionScale
+        perspectiveOrientation                    -> projectionOrientation
+        type "segmentation_with_graph"            -> "segmentation"
+    """
+    nav = state.get("navigation") or {}
+    pose_pos = ((nav.get("pose") or {}).get("position") or {})
+    voxel_size = pose_pos.get("voxelSize") or nav.get("voxelSize")
+    coords = pose_pos.get("voxelCoordinates")
+    if not voxel_size or not coords:
+        raise ProviderError(
+            "legacy start URL without navigation.pose.position.voxelCoordinates/voxelSize; "
+            "cannot convert -- paste a link from a modern Neuroglancer build instead")
+
+    out: dict[str, Any] = {
+        "dimensions": {ax: [float(v) * 1e-9, "m"] for ax, v in zip("xyz", voxel_size)},
+        "position": [float(c) for c in coords],
+    }
+    zoom = nav.get("zoomFactor")
+    if zoom is not None:
+        # legacy zoomFactor is nm per screen px; modern crossSectionScale is
+        # canonical voxels per px.
+        out["crossSectionScale"] = float(zoom) / float(min(voxel_size))
+    for legacy_key, modern_key in (("perspectiveZoom", "projectionScale"),
+                                   ("perspectiveOrientation", "projectionOrientation")):
+        if legacy_key in state:
+            out[modern_key] = copy.deepcopy(state[legacy_key])
+    layers = []
+    for layer in state.get("layers", []) or []:
+        lay = copy.deepcopy(layer)
+        if lay.get("type") == "segmentation_with_graph":
+            lay["type"] = "segmentation"
+        layers.append(lay)
+    out["layers"] = layers
+    for key in ("layout", "showDefaultAnnotations", "selectedLayer", "crossSectionOrientation"):
+        if key in state:
+            out[key] = copy.deepcopy(state[key])
+    return out
+
+
+def normalize_start_url(url: str) -> tuple[str, dict[str, Any]]:
+    """`(origin prefix, viewer state)` ready for our viewers.
+
+    Accepts a link pasted from any Neuroglancer deployment: a legacy state is
+    converted, graphene sources are addressed through middleauth. The returned
+    prefix is the link's own origin -- the caller decides whether to serve the
+    state from a packaged viewer instead.
+    """
+    prefix, state = split_state_url(url)
+    if state and is_legacy_state(state):
+        state = legacy_to_modern_state(state)
+    return prefix, rewrite_graphene_sources(state)
+
+
 def merge_state(base_state: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     """Overlay an NglState onto a full viewer state (the start URL's).
 

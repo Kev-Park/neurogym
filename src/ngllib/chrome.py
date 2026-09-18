@@ -32,9 +32,10 @@ from PIL import Image
 from .dataset import (
     DatasetSpec,
     default_start_url,
+    load_config,
     merge_state,
     ngl_state_from_viewer,
-    split_state_url,
+    normalize_start_url,
     state_to_url,
 )
 from .errors import BrowserError
@@ -51,6 +52,15 @@ logger = logging.getLogger(__name__)
 # for anything else, so it must contain the graphene hosts of the start URL.
 MIDDLEAUTH_STORAGE_KEY = "auth_token_v2"
 CAVE_SECRET_PATH = "~/.cloudvolume/secrets/cave-secret.json"
+
+# The packaged viewer is served to the page from this origin. Frozen: the CAVE
+# token in a storage_state is keyed by origin, so renaming it would silently
+# invalidate every saved credential file. Never resolved by DNS -- the route
+# intercepts first -- but it is a secure context with a real Origin header,
+# which `file://` is not and which prodv1/GCS accept (measured 2026-09-17).
+VIEWER_ORIGIN = "https://ngl.local"
+PACKAGED_VIEWER = "packaged"
+HOSTED_VIEWER = "hosted"
 
 
 def middleauth_hosts(state: dict[str, Any]) -> list[str]:
@@ -104,6 +114,51 @@ def read_cave_token(path: str | None = None) -> str:
     if not token:
         raise BrowserError(f"{f} has no 'token' field")
     return token
+
+
+def packaged_viewer_dir() -> Path | None:
+    """The viewer built into this ngllib install, if it is there."""
+    d = Path(__file__).resolve().parent / "viewer"
+    return d if (d / "index.html").is_file() else None
+
+
+def resolve_viewer(requested: str | None, config_path: str | None = None) -> Path | str:
+    """A directory to serve the viewer from, or `"hosted"`.
+
+    Order: explicit argument, `NGL_VIEWER_DIST`, `config.json` `viewer`, the
+    packaged build. Hosted is never a fallback -- it has to be asked for, so a
+    missing packaged build cannot silently send an experiment to a viewer
+    Google can change underneath it.
+    """
+    for candidate in (requested, os.environ.get("NGL_VIEWER_DIST"),
+                      load_config(config_path).get("viewer")):
+        if not candidate:
+            continue
+        if candidate == HOSTED_VIEWER:
+            return HOSTED_VIEWER
+        if candidate == PACKAGED_VIEWER:
+            break
+        d = Path(candidate).resolve()
+        if not (d / "index.html").is_file():
+            raise ValueError(f"viewer directory has no index.html: {d}")
+        return d
+    packaged = packaged_viewer_dir()
+    if packaged is not None:
+        return packaged
+    raise BrowserError(
+        "no Neuroglancer viewer found: reinstall ngllib (the build ships in "
+        "ngllib/viewer), set NGL_VIEWER_DIST to a built dist/client, pass "
+        f"viewer=<path>, or ask for the hosted build with viewer='{HOSTED_VIEWER}'")
+
+
+def viewer_provenance(dist: Path) -> str:
+    """One line describing which build is being served, for the run log."""
+    try:
+        b = json.loads((dist / "build.json").read_text())
+    except Exception:
+        return f"{dist} (no build.json)"
+    return (f"{dist} ({b.get('branch')}@{str(b.get('commit'))[:12]}"
+            f"{' DIRTY' if b.get('dirty') else ''}, built {b.get('built_at')})")
 
 
 def dist_file(dist: Path, url: str) -> Path | None:
@@ -187,7 +242,7 @@ class ChromeRenderer:
         start_url: str | None = None,
         config_path: str | None = None,
         # --- Viewer bundle + credentials -----------------------------------------
-        viewer_dist: str | None = None,
+        viewer: str | None = None,
         storage_state: str | None = None,
         cave_secret: str | None = None,
     ):
@@ -224,19 +279,19 @@ class ChromeRenderer:
         self.extra_launch_args = list(extra_launch_args or [])
 
         self.start_url = start_url or default_start_url(config_path)
-        self._url_prefix, self._base_state = split_state_url(self.start_url)
+        self._url_prefix, self._base_state = normalize_start_url(self.start_url)
         self.dataset = DatasetSpec.from_state(self._base_state)
 
-        # A Neuroglancer build served off disk instead of over the network.
-        # Needed for sources the hosted builds cannot read (flywire_public's
-        # 2019 graphene meshes have no `info` file; current upstream turns that
-        # 404 into a load error, the lab fork falls back to the legacy format),
-        # and it pins the viewer so a hosted build cannot change mid-experiment.
-        # `start_url` supplies the origin; every request to it is fulfilled from
-        # this directory, so no per-node HTTP server exists to babysit.
-        self.viewer_dist = Path(viewer_dist).resolve() if viewer_dist else None
-        if self.viewer_dist is not None and not (self.viewer_dist / "index.html").is_file():
-            raise ValueError(f"`viewer_dist` has no index.html: {self.viewer_dist}")
+        # `start_url` is the SCENE; `viewer` is the renderer. A pasted link's
+        # origin is therefore ignored unless the hosted viewer was asked for:
+        # its state is re-hosted on VIEWER_ORIGIN and served from disk. Serving
+        # locally is what makes graphene sources work at all (the hosted builds
+        # cannot read FlyWire's 2019 mesh layout) and pins the viewer so a
+        # hosted build cannot change mid-experiment.
+        self.viewer = resolve_viewer(viewer, config_path)
+        self.viewer_dist: Path | None = None if self.viewer == HOSTED_VIEWER else self.viewer
+        if self.viewer_dist is not None:
+            self._url_prefix = VIEWER_ORIGIN + "/"
         parsed = urllib.parse.urlparse(self._url_prefix)
         self._origin = f"{parsed.scheme}://{parsed.netloc}"
         # Credentials: an explicit Playwright storage_state file wins; otherwise
@@ -313,6 +368,9 @@ class ChromeRenderer:
     # =========================================================================
 
     def open(self) -> None:
+        if self.viewer_dist is not None:
+            logger.info("serving viewer %s at %s", viewer_provenance(self.viewer_dist),
+                        self._origin)
         self._ensure_browser_launched()
 
     def close(self) -> None:
