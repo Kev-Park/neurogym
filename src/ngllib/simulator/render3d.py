@@ -376,6 +376,12 @@ class MeshRenderer:
         # tiny scratch framebuffer before mapping so self._color is unbound.
         self._unbind_fbo = self.ctx.framebuffer(
             color_attachments=[self.ctx.texture((1, 1), 4)])
+        # The dst tensor's VRAM address is stable, so build the CUDA-IPC payload
+        # ONCE and reuse it. Calling reduce_tensor every step spawns a new IPC
+        # ref-counter shared-memory segment per step, and the resource_tracker
+        # churn crashes Ray workers (KeyError '/mp-...'). One payload => one segment.
+        from torch.multiprocessing.reductions import reduce_tensor
+        self._ipc_payload = reduce_tensor(self._cuda_dst)
 
     def _copy_fbo_to_cuda(self):
         """Map the registered color texture and copy it into self._cuda_dst
@@ -453,7 +459,8 @@ class MeshRenderer:
 
         if to_cuda:
             self._ensure_cuda()
-            return self._copy_fbo_to_cuda()  # torch CUDA tensor (H, W, 4), GL flip
+            self._copy_fbo_to_cuda()          # refresh self._cuda_dst in place
+            return self._ipc_payload          # stable CUDA-IPC (rebuild, args)
         px = np.frombuffer(self.fbo.read(components=4), dtype=np.uint8)
         return px.reshape(self.height, self.width, 4)[::-1, :, :3].copy()
 

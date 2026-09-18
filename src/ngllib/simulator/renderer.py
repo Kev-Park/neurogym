@@ -785,11 +785,10 @@ class SimulatorRenderer:
                           tiles["ext"][1] * pane2d_mod.PLANE_EXT_SCALE),
             em_gain=EM_GAIN, to_cuda=self.cuda_ipc)
         if self.cuda_ipc:
-            # `pane` is a persistent torch CUDA tensor (H, W, 4, GL orientation).
-            # Ship its IPC handle (not pixels); DINO server rebuilds it in-VRAM.
-            # No toolbar padding — the server resizes to 224 anyway.
-            from torch.multiprocessing.reductions import reduce_tensor
-            return reduce_tensor(pane)
+            # render(to_cuda=True) already returns the STABLE CUDA-IPC (rebuild,
+            # args) payload for the GPU-resident frame (built once, reused). Ship
+            # it as-is; the DINO server rebuilds/caches it in VRAM. No toolbar pad.
+            return pane
         out = np.zeros((PANE, PANE, 3), dtype=np.uint8)
         out[TOOLBAR:] = pane
         return out
