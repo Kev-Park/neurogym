@@ -365,17 +365,21 @@ class MeshRenderer:
         # drops alpha / resizes on the GPU.
         self._cuda_dst = torch.empty((self.height, self.width, 4),
                                      dtype=torch.uint8, device="cuda")
+        # Interop (register AND map) fails cudaErrorInvalidGraphicsContext(208)
+        # while self._color is bound as the active FBO color attachment. Unbind it
+        # (bind a scratch FBO, glFinish) BEFORE registering AND before each map —
+        # a fresh, unbound texture registers+maps fine (init probe), a bound one
+        # does not.
+        self._unbind_fbo = self.ctx.framebuffer(
+            color_attachments=[self.ctx.texture((1, 1), 4)])
+        self.ctx.finish()
+        self._unbind_fbo.use()
         err, res = rt.cudaGraphicsGLRegisterImage(
             self._color.glo, 0x0DE1,  # GL_TEXTURE_2D
             rt.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsReadOnly)
         if int(err) != 0:
             raise RuntimeError(f"cudaGraphicsGLRegisterImage failed: {int(err)}")
         self._cuda_res = res
-        # cudaGraphicsMapResources fails with cudaErrorInvalidGraphicsContext(208)
-        # if the texture is still bound as the active FBO color attachment. Bind a
-        # tiny scratch framebuffer before mapping so self._color is unbound.
-        self._unbind_fbo = self.ctx.framebuffer(
-            color_attachments=[self.ctx.texture((1, 1), 4)])
         # The dst tensor's VRAM address is stable, so build the CUDA-IPC payload
         # ONCE and reuse it. Calling reduce_tensor every step spawns a new IPC
         # ref-counter shared-memory segment per step, and the resource_tracker
