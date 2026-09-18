@@ -278,10 +278,59 @@ class MeshRenderer:
         self.plane_prog["lfac"].value = float(lfac)
         self._quad_vao.render(mode=5)  # TRIANGLE_STRIP
 
+    def _ensure_cuda(self):
+        """Lazily set up GL->CUDA interop for the color attachment (dino-server
+        CUDA-IPC path). Registers self._color once and allocates a persistent
+        torch CUDA tensor the mapped array is copied into each render. Imports
+        torch + cuda-python only here, so non-IPC runs never pull them in."""
+        if getattr(self, "_cuda_res", None) is not None:
+            return
+        import torch
+        from cuda.bindings import runtime as rt
+
+        self._torch = torch
+        self._rt = rt
+        torch.cuda.init()
+        # (H, W, 4) uint8, GL orientation (bottom-up), RGBA — the server flips /
+        # drops alpha / resizes on the GPU.
+        self._cuda_dst = torch.empty((self.height, self.width, 4),
+                                     dtype=torch.uint8, device="cuda")
+        err, res = rt.cudaGraphicsGLRegisterImage(
+            self._color.glo, 0x0DE1,  # GL_TEXTURE_2D
+            rt.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsReadOnly)
+        if int(err) != 0:
+            raise RuntimeError(f"cudaGraphicsGLRegisterImage failed: {int(err)}")
+        self._cuda_res = res
+
+    def _copy_fbo_to_cuda(self):
+        """Map the registered color texture and copy it into self._cuda_dst
+        (device->device), then sync. Returns the persistent CUDA tensor."""
+        rt = self._rt
+        W, H = self.width, self.height
+        e = rt.cudaGraphicsMapResources(1, self._cuda_res, 0)[0]
+        if int(e) != 0:
+            raise RuntimeError(f"MapResources failed: {int(e)}")
+        e, arr = rt.cudaGraphicsSubResourceGetMappedArray(self._cuda_res, 0, 0)
+        if int(e) != 0:
+            raise RuntimeError(f"GetMappedArray failed: {int(e)}")
+        e = rt.cudaMemcpy2DFromArray(
+            self._cuda_dst.data_ptr(), W * 4, arr, 0, 0, W * 4, H,
+            rt.cudaMemcpyKind.cudaMemcpyDeviceToDevice)
+        if int(e) != 0:
+            raise RuntimeError(f"Memcpy2DFromArray failed: {int(e)}")
+        rt.cudaGraphicsUnmapResources(1, self._cuda_res, 0)
+        self._torch.cuda.synchronize()
+        return self._cuda_dst
+
     def render(self, root_id, position_nm, quat, zoom_nm,
                color, em_tile=None, em_extent_nm=None,
-               em_gain: float = 1.0) -> np.ndarray:
-        """Full 3D pane: mesh(es) + section plane + axis lines. (H, W, 3) uint8.
+               em_gain: float = 1.0, to_cuda: bool = False):
+        """Full 3D pane: mesh(es) + section plane + axis lines.
+
+        Default returns (H, W, 3) uint8 (numpy). With `to_cuda=True` (dino-server
+        CUDA-IPC path) it skips the CPU readback and instead returns a persistent
+        torch CUDA tensor (H, W, 4) uint8 in GL orientation — the caller ships its
+        IPC handle to the DINO server, which flips/drops-alpha/resizes on the GPU.
 
         `root_id` is one id or a sequence of them; `color` is correspondingly
         one RGB triple or one per id.
@@ -323,6 +372,9 @@ class MeshRenderer:
         self._line_vao.render(mode=1)  # LINES
         self.ctx.disable(self._moderngl.BLEND)
 
+        if to_cuda:
+            self._ensure_cuda()
+            return self._copy_fbo_to_cuda()  # torch CUDA tensor (H, W, 4), GL flip
         px = np.frombuffer(self.fbo.read(components=4), dtype=np.uint8)
         return px.reshape(self.height, self.width, 4)[::-1, :, :3].copy()
 
