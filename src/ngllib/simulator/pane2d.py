@@ -65,8 +65,13 @@ PANE_H = PANE - TOOLBAR
 # again at k=+4). Zoom-invariance says this is the pane origin, not the
 # projection -- our optical centre sat at TOOLBAR + PANE_H/2 = 233.5 where
 # Chrome's is ~236.5.
+# The RENDER stays PANE_H tall so the camera's aspect and scale (fitted as
+# SCALE_CAL_NM) are untouched; only the composite moves down, cropping the
+# bottom PANE_3D_SHIFT rows. Rendering 430 tall instead put the centre at 235
+# and rescaled the content -- the re-sweep then asked for +2 more rows.
 TOOLBAR_3D = 20
-PANE_H_3D = PANE - TOOLBAR_3D
+PANE_3D_SHIFT = TOOLBAR_3D - TOOLBAR      # 3 capture px
+PANE_H_3D = PANE - TOOLBAR_3D             # displayed rows of the 3D pane
 CSS_PANE = 900.0
 CSS_TOOLBAR = 33.0
 CSS_VIEW_H = 867.0

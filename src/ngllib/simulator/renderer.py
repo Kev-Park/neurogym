@@ -236,7 +236,7 @@ class SimulatorRenderer:
 
     def open(self) -> None:
         if self._renderer is None:
-            self._renderer = MeshRenderer(PANE, PANE_H_3D, self._mesh_budget)
+            self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget)
             logger.info("simulator GL: %s", self._renderer.ctx.info["GL_RENDERER"])
         if self._meshes is None:
             self._meshes = MeshStore(self.source)
@@ -783,7 +783,9 @@ class SimulatorRenderer:
                           tiles["ext"][1] * pane2d_mod.PLANE_EXT_SCALE),
             em_gain=EM_GAIN)
         out = np.zeros((PANE, PANE, 3), dtype=np.uint8)
-        out[TOOLBAR_3D:] = pane
+        # Composited TOOLBAR_3D rows down (the 3D panel's own origin), the last
+        # PANE_3D_SHIFT rendered rows falling off the bottom.
+        out[TOOLBAR_3D:] = pane[:PANE_H_3D]
         return out
 
     def _render(self, block_tiles: bool) -> np.ndarray:
