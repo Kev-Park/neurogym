@@ -379,14 +379,18 @@ class Environment(gym.Env):
     # Internal: observation
     # =========================================================================
 
-    def _make_obs(self, st: dict[str, Any], image: np.ndarray) -> dict[str, Any]:
-        if self.mask_ui and image.ndim == 3 and image.shape[:2] == (450, 900):
-            from .simulator.pane2d import mask_ui
+    def _make_obs(self, st: dict[str, Any], image: Any) -> dict[str, Any]:
+        # cuda_ipc path: `image` is a reduce_tensor (rebuild, args) payload, not a
+        # numpy array — pass it through untouched (the DINO obs wrapper consumes it
+        # and replaces obs["image"] with features before RLlib sees the obs).
+        if isinstance(image, np.ndarray):
+            if self.mask_ui and image.ndim == 3 and image.shape[:2] == (450, 900):
+                from .simulator.pane2d import mask_ui
 
-            image = mask_ui(image)
-        image_size = self._renderer.layout.image_size
-        if image_size is not None and image.shape[:2] != (image_size[1], image_size[0]):
-            image = np.asarray(Image.fromarray(image).resize(image_size))
+                image = mask_ui(image)
+            image_size = self._renderer.layout.image_size
+            if image_size is not None and image.shape[:2] != (image_size[1], image_size[0]):
+                image = np.asarray(Image.fromarray(image).resize(image_size))
         return {
             "position": np.asarray(st["position"], dtype=np.float32),
             "xs_scale": np.asarray([st["crossSectionScale"]], dtype=np.float32),

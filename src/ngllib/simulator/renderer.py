@@ -136,9 +136,17 @@ class SimulatorRenderer:
         pane_mode: PaneMode = "atomic",
         dataset: DatasetSpec | None = None,
         config_path: str | None = None,
+        cuda_ipc: bool = False,
     ):
         if pane_mode not in PANE_MODES:
             raise ValueError(f"`pane_mode` must be one of {PANE_MODES}; got {pane_mode!r}")
+        # cuda_ipc (dino-server CUDA-IPC path): the RIGHT (3D GL) pane stays in
+        # VRAM and observe() returns a reduce_tensor (rebuild, args) payload
+        # instead of a numpy image. Right-pane-only (the 2D EM pane is CPU-composed,
+        # so it cannot avoid the CPU bounce); left_pane must be False.
+        self.cuda_ipc = bool(cuda_ipc)
+        if self.cuda_ipc and left_pane:
+            raise ValueError("cuda_ipc requires right-pane-only (left_pane=False)")
         self.layout = PaneLayout(
             window_size=window_size, capture_scale=capture_scale, image_size=image_size,
             left_pane=left_pane, right_pane=right_pane)
@@ -774,7 +782,13 @@ class SimulatorRenderer:
             em_tile=plane,
             em_extent_nm=(tiles["ext"][0] * pane2d_mod.PLANE_EXT_SCALE,
                           tiles["ext"][1] * pane2d_mod.PLANE_EXT_SCALE),
-            em_gain=EM_GAIN)
+            em_gain=EM_GAIN, to_cuda=self.cuda_ipc)
+        if self.cuda_ipc:
+            # `pane` is a persistent torch CUDA tensor (H, W, 4, GL orientation).
+            # Ship its IPC handle (not pixels); DINO server rebuilds it in-VRAM.
+            # No toolbar padding — the server resizes to 224 anyway.
+            from torch.multiprocessing.reductions import reduce_tensor
+            return reduce_tensor(pane)
         out = np.zeros((PANE, PANE, 3), dtype=np.uint8)
         out[TOOLBAR:] = pane
         return out
