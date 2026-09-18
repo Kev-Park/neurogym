@@ -41,7 +41,8 @@ def test_click_geometry_is_separate_from_capture_geometry():
 def test_ui_mask_regions():
     assert pane2d.UI_REGIONS == (
         (0, 32, 0, 900), (0, 450, 0, 16), (416, 450, 0, 80), (16, 48, 868, 900),
-        (416, 450, 820, 900))
+        (416, 450, 820, 900),
+        (0, 450, 450, 466))   # 3D pane left edge (axis labels), added 2026-09-18
 
 
 def test_uncalibrated_layout_warns_not_rejects():
