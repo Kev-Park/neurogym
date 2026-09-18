@@ -285,12 +285,29 @@ class MeshRenderer:
         torch + cuda-python only here, so non-IPC runs never pull them in."""
         if getattr(self, "_cuda_res", None) is not None:
             return
+        import logging
+        import os
+
         import torch
         from cuda.bindings import runtime as rt
 
         self._torch = torch
         self._rt = rt
         torch.cuda.init()
+        # Pin cuda-python's runtime context to torch's CUDA device so the GL-CUDA
+        # interop register/map run on the SAME context torch owns the dst tensor
+        # in (the map returned cudaErrorInvalidGraphicsContext(208) in the RLlib
+        # runner where they diverged; harmless when already aligned).
+        dev = torch.cuda.current_device()
+        rt.cudaSetDevice(dev)
+        try:
+            pci = torch.cuda.get_device_properties(dev).pci_bus_id
+        except Exception:
+            pci = "?"
+        logging.getLogger("ngllib.simulator.render3d").info(
+            "cuda_ipc setup: CUDA_VISIBLE_DEVICES=%r torch_dev=%d pci=%s gl=%s",
+            os.environ.get("CUDA_VISIBLE_DEVICES"), dev, pci,
+            self.ctx.info.get("GL_RENDERER", "?"))
         # (H, W, 4) uint8, GL orientation (bottom-up), RGBA — the server flips /
         # drops alpha / resizes on the GPU.
         self._cuda_dst = torch.empty((self.height, self.width, 4),
