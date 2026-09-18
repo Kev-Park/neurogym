@@ -371,12 +371,21 @@ class MeshRenderer:
         if int(err) != 0:
             raise RuntimeError(f"cudaGraphicsGLRegisterImage failed: {int(err)}")
         self._cuda_res = res
+        # cudaGraphicsMapResources fails with cudaErrorInvalidGraphicsContext(208)
+        # if the texture is still bound as the active FBO color attachment. Bind a
+        # tiny scratch framebuffer before mapping so self._color is unbound.
+        self._unbind_fbo = self.ctx.framebuffer(
+            color_attachments=[self.ctx.texture((1, 1), 4)])
 
     def _copy_fbo_to_cuda(self):
         """Map the registered color texture and copy it into self._cuda_dst
         (device->device), then sync. Returns the persistent CUDA tensor."""
         rt = self._rt
         W, H = self.width, self.height
+        # Finish the render and unbind self._color (bind the scratch FBO) so the
+        # texture is not the active render target — else map returns 208.
+        self.ctx.finish()
+        self._unbind_fbo.use()
         e = rt.cudaGraphicsMapResources(1, self._cuda_res, 0)[0]
         if int(e) != 0:
             raise RuntimeError(f"MapResources failed: {int(e)}")
