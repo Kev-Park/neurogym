@@ -58,6 +58,15 @@ LEFT_SHIFT_PX = (-3.0, 0.0)
 PANE = 450
 TOOLBAR = 17
 PANE_H = PANE - TOOLBAR
+# The 3D pane's capture geometry is NOT the 2D pane's. Fitted 2026-09-18 by
+# sweeping the composite offset against the fork build over a 16x zoom range
+# (probe_3d_calibrate.py, job 922247): k=+3 wins at every zoom and by a wide
+# margin in the mean (mesh+plane IoU 0.650 at k=0 -> 0.855 at k=+3, falling
+# again at k=+4). Zoom-invariance says this is the pane origin, not the
+# projection -- our optical centre sat at TOOLBAR + PANE_H/2 = 233.5 where
+# Chrome's is ~236.5.
+TOOLBAR_3D = 20
+PANE_H_3D = PANE - TOOLBAR_3D
 CSS_PANE = 900.0
 CSS_TOOLBAR = 33.0
 CSS_VIEW_H = 867.0
@@ -222,6 +231,11 @@ UI_REGIONS = (
     (416, 450, 0, 80),      # 2D pane scale bar ("750 nm")
     (16, 48, 868, 900),     # 3D pane top-right buttons
     (416, 450, 820, 900),   # 3D pane "Sections" control
+    # The 3D pane has a left edge too, and only the 2D pane's was masked: this
+    # strip is where the 62 pixels that still differed between two CHROME
+    # builds lived (2026-09-17), and its grey axis labels contaminated the
+    # section-plane measurement in probe_3d_calibrate.py until it was masked.
+    (0, 450, 450, 466),     # 3D pane left edge (axis labels)
 )
 
 

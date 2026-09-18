@@ -31,8 +31,8 @@ class MeshRenderer:
     """Offscreen renderer for one (width, height) pane geometry.
 
     `width`/`height` are the pane's true captured pixels BELOW the toolbar
-    (450 x 433 at capture scale 0.5) so the optical center and aspect match
-    the browser.
+    (450 x 430 at capture scale 0.5, i.e. pane2d.TOOLBAR_3D) so the optical
+    center and aspect match the browser.
     """
 
     VAO_BUDGET_BYTES = 2 << 30

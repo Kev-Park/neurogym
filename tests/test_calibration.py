@@ -21,6 +21,8 @@ def test_fitted_constants():
 
 def test_capture_geometry():
     assert (pane2d.PANE, pane2d.TOOLBAR, pane2d.PANE_H) == (450, 17, 433)
+    # The 3D pane's own capture origin, fitted 2026-09-18 (job 922247).
+    assert (pane2d.TOOLBAR_3D, pane2d.PANE_H_3D) == (20, 430)
     assert (pane2d.CSS_PANE, pane2d.CSS_TOOLBAR, pane2d.CSS_VIEW_H) == (900.0, 33.0, 867.0)
     assert CALIBRATED_WINDOW == (1800, 900) and CALIBRATED_CAPTURE_SCALE == 0.5
     lay = PaneLayout(window_size=CALIBRATED_WINDOW, capture_scale=CALIBRATED_CAPTURE_SCALE,
