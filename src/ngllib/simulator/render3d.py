@@ -56,12 +56,22 @@ class MeshRenderer:
         return (int(mb) << 20) if mb else cls.VAO_BUDGET_BYTES
 
     def __init__(self, width: int, height: int,
-                 mesh_budget_bytes: int | None = None):
+                 mesh_budget_bytes: int | None = None,
+                 cuda_ipc: bool = False):
         import moderngl
 
         self._moderngl = moderngl
         self.width, self.height = width, height
-        self.ctx = moderngl.create_context(standalone=True, backend="egl")
+        self._cuda_ipc = bool(cuda_ipc)
+        if self._cuda_ipc:
+            # In the RLlib/Ray runner the default EGL device is NOT necessarily
+            # the physical GPU torch's CUDA context lives on (all 8 are 3090s;
+            # Ray re-indexes CUDA_VISIBLE_DEVICES), and GL<->CUDA interop then
+            # fails with cudaErrorInvalidGraphicsContext(208). Pick the EGL
+            # device_index whose interop actually works.
+            self.ctx = self._create_interop_context(moderngl, width, height)
+        else:
+            self.ctx = moderngl.create_context(standalone=True, backend="egl")
         self.ctx.enable(moderngl.DEPTH_TEST)
         self._color = self.ctx.texture((width, height), 4)
         self._depth = self.ctx.depth_texture((width, height))
@@ -277,6 +287,49 @@ class MeshRenderer:
         self.plane_prog["mvp"].write(mvp_b)
         self.plane_prog["lfac"].value = float(lfac)
         self._quad_vao.render(mode=5)  # TRIANGLE_STRIP
+
+    def _create_interop_context(self, moderngl, width, height):
+        """Return a moderngl EGL context on an EGL device whose GL<->CUDA interop
+        works with torch's CUDA device (probes device_index candidates)."""
+        import logging
+
+        import torch
+        from cuda.bindings import runtime as rt
+
+        torch.cuda.init()
+        rt.cudaSetDevice(torch.cuda.current_device())
+        RO = rt.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsReadOnly
+        log = logging.getLogger("ngllib.simulator.render3d")
+        last = None
+        for idx in [None, 0, 1, 2, 3, 4, 5, 6, 7]:  # None = moderngl's default device
+            try:
+                kw = {} if idx is None else {"device_index": idx}
+                ctx = moderngl.create_context(standalone=True, backend="egl", **kw)
+            except Exception as ex:
+                last = f"create idx={idx}: {ex}"
+                continue
+            try:
+                tex = ctx.texture((8, 8), 4)
+                e, res = rt.cudaGraphicsGLRegisterImage(tex.glo, 0x0DE1, RO)
+                if int(e) != 0:
+                    raise RuntimeError(f"register {int(e)}")
+                em = rt.cudaGraphicsMapResources(1, res, 0)[0]
+                if int(em) != 0:
+                    raise RuntimeError(f"map {int(em)}")
+                rt.cudaGraphicsUnmapResources(1, res, 0)
+                rt.cudaGraphicsUnregisterResource(res)
+                tex.release()
+                log.info("cuda_ipc: EGL device_index=%r gives working GL-CUDA "
+                         "interop (gl=%s)", idx, ctx.info.get("GL_RENDERER", "?"))
+                return ctx
+            except Exception as ex:
+                last = f"interop idx={idx}: {ex}"
+                try:
+                    ctx.release()
+                except Exception:
+                    pass
+        raise RuntimeError(
+            f"cuda_ipc: no EGL device_index gave working GL-CUDA interop; last={last}")
 
     def _ensure_cuda(self):
         """Lazily set up GL->CUDA interop for the color attachment (dino-server

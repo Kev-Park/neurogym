@@ -242,7 +242,8 @@ class SimulatorRenderer:
 
     def open(self) -> None:
         if self._renderer is None:
-            self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget)
+            self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget,
+                                          cuda_ipc=self.cuda_ipc)
             logger.info("simulator GL: %s", self._renderer.ctx.info["GL_RENDERER"])
         if self._meshes is None:
             self._meshes = MeshStore(self.source)
