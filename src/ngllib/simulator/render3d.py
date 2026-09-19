@@ -459,6 +459,7 @@ class MeshRenderer:
         pane2d.compose_left_parts. `tile_key` (fetch generation) caches the EM +
         index textures across steps; only the tiny per-step LUT changes."""
         from .pane2d import PANE, PANE_H, TOOLBAR
+        from .colors import segment_color
         import moderngl
 
         self._ensure_em_gl()
