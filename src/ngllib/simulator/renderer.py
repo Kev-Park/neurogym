@@ -138,9 +138,17 @@ class SimulatorRenderer:
         config_path: str | None = None,
         cuda_ipc: bool = False,
         ipc_export: bool = True,
+        render_batch: bool = False,
+        render_batch_size: int = 1,
     ):
         if pane_mode not in PANE_MODES:
             raise ValueError(f"`pane_mode` must be one of {PANE_MODES}; got {pane_mode!r}")
+        # render_batch (throughput-scaling experiment): route 3D-pane GL through a
+        # per-process RenderService that batches all the process's envs into one
+        # atlas render + one readback/interop, instead of one GL context per env.
+        # render_batch_size = envs per runner (the atlas cell count).
+        self.render_batch = bool(render_batch)
+        self.render_batch_size = int(render_batch_size)
         # cuda_ipc (dino-server CUDA-IPC path): each enabled pane stays in VRAM
         # and observe() returns reduce_tensor (rebuild, args) payload(s) instead
         # of numpy image(s). Both panes are GPU-composed now -- the 3D pane by the
@@ -249,21 +257,35 @@ class SimulatorRenderer:
 
     def open(self) -> None:
         if self._renderer is None:
-            self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget,
-                                          cuda_ipc=self.cuda_ipc,
-                                          ipc_export=self.ipc_export)
+            if self.render_batch:
+                # Per-process shared batched render service (drop-in for the
+                # MeshRenderer subset SimulatorRenderer drives). ipc_export is
+                # always False here: batched interop feeds an in-process encoder.
+                from .render_service import get_render_service
+
+                self._renderer = get_render_service(
+                    PANE, PANE_H, self.render_batch_size,
+                    interop=self.cuda_ipc, mesh_budget_bytes=self._mesh_budget)
+                self._shared_renderer = True
+            else:
+                self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget,
+                                              cuda_ipc=self.cuda_ipc,
+                                              ipc_export=self.ipc_export)
+                self._shared_renderer = False
             logger.info("simulator GL: %s", self._renderer.ctx.info["GL_RENDERER"])
         if self._meshes is None:
             self._meshes = MeshStore(self.source)
 
     def close(self) -> None:
         # The class-level tile pools outlive individual renderers on purpose
-        # (shared by the process's env fleet; reaped at interpreter exit).
+        # (shared by the process's env fleet; reaped at interpreter exit). The
+        # batched render service is likewise per-process shared -- never torn
+        # down for a single env's close.
         self._pending = None
         self._prefetch = None
-        if self._renderer is not None:
+        if self._renderer is not None and not getattr(self, "_shared_renderer", False):
             self._renderer.close()
-            self._renderer = None
+        self._renderer = None
         self._meshes = None
 
     def default_state(self) -> dict[str, Any]:

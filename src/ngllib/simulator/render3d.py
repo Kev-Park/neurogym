@@ -337,7 +337,7 @@ class MeshRenderer:
         raise RuntimeError(
             f"cuda_ipc: no EGL device_index gave working GL-CUDA interop; last={last}")
 
-    def _ipc_register(self, gl_tex, slot):
+    def _ipc_register(self, gl_tex, slot, w=None, h=None):
         """Lazily set up GL->CUDA interop for one GL texture, keyed by `slot`
         ("right" = 3D pane self._color; "left" = 2D-EM self._em_color). Registers
         the texture once and allocates a persistent torch CUDA tensor the mapped
@@ -374,9 +374,11 @@ class MeshRenderer:
             slot, os.environ.get("CUDA_VISIBLE_DEVICES"), dev, pci,
             self.ctx.info.get("GL_RENDERER", "?"))
         # (H, W, 4) uint8, GL orientation (bottom-up), RGBA — the server flips /
-        # drops alpha / resizes on the GPU.
-        dst = torch.empty((self.height, self.width, 4),
-                          dtype=torch.uint8, device="cuda")
+        # drops alpha / resizes on the GPU. `w`/`h` override the pane dims for the
+        # batched atlas texture (slot "atlas" is cols*W x rows*H).
+        W = int(w) if w else self.width
+        H = int(h) if h else self.height
+        dst = torch.empty((H, W, 4), dtype=torch.uint8, device="cuda")
         # Interop (register AND map) fails cudaErrorInvalidGraphicsContext(208)
         # while the texture is bound as the active FBO color attachment. Unbind it
         # (bind a scratch FBO, glFinish) BEFORE registering AND before each map —
@@ -401,14 +403,15 @@ class MeshRenderer:
         payload = reduce_tensor(dst) if self._ipc_export else None
         ipc[slot] = {"res": res, "dst": dst, "payload": payload}
 
-    def _ipc_copy(self, gl_tex, slot):
+    def _ipc_copy(self, gl_tex, slot, w=None, h=None):
         """Register (once) then map the slot's texture and copy it into that
         slot's persistent CUDA tensor (device->device), sync, and return the
         stable CUDA-IPC payload (rebuild, args)."""
-        self._ipc_register(gl_tex, slot)
+        self._ipc_register(gl_tex, slot, w, h)
         s = self._ipc[slot]
         rt = self._rt
-        W, H = self.width, self.height
+        W = int(w) if w else self.width
+        H = int(h) if h else self.height
         # Finish the render and unbind the texture (bind the scratch FBO) so it is
         # not the active render target — else map returns 208.
         self.ctx.finish()
@@ -562,26 +565,15 @@ class MeshRenderer:
         canvas[TOOLBAR:] = px
         return canvas
 
-    def render(self, root_id, position_nm, quat, zoom_nm,
-               color, em_tile=None, em_extent_nm=None,
-               em_gain: float = 1.0, to_cuda: bool = False):
-        """Full 3D pane: mesh(es) + section plane + axis lines.
-
-        Default returns (H, W, 3) uint8 (numpy). With `to_cuda=True` (dino-server
-        CUDA-IPC path) it skips the CPU readback and instead returns a persistent
-        torch CUDA tensor (H, W, 4) uint8 in GL orientation — the caller ships its
-        IPC handle to the DINO server, which flips/drops-alpha/resizes on the GPU.
-
-        `root_id` is one id or a sequence of them; `color` is correspondingly
-        one RGB triple or one per id.
-        """
+    def _draw_scene(self, root_id, position_nm, quat, zoom_nm, color,
+                    em_tile=None, em_extent_nm=None, em_gain: float = 1.0):
+        """Draw ONE 3D scene (mesh(es) + section plane + axis lines) into the
+        CURRENTLY-BOUND FBO and viewport. Shared by render() (single pane) and
+        render_batch() (one atlas cell). Does not clear the whole target or read
+        back — the caller owns FBO binding, clearing, viewport, and readback."""
         view, proj = self._matrices(position_nm, quat, zoom_nm)
-        mvp = (proj @ view).astype("f4")
-        mvp_b = mvp.T.copy().tobytes()  # column-major
+        mvp_b = (proj @ view).astype("f4").T.copy().tobytes()  # column-major
         pos = np.asarray(position_nm, dtype="f4")
-        self.fbo.use()
-        self.fbo.clear(0.0, 0.0, 0.0, 1.0)
-
         ldir = -(self._rot(quat) @ np.array([0.0, 0.0, 1.0]))
         ldir /= np.linalg.norm(ldir) + 1e-9
 
@@ -612,11 +604,99 @@ class MeshRenderer:
         self._line_vao.render(mode=1)  # LINES
         self.ctx.disable(self._moderngl.BLEND)
 
+    def render(self, root_id, position_nm, quat, zoom_nm,
+               color, em_tile=None, em_extent_nm=None,
+               em_gain: float = 1.0, to_cuda: bool = False):
+        """Full 3D pane: mesh(es) + section plane + axis lines.
+
+        Default returns (H, W, 3) uint8 (numpy). With `to_cuda=True` (CUDA-IPC
+        path) it skips the CPU readback and returns a persistent torch CUDA tensor
+        (H, W, 4) uint8 in GL orientation — the caller flips/drops-alpha/resizes.
+
+        `root_id` is one id or a sequence of them; `color` is correspondingly
+        one RGB triple or one per id.
+        """
+        self.fbo.use()
+        self.ctx.viewport = (0, 0, self.width, self.height)
+        self.fbo.clear(0.0, 0.0, 0.0, 1.0)
+        self._draw_scene(root_id, position_nm, quat, zoom_nm, color,
+                         em_tile, em_extent_nm, em_gain)
         if to_cuda:
             # refresh the right-pane CUDA tensor in place; returns stable payload
             return self._ipc_copy(self._color, "right")
         px = np.frombuffer(self.fbo.read(components=4), dtype=np.uint8)
         return px.reshape(self.height, self.width, 4)[::-1, :, :3].copy()
+
+    # -------------------------------------------------------------- atlas batch
+
+    def enable_atlas(self, batch_size: int) -> None:
+        """Create a `batch_size`-cell atlas framebuffer (cols x rows grid of
+        width x height cells) so render_batch can draw many scenes into ONE FBO
+        and read them back / copy them out in ONE operation — amortizing the
+        per-render context bind + the readback/interop sync across the batch."""
+        if getattr(self, "_atlas_fbo", None) is not None:
+            return
+        import math
+        n = max(1, int(batch_size))
+        cols = int(math.ceil(math.sqrt(n)))
+        rows = int(math.ceil(n / cols))
+        aw, ah = cols * self.width, rows * self.height
+        self._atlas_cols, self._atlas_rows = cols, rows
+        self._atlas_w, self._atlas_h, self._atlas_cap = aw, ah, n
+        self._atlas_color = self.ctx.texture((aw, ah), 4)
+        self._atlas_depth = self.ctx.depth_texture((aw, ah))
+        self._atlas_fbo = self.ctx.framebuffer(
+            color_attachments=[self._atlas_color], depth_attachment=self._atlas_depth)
+
+    def _cell_gl_viewport(self, k: int) -> tuple[int, int, int, int]:
+        """GL viewport (origin bottom-left) for cell k, laid out so that after a
+        single vertical flip of the whole atlas readback, cell k occupies image
+        rows [row*H:(row+1)*H], cols [col*W:(col+1)*W] (row 0 = top)."""
+        col = k % self._atlas_cols
+        row = k // self._atlas_cols
+        return (col * self.width,
+                (self._atlas_rows - 1 - row) * self.height,
+                self.width, self.height)
+
+    def render_batch(self, scenes: list[dict], to_cuda: bool = False):
+        """Render each scene dict into its atlas cell, then ONE readback (numpy
+        panes) or ONE interop copy (a CUDA atlas tensor split into per-cell
+        views). `scenes[k]` carries render()'s kwargs. Returns a list, one entry
+        per scene: (H, W, 3) uint8 numpy, or (cell_view (H,W,4) uint8 cuda, True)."""
+        n = len(scenes)
+        if n > self._atlas_cap:
+            raise ValueError(f"batch {n} exceeds atlas capacity {self._atlas_cap}")
+        self._atlas_fbo.use()
+        self.ctx.scissor = None
+        self.ctx.viewport = (0, 0, self._atlas_w, self._atlas_h)
+        self._atlas_fbo.clear(0.0, 0.0, 0.0, 1.0)
+        for k, sc in enumerate(scenes):
+            vp = self._cell_gl_viewport(k)
+            self.ctx.viewport = vp
+            self.ctx.scissor = vp   # confine draws + any blend to the cell
+            self._draw_scene(
+                sc["root_id"], sc["position_nm"], sc["quat"], sc["zoom_nm"],
+                sc["color"], sc.get("em_tile"), sc.get("em_extent_nm"),
+                sc.get("em_gain", 1.0))
+        self.ctx.scissor = None
+        W, H = self.width, self.height
+        if to_cuda:
+            t = self._ipc_copy(self._atlas_color, "atlas",
+                               w=self._atlas_w, h=self._atlas_h)  # GL bottom-up
+            # Bare (H,W,4) cuda cell views, GL bottom-up — the caller wraps them
+            # (pane, gl_flip=True) exactly like the single-pane to_cuda return.
+            out = []
+            for k in range(n):
+                x, y, _, _ = self._cell_gl_viewport(k)
+                out.append(t[y:y + H, x:x + W, :])
+            return out
+        px = np.frombuffer(self._atlas_fbo.read(components=4), dtype=np.uint8)
+        px = px.reshape(self._atlas_h, self._atlas_w, 4)[::-1, :, :3]  # flip once
+        out = []
+        for k in range(n):
+            col, row = k % self._atlas_cols, k // self._atlas_cols
+            out.append(px[row * H:(row + 1) * H, col * W:(col + 1) * W].copy())
+        return out
 
     def pick_depth(self, root_id, position_nm, quat, zoom_nm,
                    plane_extent_nm=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -633,6 +713,9 @@ class MeshRenderer:
         mvp_b = (proj @ view).astype("f4").T.copy().tobytes()
         pos = np.asarray(position_nm, dtype="f4")
         self.fbo.use()
+        # render_batch shares this context and leaves the viewport on an atlas
+        # cell; reset to the full pane before the depth pass.
+        self.ctx.viewport = (0, 0, self.width, self.height)
         self.fbo.clear(0.0, 0.0, 0.0, 1.0)
         self.prog["mvp"].write(mvp_b)
         self.prog["light"].value = (0.0, 0.0, 0.8, 0.2)
