@@ -491,7 +491,10 @@ class MeshRenderer:
         uniq = self._uniq
         K = max(1, len(uniq))
         visset = {int(v) for v in visible}
-        show_all = 1 if not visset else 0
+        # SHOW_ALL (empty visible => paint every segment) only applies when there
+        # ARE ids; with no id map, an empty set means no tint (pure EM).
+        has_ids = len(uniq) > 0
+        show_all = 1 if (not visset and has_ids) else 0
         lut = np.zeros((K, 4), dtype="u1")
         for k, rid in enumerate(uniq):
             lut[k, 0:3] = (np.asarray(segment_color(int(rid))) * 255.0).astype("u1")
@@ -503,6 +506,10 @@ class MeshRenderer:
 
         self._em_fbo.use()
         self._em_fbo.clear(0.0, 0.0, 0.0, 1.0)
+        # The 2D FBO has no depth attachment; rendering with the globally-enabled
+        # DEPTH_TEST then discards every fragment (black output). Disable it for
+        # the quad, restore after so the 3D pass still depth-tests.
+        self.ctx.disable(moderngl.DEPTH_TEST)
         self._em_tex.use(0); self._idx_tex.use(1); self._lut_tex.use(2)
         self._em_prog["em"].value = 0
         self._em_prog["idx"].value = 1
@@ -515,6 +522,7 @@ class MeshRenderer:
         self._em_prog["ch_center"].value = (float(cx), float(self.height - 1 - cy))
         self._em_prog["ch_len"].value = float(int(min(900, 867) / 4 / 2))
         self._em_vao.render(mode=moderngl.TRIANGLE_STRIP)
+        self.ctx.enable(moderngl.DEPTH_TEST)  # restore for the 3D pass
         # [::-1] flip: empirically the EM comes out vertically flipped without it
         # (probe mean diff ~127 = a flipped 0-255 gradient), so the readback needs
         # the same bottom-up->top-down flip as the 3D pane.
