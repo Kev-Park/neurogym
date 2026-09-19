@@ -440,7 +440,7 @@ class MeshRenderer:
                     vec2 fc = gl_FragCoord.xy;
                     if (abs(fc.y-ch_center.y)<0.5 && fc.x>=ch_center.x && fc.x<=ch_center.x+ch_len)
                         c = 0.5*vec3(1.0,0.0,0.0) + 0.5*c;     // red +x
-                    if (abs(fc.x-ch_center.x)<0.5 && fc.y<=ch_center.y && fc.y>=ch_center.y-ch_len)
+                    if (abs(fc.x-ch_center.x)<0.5 && fc.y>=ch_center.y && fc.y<=ch_center.y+ch_len)
                         c = 0.5*vec3(0.0,1.0,0.0) + 0.5*c;     // green +y (top-down)
                     frag = vec4(c, 1.0);
                 }""",
@@ -509,11 +509,16 @@ class MeshRenderer:
         self._em_prog["show_all"].value = show_all
         # crosshair centre in GL (bottom-up) px; matches draw_crosshair (top-down).
         cy, cx = PANE_H // 2, PANE // 2
-        self._em_prog["ch_center"].value = (float(cx), float(self.height - cy))
+        # px row r == fbo row r (no flip) == gl_y r, so the crosshair centre in GL
+        # coords is (cx, cy) directly.
+        self._em_prog["ch_center"].value = (float(cx), float(cy))
         self._em_prog["ch_len"].value = float(int(min(900, 867) / 4 / 2))
         self._em_vao.render(mode=moderngl.TRIANGLE_STRIP)
+        # No [::-1] flip: the EM texture uploads data row 0 -> GL v=0 (fbo bottom),
+        # so reading bottom-up already yields top-down order (unlike the 3D scene,
+        # whose orientation comes from the projection and needs the flip).
         px = np.frombuffer(self._em_fbo.read(components=4), dtype=np.uint8)
-        px = px.reshape(self.height, self.width, 4)[::-1, :, :3]
+        px = px.reshape(self.height, self.width, 4)[:, :, :3]
         canvas = np.zeros((PANE, PANE, 3), dtype=np.uint8)
         canvas[TOOLBAR:] = px
         return canvas
