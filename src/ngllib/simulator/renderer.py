@@ -137,6 +137,7 @@ class SimulatorRenderer:
         dataset: DatasetSpec | None = None,
         config_path: str | None = None,
         cuda_ipc: bool = False,
+        ipc_export: bool = True,
     ):
         if pane_mode not in PANE_MODES:
             raise ValueError(f"`pane_mode` must be one of {PANE_MODES}; got {pane_mode!r}")
@@ -146,7 +147,13 @@ class SimulatorRenderer:
         # mesh renderer, the 2D EM pane by MeshRenderer.render_em (GPU equivalent
         # of compose_left_parts, pixel-parity validated by em_gl_probe) -- so a
         # both-panes run returns a [left, right] list of payloads.
+        #
+        # ipc_export=False (in-process DINO): the panes come back as RAW CUDA
+        # tensors, not cross-process IPC payloads -- no server, no reduce_tensor.
+        # The same GL->CUDA interop context is still used (rendering stays on the
+        # GPU); only the hand-off differs. Meaningful only when cuda_ipc.
         self.cuda_ipc = bool(cuda_ipc)
+        self.ipc_export = bool(ipc_export)
         self.layout = PaneLayout(
             window_size=window_size, capture_scale=capture_scale, image_size=image_size,
             left_pane=left_pane, right_pane=right_pane)
@@ -243,7 +250,8 @@ class SimulatorRenderer:
     def open(self) -> None:
         if self._renderer is None:
             self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget,
-                                          cuda_ipc=self.cuda_ipc)
+                                          cuda_ipc=self.cuda_ipc,
+                                          ipc_export=self.ipc_export)
             logger.info("simulator GL: %s", self._renderer.ctx.info["GL_RENDERER"])
         if self._meshes is None:
             self._meshes = MeshStore(self.source)

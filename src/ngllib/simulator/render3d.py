@@ -57,12 +57,18 @@ class MeshRenderer:
 
     def __init__(self, width: int, height: int,
                  mesh_budget_bytes: int | None = None,
-                 cuda_ipc: bool = False):
+                 cuda_ipc: bool = False, ipc_export: bool = True):
         import moderngl
 
         self._moderngl = moderngl
         self.width, self.height = width, height
         self._cuda_ipc = bool(cuda_ipc)
+        # ipc_export: True => wrap the GPU frame as a cross-process CUDA-IPC
+        # payload (reduce_tensor) for a separate DINO-server process. False =>
+        # the DINO encoder lives in THIS process, so hand back the raw CUDA
+        # tensor directly -- no IPC handle, no reduce_tensor / resource_tracker
+        # (there is no process boundary to cross). Only meaningful when cuda_ipc.
+        self._ipc_export = bool(ipc_export)
         if self._cuda_ipc:
             # In the RLlib/Ray runner the default EGL device is NOT necessarily
             # the physical GPU torch's CUDA context lives on (all 8 are 3090s;
@@ -390,7 +396,10 @@ class MeshRenderer:
         # ONCE and reuse it. Calling reduce_tensor every step spawns a new IPC
         # ref-counter shared-memory segment per step, and the resource_tracker
         # churn crashes Ray workers (KeyError '/mp-...'). One payload => one segment.
-        ipc[slot] = {"res": res, "dst": dst, "payload": reduce_tensor(dst)}
+        # In-process feed (ipc_export False): skip reduce_tensor entirely -- no
+        # process boundary, so the raw dst tensor is handed back directly.
+        payload = reduce_tensor(dst) if self._ipc_export else None
+        ipc[slot] = {"res": res, "dst": dst, "payload": payload}
 
     def _ipc_copy(self, gl_tex, slot):
         """Register (once) then map the slot's texture and copy it into that
@@ -417,7 +426,9 @@ class MeshRenderer:
             raise RuntimeError(f"Memcpy2DFromArray[{slot}] failed: {int(e)}")
         rt.cudaGraphicsUnmapResources(1, s["res"], 0)
         self._torch.cuda.synchronize()
-        return s["payload"]
+        # Server path: the stable IPC payload (rebuild, args). In-process path:
+        # the raw CUDA tensor, refreshed in place, fed straight to encode_gpu.
+        return s["payload"] if self._ipc_export else s["dst"]
 
     def _ensure_em_gl(self):
         """Lazy GL program + textures + FBO for the 2D EM pane compositor
