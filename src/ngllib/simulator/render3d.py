@@ -440,8 +440,8 @@ class MeshRenderer:
                     vec2 fc = gl_FragCoord.xy;
                     if (abs(fc.y-ch_center.y)<0.5 && fc.x>=ch_center.x && fc.x<=ch_center.x+ch_len)
                         c = 0.5*vec3(1.0,0.0,0.0) + 0.5*c;     // red +x
-                    if (abs(fc.x-ch_center.x)<0.5 && fc.y<=ch_center.y && fc.y>=ch_center.y-ch_len)
-                        c = 0.5*vec3(0.0,1.0,0.0) + 0.5*c;     // green +y (top-down, flipped)
+                    if (abs(fc.x-ch_center.x)<0.5 && fc.y>=ch_center.y && fc.y<=ch_center.y+ch_len)
+                        c = 0.5*vec3(0.0,1.0,0.0) + 0.5*c;     // green +y (top-down, no flip)
                     frag = vec4(c, 1.0);
                 }""",
         )
@@ -519,17 +519,16 @@ class MeshRenderer:
         self._em_prog["show_all"].value = show_all
         # crosshair centre in GL (bottom-up) px; matches draw_crosshair (top-down).
         cy, cx = PANE_H // 2, PANE // 2
-        # With the [::-1] readback flip, top-down px row cy maps to GL row
-        # (height-1-cy), so place the crosshair centre there.
-        self._em_prog["ch_center"].value = (float(cx), float(self.height - 1 - cy))
+        # No readback flip: px row cy maps to GL row cy directly.
+        self._em_prog["ch_center"].value = (float(cx), float(cy))
         self._em_prog["ch_len"].value = float(int(min(900, 867) / 4 / 2))
         self._em_vao.render(mode=moderngl.TRIANGLE_STRIP)
         self.ctx.enable(moderngl.DEPTH_TEST)  # restore for the 3D pass
-        # [::-1] flip: empirically the EM comes out vertically flipped without it
-        # (probe mean diff ~127 = a flipped 0-255 gradient), so the readback needs
-        # the same bottom-up->top-down flip as the 3D pane.
+        # NO [::-1]: probe showed GPU-with-flip == CPU vertically flipped, so the
+        # correct orientation is the un-flipped read (the earlier "flip needed"
+        # reading was an artifact of the all-black dtype bug).
         px = np.frombuffer(self._em_fbo.read(components=4), dtype=np.uint8)
-        px = px.reshape(self.height, self.width, 4)[::-1, :, :3]
+        px = px.reshape(self.height, self.width, 4)[:, :, :3]
         canvas = np.zeros((PANE, PANE, 3), dtype=np.uint8)
         canvas[TOOLBAR:] = px
         return canvas
