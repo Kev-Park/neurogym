@@ -402,7 +402,7 @@ class MeshRenderer:
         e, arr = rt.cudaGraphicsSubResourceGetMappedArray(self._cuda_res, 0, 0)
         if int(e) != 0:
             raise RuntimeError(f"GetMappedArray failed: {int(e)}")
-        e = rt.cudaMemcpy2DFromArray(
+        (e,) = rt.cudaMemcpy2DFromArray(   # cuda-python returns a 1-tuple (err,)
             self._cuda_dst.data_ptr(), W * 4, arr, 0, 0, W * 4, H,
             rt.cudaMemcpyKind.cudaMemcpyDeviceToDevice)
         if int(e) != 0:
