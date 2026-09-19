@@ -469,7 +469,9 @@ class MeshRenderer:
         if key != self._em_tile_key:
             emb = np.ascontiguousarray(np.asarray(em_gray, dtype=np.uint8))
             if self._em_tex is None or self._em_tex.size != (W, H):
-                self._em_tex = ctx.texture((W, H), 1, dtype="u1")
+                # 'f1' = normalized R8 (float sampler2D, .r in [0,1]); 'u1' is an
+                # INTEGER texture (usampler2D) and reads 0 via a float sampler.
+                self._em_tex = ctx.texture((W, H), 1, dtype="f1")
                 self._em_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
             self._em_tex.write(emb.tobytes())
             if ids is not None:
@@ -500,7 +502,7 @@ class MeshRenderer:
             lut[k, 0:3] = (np.asarray(segment_color(int(rid))) * 255.0).astype("u1")
             lut[k, 3] = 255 if (show_all or int(rid) in visset) else 0
         if self._lut_tex is None or self._lut_tex.size != (K, 1):
-            self._lut_tex = ctx.texture((K, 1), 4, dtype="u1")
+            self._lut_tex = ctx.texture((K, 1), 4, dtype="f1")  # normalized RGBA -> float
             self._lut_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self._lut_tex.write(np.ascontiguousarray(lut).tobytes())
 
