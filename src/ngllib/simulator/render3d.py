@@ -411,6 +411,113 @@ class MeshRenderer:
         self._torch.cuda.synchronize()
         return self._cuda_dst
 
+    def _ensure_em_gl(self):
+        """Lazy GL program + textures + FBO for the 2D EM pane compositor
+        (GPU equivalent of pane2d.compose_left_parts). Renders EM->RGB with
+        per-visible-segment 0.5 tint, entirely on the GPU so the pane can stay
+        in VRAM for the CUDA-IPC feed."""
+        if getattr(self, "_em_prog", None) is not None:
+            return
+        ctx = self.ctx
+        self._em_prog = ctx.program(
+            vertex_shader="""#version 330
+                in vec2 pos; out vec2 uv;
+                void main(){ uv = pos*0.5+0.5; gl_Position = vec4(pos,0.0,1.0); }""",
+            fragment_shader="""#version 330
+                uniform sampler2D em;      // grayscale, .r in [0,1]
+                uniform usampler2D idx;    // per-pixel compact segment index
+                uniform sampler2D lut;     // K x 1 RGBA8: rgb=color, a=visible
+                uniform int show_all;      // 1 => SHOW_ALL (every segment paints)
+                uniform vec2 ch_center;    // crosshair centre, GL (bottom-up) px
+                uniform float ch_len;
+                in vec2 uv; out vec4 frag;
+                void main(){
+                    float g = texture(em, uv).r;
+                    uint k = texture(idx, uv).r;
+                    vec4 e = texelFetch(lut, ivec2(int(k),0), 0);
+                    float vis = (show_all==1) ? 1.0 : e.a;
+                    vec3 c = (vis > 0.5) ? (0.5*e.rgb + 0.5*vec3(g)) : vec3(g);
+                    vec2 fc = gl_FragCoord.xy;
+                    if (abs(fc.y-ch_center.y)<0.5 && fc.x>=ch_center.x && fc.x<=ch_center.x+ch_len)
+                        c = 0.5*vec3(1.0,0.0,0.0) + 0.5*c;     // red +x
+                    if (abs(fc.x-ch_center.x)<0.5 && fc.y<=ch_center.y && fc.y>=ch_center.y-ch_len)
+                        c = 0.5*vec3(0.0,1.0,0.0) + 0.5*c;     // green +y (top-down)
+                    frag = vec4(c, 1.0);
+                }""",
+        )
+        quad = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype="f4")
+        self._em_vbo = ctx.buffer(quad.tobytes())
+        self._em_vao = ctx.vertex_array(self._em_prog, [(self._em_vbo, "2f", "pos")])
+        self._em_color = ctx.texture((self.width, self.height), 4)
+        self._em_fbo = ctx.framebuffer(color_attachments=[self._em_color])
+        self._em_tex = self._idx_tex = self._lut_tex = None
+        self._em_tile_key = None
+        self._uniq = np.zeros(0, dtype="u8")
+
+    def render_em(self, em_gray, ids, visible, tile_key=None):
+        """GPU-composited 2D EM pane -> (PANE, PANE, 3) uint8, matching
+        pane2d.compose_left_parts. `tile_key` (fetch generation) caches the EM +
+        index textures across steps; only the tiny per-step LUT changes."""
+        from .pane2d import PANE, PANE_H, TOOLBAR
+        import moderngl
+
+        self._ensure_em_gl()
+        ctx = self.ctx
+        H, W = int(em_gray.shape[0]), int(em_gray.shape[1])
+        key = tile_key if tile_key is not None else (id(em_gray), id(ids))
+        if key != self._em_tile_key:
+            emb = np.ascontiguousarray(np.asarray(em_gray, dtype=np.uint8))
+            if self._em_tex is None or self._em_tex.size != (W, H):
+                self._em_tex = ctx.texture((W, H), 1, dtype="u1")
+                self._em_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self._em_tex.write(emb.tobytes())
+            if ids is not None:
+                uniq, inv = np.unique(ids, return_inverse=True)
+                self._uniq = uniq
+                idxmap = inv.reshape(ids.shape).astype("u2")
+                ih, iw = ids.shape
+                if self._idx_tex is None or self._idx_tex.size != (iw, ih):
+                    self._idx_tex = ctx.texture((iw, ih), 1, dtype="u2")
+                    self._idx_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+                self._idx_tex.write(np.ascontiguousarray(idxmap).tobytes())
+            else:
+                self._uniq = np.zeros(0, dtype="u8")
+                if self._idx_tex is None or self._idx_tex.size != (W, H):
+                    self._idx_tex = ctx.texture((W, H), 1, dtype="u2")
+                    self._idx_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+                self._idx_tex.write(np.zeros((H, W), dtype="u2").tobytes())
+            self._em_tile_key = key
+        uniq = self._uniq
+        K = max(1, len(uniq))
+        visset = {int(v) for v in visible}
+        show_all = 1 if not visset else 0
+        lut = np.zeros((K, 4), dtype="u1")
+        for k, rid in enumerate(uniq):
+            lut[k, 0:3] = (np.asarray(segment_color(int(rid))) * 255.0).astype("u1")
+            lut[k, 3] = 255 if (show_all or int(rid) in visset) else 0
+        if self._lut_tex is None or self._lut_tex.size != (K, 1):
+            self._lut_tex = ctx.texture((K, 1), 4, dtype="u1")
+            self._lut_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self._lut_tex.write(np.ascontiguousarray(lut).tobytes())
+
+        self._em_fbo.use()
+        self._em_fbo.clear(0.0, 0.0, 0.0, 1.0)
+        self._em_tex.use(0); self._idx_tex.use(1); self._lut_tex.use(2)
+        self._em_prog["em"].value = 0
+        self._em_prog["idx"].value = 1
+        self._em_prog["lut"].value = 2
+        self._em_prog["show_all"].value = show_all
+        # crosshair centre in GL (bottom-up) px; matches draw_crosshair (top-down).
+        cy, cx = PANE_H // 2, PANE // 2
+        self._em_prog["ch_center"].value = (float(cx), float(self.height - cy))
+        self._em_prog["ch_len"].value = float(int(min(900, 867) / 4 / 2))
+        self._em_vao.render(mode=moderngl.TRIANGLE_STRIP)
+        px = np.frombuffer(self._em_fbo.read(components=4), dtype=np.uint8)
+        px = px.reshape(self.height, self.width, 4)[::-1, :, :3]
+        canvas = np.zeros((PANE, PANE, 3), dtype=np.uint8)
+        canvas[TOOLBAR:] = px
+        return canvas
+
     def render(self, root_id, position_nm, quat, zoom_nm,
                color, em_tile=None, em_extent_nm=None,
                em_gain: float = 1.0, to_cuda: bool = False):
