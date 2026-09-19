@@ -140,13 +140,13 @@ class SimulatorRenderer:
     ):
         if pane_mode not in PANE_MODES:
             raise ValueError(f"`pane_mode` must be one of {PANE_MODES}; got {pane_mode!r}")
-        # cuda_ipc (dino-server CUDA-IPC path): the RIGHT (3D GL) pane stays in
-        # VRAM and observe() returns a reduce_tensor (rebuild, args) payload
-        # instead of a numpy image. Right-pane-only (the 2D EM pane is CPU-composed,
-        # so it cannot avoid the CPU bounce); left_pane must be False.
+        # cuda_ipc (dino-server CUDA-IPC path): each enabled pane stays in VRAM
+        # and observe() returns reduce_tensor (rebuild, args) payload(s) instead
+        # of numpy image(s). Both panes are GPU-composed now -- the 3D pane by the
+        # mesh renderer, the 2D EM pane by MeshRenderer.render_em (GPU equivalent
+        # of compose_left_parts, pixel-parity validated by em_gl_probe) -- so a
+        # both-panes run returns a [left, right] list of payloads.
         self.cuda_ipc = bool(cuda_ipc)
-        if self.cuda_ipc and left_pane:
-            raise ValueError("cuda_ipc requires right-pane-only (left_pane=False)")
         self.layout = PaneLayout(
             window_size=window_size, capture_scale=capture_scale, image_size=image_size,
             left_pane=left_pane, right_pane=right_pane)
@@ -756,6 +756,17 @@ class SimulatorRenderer:
         happened in the fetch worker, so this is a mask-and-blend.
         """
         vis = S.visible_segments(self._state["segments"])
+        if self.cuda_ipc:
+            # GPU-composited EM pane, kept in VRAM; returns a stable CUDA-IPC
+            # payload for _em_color. `_tile_key` (fetch generation) lets render_em
+            # cache the EM+index textures across steps; only the tiny LUT changes
+            # per visible-set change. No memo here -- the LUT rebuild is cheap and
+            # the payload handle is stable regardless. gl_flip=False: render_em is
+            # read WITHOUT a row flip (parity), so the server must not flip it.
+            payload = self._renderer.render_em(
+                tiles.get("em"), tiles.get("ids"), vis,
+                tile_key=self._tile_key, to_cuda=True)
+            return (payload, False)
         cached = tiles.get("left_canvas")
         if cached is not None and tiles.get("left_vis") == vis:
             return cached
@@ -788,7 +799,9 @@ class SimulatorRenderer:
             # render(to_cuda=True) already returns the STABLE CUDA-IPC (rebuild,
             # args) payload for the GPU-resident frame (built once, reused). Ship
             # it as-is; the DINO server rebuilds/caches it in VRAM. No toolbar pad.
-            return pane
+            # gl_flip=True: the 3D framebuffer is bottom-up (the numpy path reads
+            # it with [::-1]), so the server must flip it to image order.
+            return (pane, True)
         out = np.zeros((PANE, PANE, 3), dtype=np.uint8)
         out[TOOLBAR:] = pane
         return out
@@ -800,4 +813,9 @@ class SimulatorRenderer:
             panes.append(self._render_left(tiles))
         if self.layout.right_pane:
             panes.append(self._render_right(tiles))
+        if self.cuda_ipc:
+            # panes are (CUDA-IPC payload, gl_flip) tuples (not ndarrays); ship
+            # the list in left-then-right order for the DINO server to rebuild +
+            # encode_gpu. A single-pane run still ships a 1-element list.
+            return panes
         return panes[0] if len(panes) == 1 else np.concatenate(panes, axis=1)

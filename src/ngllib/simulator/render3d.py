@@ -331,18 +331,24 @@ class MeshRenderer:
         raise RuntimeError(
             f"cuda_ipc: no EGL device_index gave working GL-CUDA interop; last={last}")
 
-    def _ensure_cuda(self):
-        """Lazily set up GL->CUDA interop for the color attachment (dino-server
-        CUDA-IPC path). Registers self._color once and allocates a persistent
-        torch CUDA tensor the mapped array is copied into each render. Imports
-        torch + cuda-python only here, so non-IPC runs never pull them in."""
-        if getattr(self, "_cuda_res", None) is not None:
+    def _ipc_register(self, gl_tex, slot):
+        """Lazily set up GL->CUDA interop for one GL texture, keyed by `slot`
+        ("right" = 3D pane self._color; "left" = 2D-EM self._em_color). Registers
+        the texture once and allocates a persistent torch CUDA tensor the mapped
+        array is copied into each render, plus a stable CUDA-IPC payload. Both
+        panes share this path so the proven right-pane logic covers the left too.
+        Imports torch + cuda-python only here, so non-IPC runs never pull them in."""
+        ipc = getattr(self, "_ipc", None)
+        if ipc is None:
+            ipc = self._ipc = {}
+        if slot in ipc:
             return
         import logging
         import os
 
         import torch
         from cuda.bindings import runtime as rt
+        from torch.multiprocessing.reductions import reduce_tensor
 
         self._torch = torch
         self._rt = rt
@@ -358,58 +364,60 @@ class MeshRenderer:
         except Exception:
             pci = "?"
         logging.getLogger("ngllib.simulator.render3d").info(
-            "cuda_ipc setup: CUDA_VISIBLE_DEVICES=%r torch_dev=%d pci=%s gl=%s",
-            os.environ.get("CUDA_VISIBLE_DEVICES"), dev, pci,
+            "cuda_ipc setup slot=%s: CUDA_VISIBLE_DEVICES=%r torch_dev=%d pci=%s gl=%s",
+            slot, os.environ.get("CUDA_VISIBLE_DEVICES"), dev, pci,
             self.ctx.info.get("GL_RENDERER", "?"))
         # (H, W, 4) uint8, GL orientation (bottom-up), RGBA — the server flips /
         # drops alpha / resizes on the GPU.
-        self._cuda_dst = torch.empty((self.height, self.width, 4),
-                                     dtype=torch.uint8, device="cuda")
+        dst = torch.empty((self.height, self.width, 4),
+                          dtype=torch.uint8, device="cuda")
         # Interop (register AND map) fails cudaErrorInvalidGraphicsContext(208)
-        # while self._color is bound as the active FBO color attachment. Unbind it
+        # while the texture is bound as the active FBO color attachment. Unbind it
         # (bind a scratch FBO, glFinish) BEFORE registering AND before each map —
         # a fresh, unbound texture registers+maps fine (init probe), a bound one
-        # does not.
-        self._unbind_fbo = self.ctx.framebuffer(
-            color_attachments=[self.ctx.texture((1, 1), 4)])
+        # does not. One scratch FBO, shared across slots.
+        if getattr(self, "_unbind_fbo", None) is None:
+            self._unbind_fbo = self.ctx.framebuffer(
+                color_attachments=[self.ctx.texture((1, 1), 4)])
         self.ctx.finish()
         self._unbind_fbo.use()
         err, res = rt.cudaGraphicsGLRegisterImage(
-            self._color.glo, 0x0DE1,  # GL_TEXTURE_2D
+            gl_tex.glo, 0x0DE1,  # GL_TEXTURE_2D
             rt.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsReadOnly)
         if int(err) != 0:
-            raise RuntimeError(f"cudaGraphicsGLRegisterImage failed: {int(err)}")
-        self._cuda_res = res
+            raise RuntimeError(f"cudaGraphicsGLRegisterImage[{slot}] failed: {int(err)}")
         # The dst tensor's VRAM address is stable, so build the CUDA-IPC payload
         # ONCE and reuse it. Calling reduce_tensor every step spawns a new IPC
         # ref-counter shared-memory segment per step, and the resource_tracker
         # churn crashes Ray workers (KeyError '/mp-...'). One payload => one segment.
-        from torch.multiprocessing.reductions import reduce_tensor
-        self._ipc_payload = reduce_tensor(self._cuda_dst)
+        ipc[slot] = {"res": res, "dst": dst, "payload": reduce_tensor(dst)}
 
-    def _copy_fbo_to_cuda(self):
-        """Map the registered color texture and copy it into self._cuda_dst
-        (device->device), then sync. Returns the persistent CUDA tensor."""
+    def _ipc_copy(self, gl_tex, slot):
+        """Register (once) then map the slot's texture and copy it into that
+        slot's persistent CUDA tensor (device->device), sync, and return the
+        stable CUDA-IPC payload (rebuild, args)."""
+        self._ipc_register(gl_tex, slot)
+        s = self._ipc[slot]
         rt = self._rt
         W, H = self.width, self.height
-        # Finish the render and unbind self._color (bind the scratch FBO) so the
-        # texture is not the active render target — else map returns 208.
+        # Finish the render and unbind the texture (bind the scratch FBO) so it is
+        # not the active render target — else map returns 208.
         self.ctx.finish()
         self._unbind_fbo.use()
-        e = rt.cudaGraphicsMapResources(1, self._cuda_res, 0)[0]
+        e = rt.cudaGraphicsMapResources(1, s["res"], 0)[0]
         if int(e) != 0:
-            raise RuntimeError(f"MapResources failed: {int(e)}")
-        e, arr = rt.cudaGraphicsSubResourceGetMappedArray(self._cuda_res, 0, 0)
+            raise RuntimeError(f"MapResources[{slot}] failed: {int(e)}")
+        e, arr = rt.cudaGraphicsSubResourceGetMappedArray(s["res"], 0, 0)
         if int(e) != 0:
-            raise RuntimeError(f"GetMappedArray failed: {int(e)}")
+            raise RuntimeError(f"GetMappedArray[{slot}] failed: {int(e)}")
         (e,) = rt.cudaMemcpy2DFromArray(   # cuda-python returns a 1-tuple (err,)
-            self._cuda_dst.data_ptr(), W * 4, arr, 0, 0, W * 4, H,
+            s["dst"].data_ptr(), W * 4, arr, 0, 0, W * 4, H,
             rt.cudaMemcpyKind.cudaMemcpyDeviceToDevice)
         if int(e) != 0:
-            raise RuntimeError(f"Memcpy2DFromArray failed: {int(e)}")
-        rt.cudaGraphicsUnmapResources(1, self._cuda_res, 0)
+            raise RuntimeError(f"Memcpy2DFromArray[{slot}] failed: {int(e)}")
+        rt.cudaGraphicsUnmapResources(1, s["res"], 0)
         self._torch.cuda.synchronize()
-        return self._cuda_dst
+        return s["payload"]
 
     def _ensure_em_gl(self):
         """Lazy GL program + textures + FBO for the 2D EM pane compositor
@@ -454,10 +462,15 @@ class MeshRenderer:
         self._em_tile_key = None
         self._uniq = np.zeros(0, dtype="u8")
 
-    def render_em(self, em_gray, ids, visible, tile_key=None):
+    def render_em(self, em_gray, ids, visible, tile_key=None, to_cuda=False):
         """GPU-composited 2D EM pane -> (PANE, PANE, 3) uint8, matching
         pane2d.compose_left_parts. `tile_key` (fetch generation) caches the EM +
-        index textures across steps; only the tiny per-step LUT changes."""
+        index textures across steps; only the tiny per-step LUT changes.
+
+        With `to_cuda=True` (dino-server CUDA-IPC path) it skips the CPU readback
+        and returns a persistent torch CUDA tensor's IPC payload for _em_color
+        (PANE_H x PANE, RGBA, GL bottom-up orientation) — the server flips / drops
+        alpha / resizes on the GPU, exactly as for the right pane."""
         from .pane2d import PANE, PANE_H, TOOLBAR
         from .colors import segment_color
         import moderngl
@@ -524,6 +537,11 @@ class MeshRenderer:
         self._em_prog["ch_len"].value = float(int(min(900, 867) / 4 / 2))
         self._em_vao.render(mode=moderngl.TRIANGLE_STRIP)
         self.ctx.enable(moderngl.DEPTH_TEST)  # restore for the 3D pass
+        if to_cuda:
+            # Keep the composited pane in VRAM; ship its IPC handle. Note the
+            # right pane IS GL-flipped by the server but the numpy left pane is
+            # read WITHOUT a flip (parity), so the server must NOT flip "left".
+            return self._ipc_copy(self._em_color, "left")
         # NO [::-1]: probe showed GPU-with-flip == CPU vertically flipped, so the
         # correct orientation is the un-flipped read (the earlier "flip needed"
         # reading was an artifact of the all-black dtype bug).
@@ -584,9 +602,8 @@ class MeshRenderer:
         self.ctx.disable(self._moderngl.BLEND)
 
         if to_cuda:
-            self._ensure_cuda()
-            self._copy_fbo_to_cuda()          # refresh self._cuda_dst in place
-            return self._ipc_payload          # stable CUDA-IPC (rebuild, args)
+            # refresh the right-pane CUDA tensor in place; returns stable payload
+            return self._ipc_copy(self._color, "right")
         px = np.frombuffer(self.fbo.read(components=4), dtype=np.uint8)
         return px.reshape(self.height, self.width, 4)[::-1, :, :3].copy()
 
