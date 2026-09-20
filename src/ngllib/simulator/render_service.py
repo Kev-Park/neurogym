@@ -37,26 +37,32 @@ _SERVICES_LOCK = threading.Lock()
 
 
 def get_render_service(pane: int, pane_h: int, batch_size: int, *,
-                       interop: bool = False, mesh_budget_bytes: int | None = None,
+                       interop: bool = False, ipc_export: bool = False,
+                       mesh_budget_bytes: int | None = None,
                        max_delay_ms: float = 3.0) -> "RenderService":
-    """Get (or lazily create) the process's shared RenderService."""
-    key = (pane, pane_h, batch_size, interop, mesh_budget_bytes)
+    """Get (or lazily create) the process's shared RenderService.
+
+    `interop` keeps the batched panes in VRAM (GL->CUDA). `ipc_export` controls
+    the hand-off: False = raw CUDA cell views for an IN-PROCESS encoder; True =
+    per-cell reduce_tensor IPC payloads for a cross-process DINO SERVER."""
+    key = (pane, pane_h, batch_size, interop, ipc_export, mesh_budget_bytes)
     with _SERVICES_LOCK:
         svc = _SERVICES.get(key)
         if svc is None:
             svc = _SERVICES[key] = RenderService(
-                pane, pane_h, batch_size, interop=interop,
+                pane, pane_h, batch_size, interop=interop, ipc_export=ipc_export,
                 mesh_budget_bytes=mesh_budget_bytes, max_delay_ms=max_delay_ms)
         return svc
 
 
 class RenderService:
     def __init__(self, pane: int, pane_h: int, batch_size: int, *,
-                 interop: bool = False, mesh_budget_bytes: int | None = None,
-                 max_delay_ms: float = 3.0):
+                 interop: bool = False, ipc_export: bool = False,
+                 mesh_budget_bytes: int | None = None, max_delay_ms: float = 3.0):
         self._pane, self._pane_h = pane, pane_h
         self._batch_cap = max(1, int(batch_size))
         self._interop = bool(interop)
+        self._ipc_export = bool(ipc_export)
         self._mesh_budget = mesh_budget_bytes
         self._max_delay = float(max_delay_ms) / 1000.0
         self._q: queue.Queue = queue.Queue()
@@ -119,7 +125,7 @@ class RenderService:
         try:
             self._mr = MeshRenderer(
                 self._pane, self._pane_h, self._mesh_budget,
-                cuda_ipc=self._interop, ipc_export=False)
+                cuda_ipc=self._interop, ipc_export=self._ipc_export)
             self._mr.enable_atlas(self._batch_cap)
         except BaseException as e:  # surface init failure to the constructor
             self._err = e

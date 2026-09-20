@@ -658,6 +658,63 @@ class MeshRenderer:
                 (self._atlas_rows - 1 - row) * self.height,
                 self.width, self.height)
 
+    def _ensure_atlas_cell_ipc(self, n: int) -> None:
+        """Register the atlas color texture (once) and allocate n per-cell CUDA
+        dst tensors, each with a stable reduce_tensor IPC payload — for the
+        batched server+interop path. Per-cell distinct storage keeps the DINO
+        server's per-handle IPC cache correct (unlike views of one atlas)."""
+        if getattr(self, "_cell_ipc", None) is not None:
+            return
+        import torch
+        from cuda.bindings import runtime as rt
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        self._torch = torch
+        self._rt = rt
+        torch.cuda.init()
+        rt.cudaSetDevice(torch.cuda.current_device())
+        if getattr(self, "_unbind_fbo", None) is None:
+            self._unbind_fbo = self.ctx.framebuffer(
+                color_attachments=[self.ctx.texture((1, 1), 4)])
+        self.ctx.finish()
+        self._unbind_fbo.use()
+        err, res = rt.cudaGraphicsGLRegisterImage(
+            self._atlas_color.glo, 0x0DE1,
+            rt.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsReadOnly)
+        if int(err) != 0:
+            raise RuntimeError(f"atlas cell register failed: {int(err)}")
+        dsts = [torch.empty((self.height, self.width, 4), dtype=torch.uint8,
+                            device="cuda") for _ in range(n)]
+        self._cell_ipc = {"res": res, "dsts": dsts,
+                          "payloads": [reduce_tensor(d) for d in dsts]}
+
+    def _copy_atlas_cells(self, n: int) -> list:
+        """Map the atlas once, copy each cell region (device->device) into its
+        persistent dst tensor, sync, return bare per-cell IPC payloads (the
+        caller wraps each (payload, gl_flip=True))."""
+        self._ensure_atlas_cell_ipc(self._atlas_cap)
+        c = self._cell_ipc
+        rt = self._rt
+        W, H = self.width, self.height
+        self.ctx.finish()
+        self._unbind_fbo.use()
+        e = rt.cudaGraphicsMapResources(1, c["res"], 0)[0]
+        if int(e) != 0:
+            raise RuntimeError(f"atlas cell map failed: {int(e)}")
+        e, arr = rt.cudaGraphicsSubResourceGetMappedArray(c["res"], 0, 0)
+        if int(e) != 0:
+            raise RuntimeError(f"atlas cell getarray failed: {int(e)}")
+        for k in range(n):
+            x, y, _, _ = self._cell_gl_viewport(k)
+            (e,) = rt.cudaMemcpy2DFromArray(   # src offset into the cell region
+                c["dsts"][k].data_ptr(), W * 4, arr, x * 4, y, W * 4, H,
+                rt.cudaMemcpyKind.cudaMemcpyDeviceToDevice)
+            if int(e) != 0:
+                raise RuntimeError(f"atlas cell {k} copy failed: {int(e)}")
+        rt.cudaGraphicsUnmapResources(1, c["res"], 0)
+        self._torch.cuda.synchronize()
+        return [c["payloads"][k] for k in range(n)]
+
     def render_batch(self, scenes: list[dict], to_cuda: bool = False):
         """Render each scene dict into its atlas cell, then ONE readback (numpy
         panes) or ONE interop copy (a CUDA atlas tensor split into per-cell
@@ -681,10 +738,15 @@ class MeshRenderer:
         self.ctx.scissor = None
         W, H = self.width, self.height
         if to_cuda:
+            if self._ipc_export:
+                # Server path: each cell -> its OWN persistent CUDA dst tensor
+                # (distinct storage => distinct IPC handle, so the DINO server's
+                # per-handle cache stays correct) -> bare reduce_tensor payloads.
+                return self._copy_atlas_cells(n)
+            # In-process path: one atlas dst tensor, bare (H,W,4) cuda cell views
+            # (GL bottom-up); the caller wraps each (pane, gl_flip=True).
             t = self._ipc_copy(self._atlas_color, "atlas",
-                               w=self._atlas_w, h=self._atlas_h)  # GL bottom-up
-            # Bare (H,W,4) cuda cell views, GL bottom-up — the caller wraps them
-            # (pane, gl_flip=True) exactly like the single-pane to_cuda return.
+                               w=self._atlas_w, h=self._atlas_h)
             out = []
             for k in range(n):
                 x, y, _, _ = self._cell_gl_viewport(k)

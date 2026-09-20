@@ -263,9 +263,13 @@ class SimulatorRenderer:
                 # always False here: batched interop feeds an in-process encoder.
                 from .render_service import get_render_service
 
+                # ipc_export=True (server path): batched panes become per-cell
+                # reduce_tensor payloads for the DINO server; False (in-process):
+                # raw CUDA cell views for the in-process encoder.
                 self._renderer = get_render_service(
                     PANE, PANE_H, self.render_batch_size,
-                    interop=self.cuda_ipc, mesh_budget_bytes=self._mesh_budget)
+                    interop=self.cuda_ipc, ipc_export=self.ipc_export,
+                    mesh_budget_bytes=self._mesh_budget)
                 self._shared_renderer = True
             else:
                 self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget,
