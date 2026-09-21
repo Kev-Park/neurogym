@@ -150,6 +150,25 @@ class _LocalFuture:
             raise self._exc
         return self._result
 
+    # concurrent.futures.Future surface the renderer's fetch state machine touches
+    # (it calls .cancel() on superseded/warm fetches). A fetch already dispatched to
+    # the background thread cannot be un-dispatched, so cancel() reports False just
+    # like a ProcessPoolExecutor future for an already-running task -- the renderer
+    # then simply lets it finish and discards the result.
+    def cancel(self) -> bool:
+        return False
+
+    def cancelled(self) -> bool:
+        return False
+
+    def running(self) -> bool:
+        return not self._ev.is_set()
+
+    def exception(self, timeout=None):
+        if not self._ev.wait(timeout):
+            raise FuturesTimeout("fetch background result timed out")
+        return self._exc
+
 
 class _RayPool:
     """One fetch actor with a DEDICATED BACKGROUND THREAD that owns all Ray I/O.
