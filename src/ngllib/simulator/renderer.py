@@ -28,11 +28,9 @@ from __future__ import annotations
 
 import copy
 import logging
-import multiprocessing
 import os
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Literal
 
@@ -112,6 +110,8 @@ class SimulatorRenderer:
     # fork would inherit CUDA/EGL state.
     _TILE_POOLS: list | None = None
     _POOL_SEQ: int = 0
+    _POOL_AFFINITY: bool = True   # env->pool sticky; NGL_NATIVE_FETCH_AFFINITY=0 = round-robin
+    _POOL_RR: int = 0             # round-robin cursor for the no-affinity A/B arm
 
     # Coarse level requested first; MeshStore.get walks down to whatever the
     # segment actually has. NG streams meshes the same way.
@@ -443,16 +443,21 @@ class SimulatorRenderer:
         this is a shard count and not a global switch.
         """
         if cls._TILE_POOLS is None:
-            n = max(1, int(os.environ.get("NGL_NATIVE_FETCH_WORKERS", "6")))
-            cls._TILE_POOLS = [
-                ProcessPoolExecutor(
-                    max_workers=1, mp_context=multiprocessing.get_context("spawn"))
-                for _ in range(n)]
+            from .fetch_pool import make_pools, pool_config
+            cls._TILE_POOLS = make_pools()
+            _, _, cls._POOL_AFFINITY = pool_config()
         return cls._TILE_POOLS
 
-    def _tile_pool(self) -> ProcessPoolExecutor:
-        pools = self._pools()
-        return pools[self._pool_shard % len(pools)]
+    def _tile_pool(self):
+        cls = type(self)
+        pools = cls._pools()
+        if cls._POOL_AFFINITY:
+            return pools[self._pool_shard % len(pools)]
+        # A/B no-affinity: round-robin each dispatch, scattering an env's fetches
+        # across workers -- deliberately breaks per-worker chunk-LRU locality.
+        idx = cls._POOL_RR % len(pools)
+        cls._POOL_RR += 1
+        return pools[idx]
 
     # ------------------------------------------------------------------ picking
 
