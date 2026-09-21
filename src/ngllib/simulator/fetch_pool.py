@@ -258,6 +258,9 @@ class _SocketPool:
                 conn = None
                 fut._set(None, e)
 
+    def shutdown(self, wait=False):  # parity with ProcessPoolExecutor
+        self._q.put(None)
+
 
 def _make_socket_pools(n: int):
     host = os.environ.get("NGL_FETCH_SERVER_HOST")
