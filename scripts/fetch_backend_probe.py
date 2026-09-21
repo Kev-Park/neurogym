@@ -82,8 +82,22 @@ def main():
     print(f"affinity: same-actor warm={warm:.1f} ms  fresh-actor cold={cold:.1f} ms "
           f"-> chunk-LRU reuse {verdict}", flush=True)
 
+    # --- approach D: _RayPool background-thread path (env thread never calls ray) ---
+    from ngllib.simulator.fetch_pool import _RayPool, _LocalFuture
+    pool = _RayPool(Actor.remote())
+    f = pool.submit(worker_tile, src, pos_nm, ext[0], ext[1], MAXPX, False)
+    is_local = isinstance(f, _LocalFuture)      # env thread gets a LOCAL future
+    early_done = f.done()                        # local Event check, no ray call
+    pool_tile = f.result(timeout=120)            # blocks on local Event; ray.get on bg thread
+    dpt = int(np.abs(ref_tile.astype(np.int64) - pool_tile.astype(np.int64)).max())
+    pool.shutdown()
+    print(f"RayPool(D): local_future={is_local} done_before={early_done} tile_diff={dpt}",
+          flush=True)
+    d_ok = is_local and dpt == 0
+    print(f"RAYPOOL-D-PARITY {'PASS' if d_ok else 'FAIL'}", flush=True)
+
     ray.shutdown()
-    return 0 if ok else 1
+    return 0 if (ok and d_ok) else 1
 
 
 if __name__ == "__main__":
