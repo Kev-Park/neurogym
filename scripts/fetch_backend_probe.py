@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 import numpy as np
 
@@ -95,9 +97,45 @@ def main():
           flush=True)
     d_ok = is_local and dpt == 0
     print(f"RAYPOOL-D-PARITY {'PASS' if d_ok else 'FAIL'}", flush=True)
-
     ray.shutdown()
-    return 0 if (ok and d_ok) else 1
+
+    # --- socket backend: start a local fetch server, connect a _SocketPool ---
+    from ngllib.simulator.fetch_pool import _SocketPool, _LocalFuture
+    sport = 39917
+    srv = subprocess.Popen([sys.executable, "-m", "ngllib.simulator.fetch_server",
+                            str(sport)])
+    time.sleep(4)  # let it bind
+    s_ok = False
+    try:
+        sp = _SocketPool("127.0.0.1", sport)
+        f = sp.submit(worker_tile, src, pos_nm, ext[0], ext[1], MAXPX, False)
+        s_local = isinstance(f, _LocalFuture)
+        s_tile = f.result(timeout=120)
+        dst = int(np.abs(ref_tile.astype(np.int64) - s_tile.astype(np.int64)).max())
+        fm = sp.submit(worker_mesh, src, ROOT, 0)
+        s_v, s_vn, s_f = fm.result(timeout=180)
+        dmv = float(np.abs(ref_v - s_v).max())
+        dmf = int(np.abs(ref_f - s_f).max())
+        # affinity: same pool (warm, sticky server proc) vs fresh pool (cold)
+        t0 = time.perf_counter()
+        sp.submit(worker_tile, src, pos_nm, ext[0], ext[1], MAXPX, False).result(60)
+        s_warm = (time.perf_counter() - t0) * 1e3
+        sp2 = _SocketPool("127.0.0.1", sport)
+        t0 = time.perf_counter()
+        sp2.submit(worker_tile, src, pos_nm, ext[0], ext[1], MAXPX, False).result(60)
+        s_cold = (time.perf_counter() - t0) * 1e3
+        sp.shutdown(); sp2.shutdown()
+        s_ok = s_local and dst == 0 and dmv == 0.0 and dmf == 0
+        print(f"Socket: local_future={s_local} tile_diff={dst} mesh_vert_diff={dmv} "
+              f"mesh_face_diff={dmf}", flush=True)
+        print(f"Socket affinity: warm(same conn)={s_warm:.1f} ms  cold(fresh conn)="
+              f"{s_cold:.1f} ms -> reuse {'OBSERVED' if s_warm < 0.6 * s_cold else 'weak'}",
+              flush=True)
+    finally:
+        srv.terminate()
+    print(f"SOCKET-PARITY {'PASS' if s_ok else 'FAIL'}", flush=True)
+
+    return 0 if (ok and d_ok and s_ok) else 1
 
 
 if __name__ == "__main__":

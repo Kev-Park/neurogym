@@ -20,21 +20,59 @@ unchanged:
 Decoded results (numpy tiles ~0.8 MB, meshes up to ~60 MB) ship back over Ray's
 object store -- the network cost is the trade to measure against the CPU gain.
 
+- **socket**: N persistent TCP connections to a fetch server (fetch_server.py) on the
+  CPU node. The GPU node connects OUT (the only direction a directional firewall
+  allows), so NO Ray cluster spans the nodes -- the GPU node runs local Ray and each
+  env-runner's pool just opens a socket. Sidesteps every cross-node Ray issue.
+
 Knobs (launcher-set, per-node budgets):
 - NGL_NATIVE_FETCH_WORKERS   pool count N (default 6)
-- NGL_NATIVE_FETCH_BACKEND   'process' (default) | 'ray'
+- NGL_NATIVE_FETCH_BACKEND   'process' (default) | 'ray' | 'socket'
 - NGL_NATIVE_FETCH_AFFINITY  '1' (default, env->pool sticky) | '0' (round-robin, A/B)
 - NGL_NATIVE_FETCH_RESOURCE  ray custom resource to pin fetch actors onto (e.g.
                              'fetch_cpu'); unset => placed anywhere (local, Stage 0)
+- NGL_FETCH_SERVER_HOST/PORT socket backend: the CPU-node fetch server's IP + port
 """
 from __future__ import annotations
 
 import multiprocessing
 import os
+import pickle
 import queue
+import socket
+import struct
 import threading
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
+
+
+# ---------------------------------------------------------------- socket wire
+# Length-prefixed frames (4-byte big-endian length + payload), shared by the
+# socket fetch client (below) and fetch_server.py. Used by the 'socket' backend:
+# GPU-node env-runners connect OUT to a fetch server on the CPU node (the only
+# direction a directional firewall allows) and get decoded numpy back on the same
+# stateful connection -- disaggregated fetch with no Ray and no login proxy.
+
+def _recv_all(conn: socket.socket, n: int) -> bytes | None:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
+def recv_msg(conn: socket.socket) -> bytes | None:
+    hdr = _recv_all(conn, 4)
+    if hdr is None:
+        return None
+    (ln,) = struct.unpack(">I", hdr)
+    return _recv_all(conn, ln)
+
+
+def send_msg(conn: socket.socket, payload: bytes) -> None:
+    conn.sendall(struct.pack(">I", len(payload)) + payload)
 
 
 def pool_config() -> tuple[int, str, bool]:
@@ -49,6 +87,8 @@ def make_pools():
     n, backend, _ = pool_config()
     if backend == "ray":
         return _make_ray_pools(n)
+    if backend == "socket":
+        return _make_socket_pools(n)
     return _make_process_pools(n)
 
 
@@ -161,3 +201,68 @@ def _make_ray_pools(n: int):
     if res:  # pin onto CPU-only nodes that advertise this custom resource
         opts["resources"] = {res: 1}
     return [_RayPool(cls.options(**opts).remote()) for _ in range(n)]
+
+
+# ------------------------------------------------------------------- socket
+# A GPU-node client that connects OUT to a fetch server on the CPU node (see
+# fetch_server.py). One persistent connection per pool -> the server serves it
+# from one process with its own chunk/mesh LRU, so env->pool affinity gives the
+# same locality as the process pools. All socket I/O runs on a dedicated
+# background thread (approach D): env threads only submit + poll _LocalFuture.
+
+class _SocketPool:
+    def __init__(self, host: str, port: int):
+        self._host, self._port = host, port
+        self._q: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._loop, name="socket-fetch-pool", daemon=True)
+        self._thread.start()
+
+    def submit(self, fn, *args):
+        fut = _LocalFuture()
+        self._q.put((fut, fn, args))
+        return fut
+
+    def _connect(self) -> socket.socket:
+        s = socket.create_connection((self._host, self._port), timeout=60)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return s
+
+    def _loop(self):
+        conn = None
+        while True:
+            item = self._q.get()
+            if item is None:  # shutdown sentinel
+                if conn is not None:
+                    conn.close()
+                return
+            fut, fn, args = item
+            try:
+                if conn is None:
+                    conn = self._connect()
+                send_msg(conn, pickle.dumps((fn, args), protocol=pickle.HIGHEST_PROTOCOL))
+                reply = recv_msg(conn)
+                if reply is None:
+                    raise ConnectionError("fetch server closed the connection")
+                status, payload = pickle.loads(reply)
+                if status == "ok":
+                    fut._set(payload, None)
+                else:
+                    fut._set(None, RuntimeError(f"fetch server: {payload}"))
+            except Exception as e:  # noqa: BLE001 - reconnect next request, surface now
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                conn = None
+                fut._set(None, e)
+
+
+def _make_socket_pools(n: int):
+    host = os.environ.get("NGL_FETCH_SERVER_HOST")
+    port = os.environ.get("NGL_FETCH_SERVER_PORT")
+    if not host or not port:
+        raise RuntimeError(
+            "socket fetch backend needs NGL_FETCH_SERVER_HOST + NGL_FETCH_SERVER_PORT")
+    return [_SocketPool(host, int(port)) for _ in range(n)]
