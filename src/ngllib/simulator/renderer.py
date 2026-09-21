@@ -800,7 +800,9 @@ class SimulatorRenderer:
             payload = self._renderer.render_em(
                 tiles.get("em"), tiles.get("ids"), vis,
                 tile_key=self._tile_key, to_cuda=True)
-            return (payload, False)
+            # (payload, gl_flip, top_pad): left EM pane is unflipped; TOOLBAR black
+            # rows are re-added at encode so interop matches the numpy canvas.
+            return (payload, False, TOOLBAR)
         cached = tiles.get("left_canvas")
         if cached is not None and tiles.get("left_vis") == vis:
             return cached
@@ -832,10 +834,12 @@ class SimulatorRenderer:
         if self.cuda_ipc:
             # render(to_cuda=True) already returns the STABLE CUDA-IPC (rebuild,
             # args) payload for the GPU-resident frame (built once, reused). Ship
-            # it as-is; the DINO server rebuilds/caches it in VRAM. No toolbar pad.
+            # it as-is; the DINO server rebuilds/caches it in VRAM.
             # gl_flip=True: the 3D framebuffer is bottom-up (the numpy path reads
-            # it with [::-1]), so the server must flip it to image order.
-            return (pane, True)
+            # it with [::-1]), so the server must flip it to image order. top_pad=
+            # TOOLBAR re-adds the black toolbar strip AFTER the flip, matching the
+            # readback `out[TOOLBAR:] = pane` so the obs is framed identically.
+            return (pane, True, TOOLBAR)
         out = np.zeros((PANE, PANE, 3), dtype=np.uint8)
         out[TOOLBAR:] = pane
         return out
