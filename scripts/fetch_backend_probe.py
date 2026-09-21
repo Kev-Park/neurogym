@@ -38,11 +38,11 @@ def main():
 
     # --- ray backend ---
     import ray
+    # Disable Ray>=2.43's uv-run auto-upload of the 1.2GB CWD as runtime_env (it
+    # stalls actor startup); all nodes share /scratch, so no upload is needed.
+    os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
     ray.init(ignore_reinit_error=True, num_cpus=4, log_to_driver=False,
-             include_dashboard=False,
-             runtime_env={"excludes": ["*.csv", "*.zip", ".venv/**", ".git/**",
-                                       "slurm_outputs/**", "rb_out/**",
-                                       "checkpoints/**", "*.out"]})
+             include_dashboard=False)
     from ngllib.simulator.fetch_pool import _fetch_actor_cls
     Actor = _fetch_actor_cls()
     a = Actor.remote()
