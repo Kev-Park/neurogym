@@ -1,0 +1,4 @@
+
+# The packaged Neuroglancer build is shipped bytes: never translate line
+# endings, or a Windows checkout serves different bytes than were built.
+src/ngllib/viewer/** -text

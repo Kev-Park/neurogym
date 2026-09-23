@@ -1,0 +1,14 @@
+This directory contains a compiled, MODIFIED build of Neuroglancer.
+
+Upstream:      https://github.com/google/neuroglancer (Apache License 2.0)
+Modifications: https://github.com/seung-lab/neuroglancer.git
+               branch rl-recording, commit 2556d44570921c225c1869f96a32ac48bb2454b8
+               The fork retains support for the legacy graphene mesh layout
+               (mesh directories with no info file, e.g. FlyWire's
+               fly_v31_meshes_v2_062619) that current upstream builds fail to
+               load, and adds proofreading and recording features.
+Built by:      ngllib scripts/build_viewer.sh
+
+Licensed under the Apache License, Version 2.0; see LICENSE in this directory.
+Bundled third-party components retain their own licences; see
+THIRD_PARTY_NOTICES.txt.

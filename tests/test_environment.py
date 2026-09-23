@@ -168,7 +168,8 @@ def test_ui_mask_only_on_the_calibrated_two_pane_frame(fake_renderer, monkeypatc
     obs, _ = two.reset()
     assert obs["image"].shape == (450, 900, 3)
     assert obs["image"][0, 0].tolist() == [0, 0, 0]        # toolbar strip blanked
-    assert obs["image"][200, 450].tolist() == [200, 200, 200]
+    assert obs["image"][200, 450].tolist() == [0, 0, 0]    # 3D pane left edge blanked
+    assert obs["image"][200, 500].tolist() == [200, 200, 200]   # pane content kept
     one = Environment(backend=fake_renderer(capture_scale=0.5))
     obs, _ = one.reset()
     assert obs["image"][0, 0].tolist() == [200, 200, 200]  # single pane: untouched

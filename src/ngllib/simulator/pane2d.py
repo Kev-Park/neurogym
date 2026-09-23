@@ -42,10 +42,29 @@ CANONICAL_NM = float(min(CALIBRATED_DATASET.voxel_nm))
 # is real (perspective camera vs NG's orthographic unit definition) and
 # has not been derived, so the fitted value ships.
 SCALE_CAL_NM = 4.07
-# Chrome/simulator EM intensity ratio on grey 2D-pane pixels (2026-08-28,
-# re-confirmed optimal by probe_left_pane_parity 2026-09-10). Chrome's image
-# layer opacity 0.5 does NOT halve on-screen EM; ~1.0 is right.
-EM_GAIN = 0.978
+# Chrome/simulator EM intensity ratio on grey 2D-pane pixels. Chrome's image
+# layer opacity 0.5 does NOT halve on-screen EM; ~1.0 is right, and 1.0 is now
+# what ships: fitting the pane's EM against Chrome (probe_em_tone) found a pure
+# GAIN error of x1.0257 on 0.978 -- no gamma (0.9986) and no offset -- identical
+# across five states, and re-rendering at each candidate (probe_em_gain_sweep,
+# job 967366) put 1.0 best on both mean |diff| (4.81 -> 3.68) and block-SSIM
+# (0.9687 -> 0.9699), with segment IoU unmoved. The earlier 0.978 came from a
+# JPEG-captured comparison, which depresses exactly this measurement.
+# NGL_NATIVE_EM_GAIN overrides it for sweeps. Changing this changes the
+# observation for every existing run.
+EM_GAIN = 1.0
+
+
+def em_gain() -> float:
+    """EM_GAIN, or the NGL_NATIVE_EM_GAIN override (calibration sweeps).
+
+    Read per call so a sweep can change it between renders in one process;
+    the constant is what ships.
+    """
+    import os
+
+    v = os.environ.get("NGL_NATIVE_EM_GAIN")
+    return float(v) if v else EM_GAIN
 # 2D-pane fetch-centre correction in captured px (dy, dx). Registration is
 # pixel-exact with it (jitter sd 0.0) and the 2026-09-10 shift search found
 # no better offset. Absorbs the ~1.6% vertical over-extent of CSS_VIEW_H.
@@ -58,6 +77,20 @@ LEFT_SHIFT_PX = (-3.0, 0.0)
 PANE = 450
 TOOLBAR = 17
 PANE_H = PANE - TOOLBAR
+# The 3D pane's capture geometry is NOT the 2D pane's. Fitted 2026-09-18 by
+# sweeping the composite offset against the fork build over a 16x zoom range
+# (probe_3d_calibrate.py, job 922247): k=+3 wins at every zoom and by a wide
+# margin in the mean (mesh+plane IoU 0.650 at k=0 -> 0.855 at k=+3, falling
+# again at k=+4). Zoom-invariance says this is the pane origin, not the
+# projection -- our optical centre sat at TOOLBAR + PANE_H/2 = 233.5 where
+# Chrome's is ~236.5.
+# The RENDER stays PANE_H tall so the camera's aspect and scale (fitted as
+# SCALE_CAL_NM) are untouched; only the composite moves down, cropping the
+# bottom PANE_3D_SHIFT rows. Rendering 430 tall instead put the centre at 235
+# and rescaled the content -- the re-sweep then asked for +2 more rows.
+TOOLBAR_3D = 20
+PANE_3D_SHIFT = TOOLBAR_3D - TOOLBAR      # 3 capture px
+PANE_H_3D = PANE - TOOLBAR_3D             # displayed rows of the 3D pane
 CSS_PANE = 900.0
 CSS_TOOLBAR = 33.0
 CSS_VIEW_H = 867.0
@@ -110,7 +143,7 @@ def resample_em(tile) -> np.ndarray:
     """
     big = Image.fromarray(tile).resize((900, 867), Image.BILINEAR)
     img = np.asarray(big.resize((PANE, PANE_H), Image.BOX)).astype(np.float32)
-    return np.clip(img * EM_GAIN, 0, 255).astype(np.uint8)
+    return np.clip(img * em_gain(), 0, 255).astype(np.uint8)
 
 
 def draw_crosshair(rgb: np.ndarray) -> None:
@@ -222,6 +255,11 @@ UI_REGIONS = (
     (416, 450, 0, 80),      # 2D pane scale bar ("750 nm")
     (16, 48, 868, 900),     # 3D pane top-right buttons
     (416, 450, 820, 900),   # 3D pane "Sections" control
+    # The 3D pane has a left edge too, and only the 2D pane's was masked: this
+    # strip is where the 62 pixels that still differed between two CHROME
+    # builds lived (2026-09-17), and its grey axis labels contaminated the
+    # section-plane measurement in probe_3d_calibrate.py until it was masked.
+    (0, 450, 450, 466),     # 3D pane left edge (axis labels)
 )
 
 

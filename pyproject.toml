@@ -44,4 +44,6 @@ where = ["src"]
 include = ["ngllib*"]
 
 [tool.setuptools.package-data]
-ngllib = ["config.json"]
+# viewer/ is the committed Neuroglancer build served to headless Chromium
+# (see scripts/build_viewer.sh). Flat directory, so no recursive glob.
+ngllib = ["config.json", "viewer/*"]

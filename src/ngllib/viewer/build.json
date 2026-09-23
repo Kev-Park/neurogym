@@ -1,0 +1,9 @@
+{
+  "remote": "https://github.com/seung-lab/neuroglancer.git",
+  "branch": "rl-recording",
+  "commit": "2556d44570921c225c1869f96a32ac48bb2454b8",
+  "dirty": false,
+  "node": "v24.6.0",
+  "built_at": "2026-09-18T15:50:37Z",
+  "built_by": "scripts/build_viewer.sh"
+}
