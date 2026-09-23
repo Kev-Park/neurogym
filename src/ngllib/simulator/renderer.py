@@ -39,7 +39,20 @@ from typing import Any, Literal
 import numpy as np
 
 from .. import state as S
-from ..dataset import DatasetSpec, default_start_url, ngl_state_from_viewer, split_state_url
+from ..auth import (
+    cave_token_from_config,
+    cloudvolume_secret_exists,
+    ensure_cave_secret,
+    read_cave_token,
+)
+from ..dataset import (
+    DatasetSpec,
+    default_start_url,
+    load_config,
+    ngl_state_from_viewer,
+    split_state_url,
+)
+from ..errors import RendererError
 from ..events import EventLog
 from ..renderer import PaneLayout
 from .colors import segment_color
@@ -138,6 +151,7 @@ class SimulatorRenderer:
         pane_mode: PaneMode = "atomic",
         dataset: DatasetSpec | None = None,
         config_path: str | None = None,
+        cave_secret: str | None = None,
     ):
         if pane_mode not in PANE_MODES:
             raise ValueError(f"`pane_mode` must be one of {PANE_MODES}; got {pane_mode!r}")
@@ -151,6 +165,8 @@ class SimulatorRenderer:
         # Deployment identity: the same start URL Chrome navigates to. The
         # dataset is what the simulator reads; the URL's viewer state is the
         # default start state, exactly as for Chrome.
+        self._config_path = config_path
+        self.cave_secret = cave_secret
         self._url_prefix, self._base_state = split_state_url(default_start_url(config_path))
         self.dataset = dataset or DatasetSpec.from_state(self._base_state)
         if self.dataset != CALIBRATED_DATASET:
@@ -235,11 +251,37 @@ class SimulatorRenderer:
     # ------------------------------------------------------------------ protocol
 
     def open(self) -> None:
+        self._ensure_credentials()
         if self._renderer is None:
             self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget)
             logger.info("simulator GL: %s", self._renderer.ctx.info["GL_RENDERER"])
         if self._meshes is None:
             self._meshes = MeshStore(self.source)
+
+    def _ensure_credentials(self) -> None:
+        """Make a CAVE token reachable by CloudVolume and its fetch workers.
+
+        Only for sources that need one: a public dataset needs no token, and
+        asking for one would turn a working public setup into an error. A token
+        already in CloudVolume's own secrets file is left alone; one configured
+        inline is materialised into a private directory (see ngllib.auth),
+        because the workers are spawned processes that can only read files.
+        """
+        if not self._needs_cave_token() or cloudvolume_secret_exists():
+            return
+        token = (read_cave_token(self.cave_secret) if self.cave_secret
+                 else cave_token_from_config(load_config(self._config_path)))
+        if not token:
+            raise RendererError(
+                f"{self.dataset.seg_url} is a middleauth source but no CAVE token was "
+                "found: set `cave_token` in your config, pass cave_secret=, or write "
+                "~/.cloudvolume/secrets/cave-secret.json")
+        path = ensure_cave_secret(token)
+        logger.info("CAVE token materialised for CloudVolume at %s/secrets", path)
+
+    def _needs_cave_token(self) -> bool:
+        urls = (self.dataset.seg_url or "", self.dataset.em_url or "")
+        return any("middleauth" in u or u.startswith("graphene://") for u in urls)
 
     def close(self) -> None:
         # The class-level tile pools outlive individual renderers on purpose

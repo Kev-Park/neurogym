@@ -38,6 +38,7 @@ from .dataset import (
     normalize_start_url,
     state_to_url,
 )
+from .auth import cave_token_from_config, read_cave_token
 from .errors import BrowserError
 from .events import EventLog
 from .renderer import PaneLayout
@@ -51,7 +52,6 @@ logger = logging.getLogger(__name__)
 # list of servers the token may be sent to -- the provider throws UnverifiedApp
 # for anything else, so it must contain the graphene hosts of the start URL.
 MIDDLEAUTH_STORAGE_KEY = "auth_token_v2"
-CAVE_SECRET_PATH = "~/.cloudvolume/secrets/cave-secret.json"
 
 # The packaged viewer is served to the page from this origin. Frozen: the CAVE
 # token in a storage_state is keyed by origin, so renaming it would silently
@@ -100,20 +100,6 @@ def cave_storage_state(origin: str, login_url: str, token: str,
              "url": login_url, "appUrls": list(app_urls)}
     return {"cookies": [], "origins": [{"origin": origin, "localStorage": [
         {"name": f"{MIDDLEAUTH_STORAGE_KEY}_{login_url}", "value": json.dumps(entry)}]}]}
-
-
-def read_cave_token(path: str | None = None) -> str:
-    """The CAVE token CloudVolume uses, so both backends share one secret."""
-    f = Path(os.path.expanduser(path or CAVE_SECRET_PATH))
-    if not f.is_file():
-        raise BrowserError(
-            f"start URL has a middleauth source but no CAVE token at {f}; "
-            "mint one (caveclient auth.setup_token) or pass storage_state=")
-    data = json.loads(f.read_text())
-    token = data.get("token") or data.get("middle_auth_token")
-    if not token:
-        raise BrowserError(f"{f} has no 'token' field")
-    return token
 
 
 def packaged_viewer_dir() -> Path | None:
@@ -300,6 +286,7 @@ class ChromeRenderer:
         # nothing has to be configured per deployment.
         self.storage_state = storage_state
         self.cave_secret = cave_secret
+        self.config_path = config_path
         self._middleauth_hosts = middleauth_hosts(self._base_state)
         self._storage_state: str | dict[str, Any] | None = None
 
@@ -331,8 +318,12 @@ class ChromeRenderer:
             self._storage_state = self.storage_state
         elif self._middleauth_hosts:
             app = self._middleauth_hosts[0]
+            # A token configured inline wins over the secrets file, so one
+            # config can carry a deployment end to end.
+            token = (cave_token_from_config(load_config(self.config_path))
+                     if self.cave_secret is None else None)
             self._storage_state = cave_storage_state(
-                self._origin, auth_server_for(app), read_cave_token(self.cave_secret),
+                self._origin, auth_server_for(app), token or read_cave_token(self.cave_secret),
                 self._middleauth_hosts)
             logger.info("seeded CAVE token for %s on %s", app, self._origin)
         else:
