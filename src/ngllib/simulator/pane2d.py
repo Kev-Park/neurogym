@@ -42,10 +42,17 @@ CANONICAL_NM = float(min(CALIBRATED_DATASET.voxel_nm))
 # is real (perspective camera vs NG's orthographic unit definition) and
 # has not been derived, so the fitted value ships.
 SCALE_CAL_NM = 4.07
-# Chrome/simulator EM intensity ratio on grey 2D-pane pixels (2026-08-28,
-# re-confirmed optimal by probe_left_pane_parity 2026-09-10). Chrome's image
-# layer opacity 0.5 does NOT halve on-screen EM; ~1.0 is right.
-EM_GAIN = 0.978
+# Chrome/simulator EM intensity ratio on grey 2D-pane pixels. Chrome's image
+# layer opacity 0.5 does NOT halve on-screen EM; ~1.0 is right, and 1.0 is now
+# what ships: fitting the pane's EM against Chrome (probe_em_tone) found a pure
+# GAIN error of x1.0257 on 0.978 -- no gamma (0.9986) and no offset -- identical
+# across five states, and re-rendering at each candidate (probe_em_gain_sweep,
+# job 967366) put 1.0 best on both mean |diff| (4.81 -> 3.68) and block-SSIM
+# (0.9687 -> 0.9699), with segment IoU unmoved. The earlier 0.978 came from a
+# JPEG-captured comparison, which depresses exactly this measurement.
+# NGL_NATIVE_EM_GAIN overrides it for sweeps. Changing this changes the
+# observation for every existing run.
+EM_GAIN = 1.0
 
 
 def em_gain() -> float:

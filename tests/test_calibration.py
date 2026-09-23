@@ -14,7 +14,7 @@ from ngllib.simulator import pane2d
 
 def test_fitted_constants():
     assert pane2d.SCALE_CAL_NM == 4.07          # sweep peak 2026-09-10; 3.95/4.19 worse
-    assert pane2d.EM_GAIN == 0.978              # optimal by probe_left_pane_parity
+    assert pane2d.EM_GAIN == 1.0                # refit 2026-09-23, job 967366
     assert pane2d.LEFT_SHIFT_PX == (-3.0, 0.0)  # registration pixel-exact
     assert pane2d.PLANE_EXT_SCALE == 1.0        # plane-extent sweep peak
 
