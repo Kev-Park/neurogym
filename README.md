@@ -11,7 +11,7 @@ This repository provides a Python library called `ngllib`, which contains a Gymn
 Some of the capabilities `ngllib` provides (not exhaustive) includes:
 
 - Headless GPU-accelerated Neuroglancer rendering using Chromium with automatic browser restarting and error handling for long training run stability
-- Distributed (multi-node) environment stepping with support for low-latency socket or filesystem-based communication
+- Environment stepping with support for low-latency socket or filesystem-based multi-node communication (direct stepping also an option for custom training frameworks)
 - Already-validated observation and action spaces for policy training and deployment
 - Customizable reset behavior with support for reset curriculums
 - Custom reward function handling
