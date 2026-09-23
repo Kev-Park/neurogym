@@ -46,6 +46,18 @@ SCALE_CAL_NM = 4.07
 # re-confirmed optimal by probe_left_pane_parity 2026-09-10). Chrome's image
 # layer opacity 0.5 does NOT halve on-screen EM; ~1.0 is right.
 EM_GAIN = 0.978
+
+
+def em_gain() -> float:
+    """EM_GAIN, or the NGL_NATIVE_EM_GAIN override (calibration sweeps).
+
+    Read per call so a sweep can change it between renders in one process;
+    the constant is what ships.
+    """
+    import os
+
+    v = os.environ.get("NGL_NATIVE_EM_GAIN")
+    return float(v) if v else EM_GAIN
 # 2D-pane fetch-centre correction in captured px (dy, dx). Registration is
 # pixel-exact with it (jitter sd 0.0) and the 2026-09-10 shift search found
 # no better offset. Absorbs the ~1.6% vertical over-extent of CSS_VIEW_H.
@@ -124,7 +136,7 @@ def resample_em(tile) -> np.ndarray:
     """
     big = Image.fromarray(tile).resize((900, 867), Image.BILINEAR)
     img = np.asarray(big.resize((PANE, PANE_H), Image.BOX)).astype(np.float32)
-    return np.clip(img * EM_GAIN, 0, 255).astype(np.uint8)
+    return np.clip(img * em_gain(), 0, 255).astype(np.uint8)
 
 
 def draw_crosshair(rgb: np.ndarray) -> None:
