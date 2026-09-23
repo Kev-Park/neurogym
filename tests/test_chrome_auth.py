@@ -1,17 +1,16 @@
-"""Viewer-bundle serving and CAVE-token seeding, without a browser."""
+"""Viewer-bundle serving and middleauth storage_state, without a browser.
+
+Token resolution itself lives in ngllib.auth and is tested in test_auth.py.
+"""
 
 import json
-
-import pytest
 
 from ngllib.chrome import (
     MIDDLEAUTH_STORAGE_KEY,
     cave_storage_state,
     dist_file,
     middleauth_hosts,
-    read_cave_token,
 )
-from ngllib.errors import BrowserError
 
 APP = "https://prodv1.flywire-daf.com"
 LOGIN = "https://global.daf-apis.com/sticky_auth"
@@ -40,24 +39,6 @@ def test_cave_storage_state_shape():
     # appUrls is load-bearing: the provider throws UnverifiedApp without it.
     assert json.loads(item["value"]) == {
         "tokenType": "Bearer", "accessToken": "tok", "url": LOGIN, "appUrls": [APP]}
-
-
-def test_read_cave_token(tmp_path):
-    f = tmp_path / "cave-secret.json"
-    f.write_text(json.dumps({"token": "abc123"}))
-    assert read_cave_token(str(f)) == "abc123"
-
-
-def test_read_cave_token_missing_file_names_the_path(tmp_path):
-    with pytest.raises(BrowserError, match="no CAVE token"):
-        read_cave_token(str(tmp_path / "absent.json"))
-
-
-def test_read_cave_token_without_token_field(tmp_path):
-    f = tmp_path / "cave-secret.json"
-    f.write_text(json.dumps({"other": 1}))
-    with pytest.raises(BrowserError, match="no 'token' field"):
-        read_cave_token(str(f))
 
 
 def test_dist_file_resolves_and_defaults_to_index(tmp_path):
