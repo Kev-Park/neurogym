@@ -32,7 +32,8 @@ class MeshRenderer:
 
     `width`/`height` are the pane's true captured pixels BELOW the toolbar
     (450 x 433 at capture scale 0.5) so the optical center and aspect match
-    the browser.
+    the browser; the 3D pane is composited pane2d.PANE_3D_SHIFT rows lower
+    than the 2D pane's toolbar offset.
     """
 
     VAO_BUDGET_BYTES = 2 << 30

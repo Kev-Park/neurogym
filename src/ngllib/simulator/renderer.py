@@ -39,7 +39,20 @@ from typing import Any, Literal
 import numpy as np
 
 from .. import state as S
-from ..dataset import DatasetSpec, default_start_url, ngl_state_from_viewer, split_state_url
+from ..auth import (
+    cave_token_from_config,
+    cloudvolume_secret_exists,
+    ensure_cave_secret,
+    read_cave_token,
+)
+from ..dataset import (
+    DatasetSpec,
+    default_start_url,
+    load_config,
+    ngl_state_from_viewer,
+    split_state_url,
+)
+from ..errors import RendererError
 from ..events import EventLog
 from ..renderer import PaneLayout
 from .colors import segment_color
@@ -61,11 +74,13 @@ from .pane2d import (
     EM_GAIN,
     PANE,
     PANE_H,
+    PANE_H_3D,
     PANEL_CX_CLICK,
     PANEL_CY_CLICK,
     PANEL_TOP_CLICK,
     SCALE_CAL_NM,
     TOOLBAR,
+    TOOLBAR_3D,
     compose_left_parts,
     pane_extents_nm,
     tint_plane,
@@ -138,6 +153,7 @@ class SimulatorRenderer:
         config_path: str | None = None,
         cuda_ipc: bool = False,
         ipc_export: bool = True,
+        cave_secret: str | None = None,
     ):
         if pane_mode not in PANE_MODES:
             raise ValueError(f"`pane_mode` must be one of {PANE_MODES}; got {pane_mode!r}")
@@ -164,6 +180,8 @@ class SimulatorRenderer:
         # Deployment identity: the same start URL Chrome navigates to. The
         # dataset is what the simulator reads; the URL's viewer state is the
         # default start state, exactly as for Chrome.
+        self._config_path = config_path
+        self.cave_secret = cave_secret
         self._url_prefix, self._base_state = split_state_url(default_start_url(config_path))
         self.dataset = dataset or DatasetSpec.from_state(self._base_state)
         if self.dataset != CALIBRATED_DATASET:
@@ -248,6 +266,7 @@ class SimulatorRenderer:
     # ------------------------------------------------------------------ protocol
 
     def open(self) -> None:
+        self._ensure_credentials()
         if self._renderer is None:
             self._renderer = MeshRenderer(PANE, PANE_H, self._mesh_budget,
                                           cuda_ipc=self.cuda_ipc,
@@ -255,6 +274,31 @@ class SimulatorRenderer:
             logger.info("simulator GL: %s", self._renderer.ctx.info["GL_RENDERER"])
         if self._meshes is None:
             self._meshes = MeshStore(self.source)
+
+    def _ensure_credentials(self) -> None:
+        """Make a CAVE token reachable by CloudVolume and its fetch workers.
+
+        Only for sources that need one: a public dataset needs no token, and
+        asking for one would turn a working public setup into an error. A token
+        already in CloudVolume's own secrets file is left alone; one configured
+        inline is materialised into a private directory (see ngllib.auth),
+        because the workers are spawned processes that can only read files.
+        """
+        if not self._needs_cave_token() or cloudvolume_secret_exists():
+            return
+        token = (read_cave_token(self.cave_secret) if self.cave_secret
+                 else cave_token_from_config(load_config(self._config_path)))
+        if not token:
+            raise RendererError(
+                f"{self.dataset.seg_url} is a middleauth source but no CAVE token was "
+                "found: set `cave_token` in your config, pass cave_secret=, or write "
+                "~/.cloudvolume/secrets/cave-secret.json")
+        path = ensure_cave_secret(token)
+        logger.info("CAVE token materialised for CloudVolume at %s/secrets", path)
+
+    def _needs_cave_token(self) -> bool:
+        urls = (self.dataset.seg_url or "", self.dataset.em_url or "")
+        return any("middleauth" in u or u.startswith("graphene://") for u in urls)
 
     def close(self) -> None:
         # The class-level tile pools outlive individual renderers on purpose
@@ -457,8 +501,8 @@ class SimulatorRenderer:
         """
         st = self._state
         ix = int(round(x_css * self.layout.capture_scale - PANE))
-        iy = int(round(y_css * self.layout.capture_scale - TOOLBAR))
-        if not (0 <= ix < PANE and 0 <= iy < PANE_H):
+        iy = int(round(y_css * self.layout.capture_scale - TOOLBAR_3D))
+        if not (0 <= ix < PANE and 0 <= iy < PANE_H_3D):
             return None
         ids = S.visible_segments(st["segments"])
         if not ids:
@@ -471,7 +515,7 @@ class SimulatorRenderer:
             depth, _, _ = self._renderer.pick_depth(
                 [rid], pos_nm, st["projectionOrientation"], zoom_nm)
             # NG picks over a small radius; take the front-most hit nearby.
-            y0, y1 = max(0, iy - 3), min(PANE_H, iy + 4)
+            y0, y1 = max(0, iy - 3), min(PANE_H_3D, iy + 4)
             x0, x1 = max(0, ix - 3), min(PANE, ix + 4)
             d = float(depth[y0:y1, x0:x1].min())
             if d < best_d:
@@ -493,6 +537,11 @@ class SimulatorRenderer:
         Shared by move-to-mouse-position and select so the two cannot drift on
         what "under the cursor" means.
 
+        NOTE (2026-09-18): the capture offset is now TOOLBAR_3D (fitted), which
+        moves every 3D pick 3 capture px with it -- the render and the pick share
+        one MeshRenderer, so they cannot disagree. The click-geometry question
+        below is separate and still open.
+
         NOTE (2026-09-10): the `- TOOLBAR` below carries the same off-by-17-CSS-px
         error the 2D branch had before PANEL_*_CLICK -- the DOM measurement says
         a panel starts at click y=23 and is 853 CSS px tall, so the row should be
@@ -509,16 +558,16 @@ class SimulatorRenderer:
         depth, view, proj = self._renderer.pick_depth(
             S.visible_segments(st["segments"]), pos_nm, quat, zoom_nm, plane_extent_nm=ext)
         fx = x_css * self.layout.capture_scale - PANE
-        fy = y_css * self.layout.capture_scale - TOOLBAR
+        fy = y_css * self.layout.capture_scale - TOOLBAR_3D
         ix, iy = int(round(fx)), int(round(fy))
-        if not (0 <= ix < PANE and 0 <= iy < PANE_H):
+        if not (0 <= ix < PANE and 0 <= iy < PANE_H_3D):
             return None
         d = depth[iy, ix]
         px, py = ix, iy
         if d >= 0.9999:
             # NG issues the pick over a small radius; take the front-most hit
             # in a 3px window (matches the browser-validated harness).
-            y0, y1 = max(0, iy - 3), min(PANE_H, iy + 4)
+            y0, y1 = max(0, iy - 3), min(PANE_H_3D, iy + 4)
             x0, x1 = max(0, ix - 3), min(PANE, ix + 4)
             win = depth[y0:y1, x0:x1]
             if not (win < 0.9999).any():
@@ -526,7 +575,7 @@ class SimulatorRenderer:
             yy, xx = np.unravel_index(np.argmin(win), win.shape)
             d, px, py = win[yy, xx], x0 + xx, y0 + yy
         ndc = np.array([2 * (px + 0.5) / PANE - 1,
-                        1 - 2 * (py + 0.5) / PANE_H,
+                        1 - 2 * (py + 0.5) / PANE_H_3D,
                         2 * d - 1, 1.0])
         w = np.linalg.inv(proj @ view) @ ndc
         return [float(v) for v in (w[:3] / w[3]) / self._voxel_nm]
@@ -811,7 +860,9 @@ class SimulatorRenderer:
             # it with [::-1]), so the server must flip it to image order.
             return (pane, True)
         out = np.zeros((PANE, PANE, 3), dtype=np.uint8)
-        out[TOOLBAR:] = pane
+        # Composited TOOLBAR_3D rows down (the 3D panel's own origin), the last
+        # PANE_3D_SHIFT rendered rows falling off the bottom.
+        out[TOOLBAR_3D:] = pane[:PANE_H_3D]
         return out
 
     def _render(self, block_tiles: bool) -> np.ndarray:

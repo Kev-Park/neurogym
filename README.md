@@ -11,7 +11,7 @@ This repository provides a Python library called `ngllib`, which contains a Gymn
 Some of the capabilities `ngllib` provides (not exhaustive) includes:
 
 - Headless GPU-accelerated Neuroglancer rendering using Chromium with automatic browser restarting and error handling for long training run stability
-- Distributed (multi-node) environment stepping with support for low-latency socket or filesystem-based communication
+- Environment stepping with support for low-latency socket or filesystem-based multi-node communication (direct stepping also an option for custom training frameworks)
 - Already-validated observation and action spaces for policy training and deployment
 - Customizable reset behavior with support for reset curriculums
 - Custom reward function handling
@@ -67,6 +67,50 @@ for _ in range(20):
 
 env.close()
 ```
+
+### The bundled viewer
+
+`ChromeRenderer` serves a Neuroglancer build from inside the package
+(`ngllib/viewer/`) on a synthetic origin, rather than loading a hosted one. Two
+reasons: a pinned build cannot change under a running experiment, and current
+upstream builds cannot load FlyWire's graphene segmentation at all (its 2019
+mesh layout has no `info` file, which upstream now treats as a load error).
+
+Which build renders is `viewer=`, independent of `start_url`, which is only the
+scene:
+
+```python
+ChromeRenderer()                                  # packaged build (default)
+ChromeRenderer(viewer="hosted")                   # the start URL's own origin
+ChromeRenderer(viewer="/path/to/dist/client")     # your own build
+```
+
+Resolution order: the argument, `NGL_VIEWER_DIST`, `config.json`'s `viewer`,
+then the packaged build. Hosted is never a fallback -- if no build resolves,
+`open()` raises rather than silently reaching for a remote viewer.
+
+A link pasted from any Neuroglancer deployment works as `start_url`: a legacy
+viewer state (`navigation.pose`, `zoomFactor`) is converted to the modern
+fields, and `graphene://` sources are rewritten to `graphene://middleauth+`.
+
+To rebuild the viewer from the fork, with `seung-lab/neuroglancer` cloned beside
+this repo and Node >= 20.10 installed:
+
+```
+bash scripts/build_viewer.sh --fork-dir ../neuroglancer
+```
+
+It refuses a dirty fork checkout, so `ngllib/viewer/build.json` always names the
+commit the shipped bytes came from; `ChromeRenderer.open()` logs it.
+
+### Non-public volumes
+
+A `graphene://middleauth+...` source needs a CAVE token. ngllib reads the one
+CloudVolume already uses (`~/.cloudvolume/secrets/cave-secret.json`) and seeds it
+into every browser context, so there is no interactive login: mint a token once
+(`caveclient`'s `auth.setup_token()`), write it to that file, and both renderers
+use it. `ChromeRenderer(storage_state=...)` takes an explicit Playwright
+credential file instead, for sources authenticated some other way.
 
 Documentation is WIP; please reach out to [kp0374@princeton.edu](mailto:kp0374@princeton.edu) if you have any questions.
 

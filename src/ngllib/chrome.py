@@ -14,11 +14,15 @@ import base64
 import io
 import json
 import logging
+import mimetypes
 import os
 import platform
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
 from typing import Any, Callable, Literal
 
 import numpy as np
@@ -28,11 +32,13 @@ from PIL import Image
 from .dataset import (
     DatasetSpec,
     default_start_url,
+    load_config,
     merge_state,
     ngl_state_from_viewer,
-    split_state_url,
+    normalize_start_url,
     state_to_url,
 )
+from .auth import cave_token_from_config, read_cave_token
 from .errors import BrowserError
 from .events import EventLog
 from .renderer import PaneLayout
@@ -40,6 +46,116 @@ from .state import REQUIRED_FIELDS
 from .utils.MouseActionHandler import MouseActionHandler
 
 logger = logging.getLogger(__name__)
+
+# Neuroglancer's middle-auth provider stores one token per auth server under
+# this localStorage key; the value shape is MiddleAuthToken. `appUrls` is the
+# list of servers the token may be sent to -- the provider throws UnverifiedApp
+# for anything else, so it must contain the graphene hosts of the start URL.
+MIDDLEAUTH_STORAGE_KEY = "auth_token_v2"
+
+# The packaged viewer is served to the page from this origin. Frozen: the CAVE
+# token in a storage_state is keyed by origin, so renaming it would silently
+# invalidate every saved credential file. Never resolved by DNS -- the route
+# intercepts first -- but it is a secure context with a real Origin header,
+# which `file://` is not and which prodv1/GCS accept (measured 2026-09-17).
+VIEWER_ORIGIN = "https://ngl.local"
+PACKAGED_VIEWER = "packaged"
+HOSTED_VIEWER = "hosted"
+
+
+def middleauth_hosts(state: dict[str, Any]) -> list[str]:
+    """App servers of every `middleauth+https://…` source in `state`."""
+    hosts: list[str] = []
+    for layer in state.get("layers", []) or []:
+        src = layer.get("source")
+        for one in (src if isinstance(src, list) else [src]):
+            url = one if isinstance(one, str) else (one or {}).get("url", "")
+            if "middleauth+" not in url:
+                continue
+            after = url.split("middleauth+", 1)[1]
+            parsed = urllib.parse.urlparse(after)
+            host = f"{parsed.scheme}://{parsed.netloc}"
+            if host not in hosts:
+                hosts.append(host)
+    return hosts
+
+
+def auth_server_for(app_url: str, timeout: float = 15.0) -> str:
+    """The auth server a graphene app delegates to (its `/auth_info` login_url).
+
+    One GET at open(), exactly what the viewer does before asking for a token.
+    """
+    with urllib.request.urlopen(f"{app_url.rstrip('/')}/auth_info", timeout=timeout) as r:
+        return json.load(r)["login_url"]
+
+
+def cave_storage_state(origin: str, login_url: str, token: str,
+                       app_urls: list[str]) -> dict[str, Any]:
+    """A Playwright storage_state seeding `token` for `login_url` on `origin`.
+
+    Equivalent to having completed the middle-auth popup in that browser
+    profile, so no context ever has to.
+    """
+    entry = {"tokenType": "Bearer", "accessToken": token,
+             "url": login_url, "appUrls": list(app_urls)}
+    return {"cookies": [], "origins": [{"origin": origin, "localStorage": [
+        {"name": f"{MIDDLEAUTH_STORAGE_KEY}_{login_url}", "value": json.dumps(entry)}]}]}
+
+
+def packaged_viewer_dir() -> Path | None:
+    """The viewer built into this ngllib install, if it is there."""
+    d = Path(__file__).resolve().parent / "viewer"
+    return d if (d / "index.html").is_file() else None
+
+
+def resolve_viewer(requested: str | None, config_path: str | None = None) -> Path | str:
+    """A directory to serve the viewer from, or `"hosted"`.
+
+    Order: explicit argument, `NGL_VIEWER_DIST`, `config.json` `viewer`, the
+    packaged build. Hosted is never a fallback -- it has to be asked for, so a
+    missing packaged build cannot silently send an experiment to a viewer
+    Google can change underneath it.
+    """
+    for candidate in (requested, os.environ.get("NGL_VIEWER_DIST"),
+                      load_config(config_path).get("viewer")):
+        if not candidate:
+            continue
+        if candidate == HOSTED_VIEWER:
+            return HOSTED_VIEWER
+        if candidate == PACKAGED_VIEWER:
+            break
+        d = Path(candidate).resolve()
+        if not (d / "index.html").is_file():
+            raise ValueError(f"viewer directory has no index.html: {d}")
+        return d
+    packaged = packaged_viewer_dir()
+    if packaged is not None:
+        return packaged
+    raise BrowserError(
+        "no Neuroglancer viewer found: reinstall ngllib (the build ships in "
+        "ngllib/viewer), set NGL_VIEWER_DIST to a built dist/client, pass "
+        f"viewer=<path>, or ask for the hosted build with viewer='{HOSTED_VIEWER}'")
+
+
+def viewer_provenance(dist: Path) -> str:
+    """One line describing which build is being served, for the run log."""
+    try:
+        b = json.loads((dist / "build.json").read_text())
+    except Exception:
+        return f"{dist} (no build.json)"
+    return (f"{dist} ({b.get('branch')}@{str(b.get('commit'))[:12]}"
+            f"{' DIRTY' if b.get('dirty') else ''}, built {b.get('built_at')})")
+
+
+def dist_file(dist: Path, url: str) -> Path | None:
+    """The file `url` maps to inside `dist`, or None (missing/escaping)."""
+    rel = urllib.parse.urlparse(url).path.lstrip("/") or "index.html"
+    try:
+        f = (dist / rel).resolve()
+        f.relative_to(dist.resolve())
+    except ValueError:
+        return None
+    return f if f.is_file() else None
 
 
 class _BrowserWatchdog:
@@ -111,6 +227,11 @@ class ChromeRenderer:
         # --- Deployment identity -------------------------------------------------
         start_url: str | None = None,
         config_path: str | None = None,
+        # --- Viewer bundle + credentials -----------------------------------------
+        viewer: str | None = None,
+        viewer_transport: Literal["server", "route"] = "server",
+        storage_state: str | None = None,
+        cave_secret: str | None = None,
     ):
         if renderer not in ("gpu", "cpu"):
             raise ValueError(f"`renderer` must be 'gpu' or 'cpu'; got {renderer!r}")
@@ -145,8 +266,45 @@ class ChromeRenderer:
         self.extra_launch_args = list(extra_launch_args or [])
 
         self.start_url = start_url or default_start_url(config_path)
-        self._url_prefix, self._base_state = split_state_url(self.start_url)
+        self._url_prefix, self._base_state = normalize_start_url(self.start_url)
         self.dataset = DatasetSpec.from_state(self._base_state)
+
+        # `start_url` is the SCENE; `viewer` is the renderer. A pasted link's
+        # origin is therefore ignored unless the hosted viewer was asked for:
+        # its state is re-hosted on VIEWER_ORIGIN and served from disk. Serving
+        # locally is what makes graphene sources work at all (the hosted builds
+        # cannot read FlyWire's 2019 mesh layout) and pins the viewer so a
+        # hosted build cannot change mid-experiment.
+        self.viewer = resolve_viewer(viewer, config_path)
+        self.viewer_dist: Path | None = None if self.viewer == HOSTED_VIEWER else self.viewer
+        # How the bundle reaches the page. "server" (default) is a loopback
+        # static server shared by the process: Chrome fetches it in its own
+        # network threads. "route" fulfils each request from a Python callback
+        # -- measurably worse (job 967718: ~1.4 s of handler time per reset,
+        # about half the reset) and kept only for environments where binding a
+        # port is not possible.
+        self.viewer_transport = viewer_transport
+        if viewer_transport not in ("server", "route"):
+            raise ValueError(
+                f"`viewer_transport` must be 'server' or 'route'; got {viewer_transport!r}")
+        if self.viewer_dist is not None:
+            if viewer_transport == "server":
+                from .viewer_server import serve
+
+                self._url_prefix = serve(self.viewer_dist) + "/"
+            else:
+                self._url_prefix = VIEWER_ORIGIN + "/"
+        parsed = urllib.parse.urlparse(self._url_prefix)
+        self._origin = f"{parsed.scheme}://{parsed.netloc}"
+        # Credentials: an explicit Playwright storage_state file wins; otherwise
+        # a middleauth source in the start URL is seeded from the CAVE token
+        # CloudVolume already reads, so one secret serves both backends and
+        # nothing has to be configured per deployment.
+        self.storage_state = storage_state
+        self.cave_secret = cave_secret
+        self.config_path = config_path
+        self._middleauth_hosts = middleauth_hosts(self._base_state)
+        self._storage_state: str | dict[str, Any] | None = None
 
         # Browser state (lazy — launched on open())
         self._playwright = None
@@ -163,12 +321,91 @@ class ChromeRenderer:
         self._last_settle_polls = 0
         self._last_nav_attempts = 1
         self._last_state_read_error: str | None = None
+        self._dist_cache: dict[Path, bytes] = {}
+        self._route_calls = 0
+        self._route_bytes = 0
+        self._route_seconds = 0.0
+
+    # =========================================================================
+    # Browser contexts (viewer bundle + credentials attach here)
+    # =========================================================================
+
+    def _resolve_storage_state(self) -> str | dict[str, Any] | None:
+        """Playwright `storage_state` for every context, resolved once."""
+        if self._storage_state is not None:
+            return self._storage_state
+        if self.storage_state is not None:
+            self._storage_state = self.storage_state
+        elif self._middleauth_hosts:
+            app = self._middleauth_hosts[0]
+            # A token configured inline wins over the secrets file, so one
+            # config can carry a deployment end to end.
+            token = (cave_token_from_config(load_config(self.config_path))
+                     if self.cave_secret is None else None)
+            self._storage_state = cave_storage_state(
+                self._origin, auth_server_for(app), token or read_cave_token(self.cave_secret),
+                self._middleauth_hosts)
+            logger.info("seeded CAVE token for %s on %s", app, self._origin)
+        else:
+            self._storage_state = ""  # sentinel: nothing to attach
+        return self._storage_state
+
+    def _serve_dist(self, route) -> None:
+        """Fulfil one viewer asset from disk.
+
+        Every call is a round trip Chrome -> driver -> this callback, on the
+        same connection the step loop uses, so the counters below are how the
+        cost of serving locally is measured (see `route_stats`).
+        """
+        t0 = time.perf_counter()
+        f = dist_file(self.viewer_dist, route.request.url)
+        if f is None:
+            route.fulfill(status=404, body=b"not found")
+            return
+        body = self._dist_cache.get(f)
+        if body is None:
+            body = self._dist_cache[f] = f.read_bytes()
+        headers = {"content-type": mimetypes.guess_type(f.name)[0] or "application/octet-stream"}
+        # Webpack content-hashes every filename, so an asset can never change
+        # under a given URL; index.html is the one mutable name. Without this
+        # Chrome must re-request all of them on every navigation.
+        headers["cache-control"] = ("no-store" if f.name == "index.html"
+                                    else "public, max-age=31536000, immutable")
+        route.fulfill(status=200, body=body, headers=headers)
+        self._route_calls += 1
+        self._route_bytes += len(body)
+        self._route_seconds += time.perf_counter() - t0
+
+    @property
+    def route_stats(self) -> dict[str, float]:
+        """(calls, bytes, seconds) spent serving the viewer since open()."""
+        return {"calls": self._route_calls, "bytes": self._route_bytes,
+                "seconds": self._route_seconds}
+
+    def _new_context(self):
+        """A BrowserContext with the viewport, credentials and served bundle.
+
+        Every context goes through here -- first page, per-episode recycle,
+        reset-ahead warm -- so a recycle or a periodic browser restart cannot
+        silently drop the login or the viewer build.
+        """
+        W, H = self.layout.window_size
+        state = self._resolve_storage_state()
+        ctx = self.browser.new_context(
+            viewport={"width": W, "height": H},
+            **({"storage_state": state} if state else {}))
+        if self.viewer_dist is not None and self.viewer_transport == "route":
+            ctx.route(f"{self._origin}/**", self._serve_dist)
+        return ctx
 
     # =========================================================================
     # Renderer protocol
     # =========================================================================
 
     def open(self) -> None:
+        if self.viewer_dist is not None:
+            logger.info("serving viewer %s at %s", viewer_provenance(self.viewer_dist),
+                        self._origin)
         self._ensure_browser_launched()
 
     def close(self) -> None:
@@ -203,8 +440,7 @@ class ChromeRenderer:
         ctx = None
         try:
             url = self._state_to_url(state)
-            W, H = self.layout.window_size
-            ctx = self.browser.new_context(viewport={"width": W, "height": H})
+            ctx = self._new_context()
             page = ctx.new_page()
             if self.clear_cache_on_recycle:
                 self._clear_cache(ctx, page)
@@ -405,12 +641,11 @@ class ChromeRenderer:
                      if c.pid not in kids_before), None)
             except Exception:
                 self._driver_pid = None
-            W, H = self.layout.window_size
             self.browser = self._playwright.chromium.launch(
                 headless=self.headless,
                 args=self._build_launch_args(),
             )
-            self.page = self.browser.new_page(viewport={"width": W, "height": H})
+            self.page = self._new_context().new_page()
             self._action_handler = MouseActionHandler(self.page)
             # Playwright doesn't expose the browser process; find it for the
             # hang watchdog (kill target). THIS env's Chrome is a child of THIS
@@ -548,9 +783,8 @@ class ChromeRenderer:
         the context every reset keeps it flat. The periodic full browser
         restart still handles browser-process-level leaks.
         """
-        W, H = self.layout.window_size
         old = self.page.context if self.page is not None else None
-        context = self.browser.new_context(viewport={"width": W, "height": H})
+        context = self._new_context()
         page = context.new_page()
         if self.clear_cache_on_recycle:
             self._clear_cache(context, page)
