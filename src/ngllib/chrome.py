@@ -229,6 +229,7 @@ class ChromeRenderer:
         config_path: str | None = None,
         # --- Viewer bundle + credentials -----------------------------------------
         viewer: str | None = None,
+        viewer_transport: Literal["server", "route"] = "server",
         storage_state: str | None = None,
         cave_secret: str | None = None,
     ):
@@ -276,8 +277,23 @@ class ChromeRenderer:
         # hosted build cannot change mid-experiment.
         self.viewer = resolve_viewer(viewer, config_path)
         self.viewer_dist: Path | None = None if self.viewer == HOSTED_VIEWER else self.viewer
+        # How the bundle reaches the page. "server" (default) is a loopback
+        # static server shared by the process: Chrome fetches it in its own
+        # network threads. "route" fulfils each request from a Python callback
+        # -- measurably worse (job 967718: ~1.4 s of handler time per reset,
+        # about half the reset) and kept only for environments where binding a
+        # port is not possible.
+        self.viewer_transport = viewer_transport
+        if viewer_transport not in ("server", "route"):
+            raise ValueError(
+                f"`viewer_transport` must be 'server' or 'route'; got {viewer_transport!r}")
         if self.viewer_dist is not None:
-            self._url_prefix = VIEWER_ORIGIN + "/"
+            if viewer_transport == "server":
+                from .viewer_server import serve
+
+                self._url_prefix = serve(self.viewer_dist) + "/"
+            else:
+                self._url_prefix = VIEWER_ORIGIN + "/"
         parsed = urllib.parse.urlparse(self._url_prefix)
         self._origin = f"{parsed.scheme}://{parsed.netloc}"
         # Credentials: an explicit Playwright storage_state file wins; otherwise
@@ -378,7 +394,7 @@ class ChromeRenderer:
         ctx = self.browser.new_context(
             viewport={"width": W, "height": H},
             **({"storage_state": state} if state else {}))
-        if self.viewer_dist is not None:
+        if self.viewer_dist is not None and self.viewer_transport == "route":
             ctx.route(f"{self._origin}/**", self._serve_dist)
         return ctx
 
