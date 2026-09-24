@@ -305,6 +305,10 @@ class ChromeRenderer:
         self._last_settle_polls = 0
         self._last_nav_attempts = 1
         self._last_state_read_error: str | None = None
+        self._dist_cache: dict[Path, bytes] = {}
+        self._route_calls = 0
+        self._route_bytes = 0
+        self._route_seconds = 0.0
 
     # =========================================================================
     # Browser contexts (viewer bundle + credentials attach here)
@@ -331,12 +335,36 @@ class ChromeRenderer:
         return self._storage_state
 
     def _serve_dist(self, route) -> None:
+        """Fulfil one viewer asset from disk.
+
+        Every call is a round trip Chrome -> driver -> this callback, on the
+        same connection the step loop uses, so the counters below are how the
+        cost of serving locally is measured (see `route_stats`).
+        """
+        t0 = time.perf_counter()
         f = dist_file(self.viewer_dist, route.request.url)
         if f is None:
             route.fulfill(status=404, body=b"not found")
             return
-        ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-        route.fulfill(status=200, body=f.read_bytes(), headers={"content-type": ctype})
+        body = self._dist_cache.get(f)
+        if body is None:
+            body = self._dist_cache[f] = f.read_bytes()
+        headers = {"content-type": mimetypes.guess_type(f.name)[0] or "application/octet-stream"}
+        # Webpack content-hashes every filename, so an asset can never change
+        # under a given URL; index.html is the one mutable name. Without this
+        # Chrome must re-request all of them on every navigation.
+        headers["cache-control"] = ("no-store" if f.name == "index.html"
+                                    else "public, max-age=31536000, immutable")
+        route.fulfill(status=200, body=body, headers=headers)
+        self._route_calls += 1
+        self._route_bytes += len(body)
+        self._route_seconds += time.perf_counter() - t0
+
+    @property
+    def route_stats(self) -> dict[str, float]:
+        """(calls, bytes, seconds) spent serving the viewer since open()."""
+        return {"calls": self._route_calls, "bytes": self._route_bytes,
+                "seconds": self._route_seconds}
 
     def _new_context(self):
         """A BrowserContext with the viewport, credentials and served bundle.
