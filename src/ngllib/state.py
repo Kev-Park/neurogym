@@ -27,6 +27,13 @@ IDENTITY_QUAT = [0.0, 0.0, 0.0, 1.0]
 
 # Upper bound the harness has always applied to projectionScale.
 PROJECTION_SCALE_MAX = 500_000.0
+# The 2D pane's zoom, in canonical voxels per CSS px (~2.03 on the calibrated
+# FlyWire start state, i.e. a pane ~7 um wide). Neuroglancer imposes no upper
+# bound -- it accepted 1e6 verbatim (probe_xs_boundary, job 972299) -- so this
+# is ours: 64 makes the pane ~230 um, already wider than any structure an
+# episode navigates, and it stops a random walk from zooming out to a fetch of
+# the whole volume.
+CROSS_SECTION_SCALE_MAX = 64.0
 
 
 def coerce(state: dict[str, Any]) -> dict[str, Any]:
@@ -66,6 +73,26 @@ def normalized_quaternion(q: Iterable[float]) -> list[float]:
     return [x / n for x in v]
 
 
+def next_cross_section_scale(previous: float, requested: float) -> float:
+    """The 2D pane's zoom, under the same rule as the 3D pane's.
+
+    MEASURED 2026-09-24 (native/probe_xs_boundary, job 972299): a
+    crossSectionScale of 0 or -2 leaves `viewer.state` unreadable exactly as a
+    non-positive projectionScale does -- only projectionOrientation survives,
+    for as long as we watched -- so a policy that zoomed the 2D pane past zero
+    would kill the episode. The same keep-previous rule gives both backends a
+    defined, identical answer.
+
+    Unlike the 3D zoom there is NO upper clamp: the same probe set 1e6 and
+    Neuroglancer accepted it verbatim. CROSS_SECTION_SCALE_MAX is ours, not
+    NG's -- it bounds how far a random walk can zoom out, where the simulator
+    would otherwise fetch a pane hundreds of microns wide.
+    """
+    if not (requested > 0.0) or not math.isfinite(requested):
+        return float(previous)
+    return float(min(CROSS_SECTION_SCALE_MAX, requested))
+
+
 def next_projection_scale(previous: float, requested: float) -> float:
     """NG's `TrackableZoom.restoreState` runs `verifyFinitePositiveFloat`, so a
     zoom of 0 or below is REJECTED outright and the viewer keeps the value it
@@ -98,7 +125,9 @@ def apply_state_edit(state: dict[str, Any], action: dict[str, Any],
     st = copy.deepcopy(state)
     dpos = action["delta_pos"]
     st["position"] = [st["position"][i] + float(dpos[i]) for i in range(3)]
-    st["crossSectionScale"] = float(st["crossSectionScale"]) + float(action["delta_xs_scale"][0])
+    st["crossSectionScale"] = next_cross_section_scale(
+        float(st["crossSectionScale"]),
+        float(st["crossSectionScale"]) + float(action["delta_xs_scale"][0]))
 
     d = action["delta_orient"]
     if orientation == "euler":

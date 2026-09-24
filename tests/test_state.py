@@ -99,3 +99,32 @@ def test_move_to():
 def test_modifiers_to_str():
     assert S.modifiers_to_str([1, 0, 1]) == "Shift, Alt"
     assert S.modifiers_to_str([0, 0, 0]) == ""
+
+
+def test_next_cross_section_scale_keeps_previous_at_or_below_zero():
+    """MEASURED (probe_xs_boundary, job 972299): NG leaves the whole viewer
+    state unreadable for crossSectionScale <= 0, exactly as for projectionScale,
+    so the 2D zoom gets the same keep-previous rule."""
+    assert S.next_cross_section_scale(2.0, 3.0) == 3.0
+    assert S.next_cross_section_scale(2.0, 0.0) == 2.0
+    assert S.next_cross_section_scale(2.0, -5.0) == 2.0
+    assert S.next_cross_section_scale(2.0, float("nan")) == 2.0
+    assert S.next_cross_section_scale(2.0, float("inf")) == 2.0
+
+
+def test_cross_section_scale_has_our_upper_bound_not_ng_s():
+    # NG accepted 1e6 verbatim; the cap is ours, to bound a zoom-out walk.
+    assert S.next_cross_section_scale(2.0, 1e6) == S.CROSS_SECTION_SCALE_MAX
+    assert S.CROSS_SECTION_SCALE_MAX == 64.0
+
+
+def test_state_edit_applies_the_2d_zoom_rule():
+    st = {"position": [1.0, 2.0, 3.0], "crossSectionScale": 2.0,
+          "projectionOrientation": [0.0, 0.0, 0.0, 1.0], "projectionScale": 1000.0,
+          "segments": []}
+    act = {"delta_pos": [1.0, 0.0, 0.0], "delta_xs_scale": [-5.0],
+           "delta_orient": [0.0, 0.0, 0.0], "delta_proj_scale": [0.0]}
+    out = S.apply_state_edit(st, act, "euler")
+    # The rejected zoom keeps its previous value; the rest of the edit applies.
+    assert out["crossSectionScale"] == 2.0
+    assert out["position"][0] == 2.0
