@@ -229,6 +229,7 @@ class ChromeRenderer:
         config_path: str | None = None,
         # --- Viewer bundle + credentials -----------------------------------------
         viewer: str | None = None,
+        viewer_transport: Literal["server", "route"] = "server",
         storage_state: str | None = None,
         cave_secret: str | None = None,
     ):
@@ -276,8 +277,23 @@ class ChromeRenderer:
         # hosted build cannot change mid-experiment.
         self.viewer = resolve_viewer(viewer, config_path)
         self.viewer_dist: Path | None = None if self.viewer == HOSTED_VIEWER else self.viewer
+        # How the bundle reaches the page. "server" (default) is a loopback
+        # static server shared by the process: Chrome fetches it in its own
+        # network threads. "route" fulfils each request from a Python callback
+        # -- measurably worse (job 967718: ~1.4 s of handler time per reset,
+        # about half the reset) and kept only for environments where binding a
+        # port is not possible.
+        self.viewer_transport = viewer_transport
+        if viewer_transport not in ("server", "route"):
+            raise ValueError(
+                f"`viewer_transport` must be 'server' or 'route'; got {viewer_transport!r}")
         if self.viewer_dist is not None:
-            self._url_prefix = VIEWER_ORIGIN + "/"
+            if viewer_transport == "server":
+                from .viewer_server import serve
+
+                self._url_prefix = serve(self.viewer_dist) + "/"
+            else:
+                self._url_prefix = VIEWER_ORIGIN + "/"
         parsed = urllib.parse.urlparse(self._url_prefix)
         self._origin = f"{parsed.scheme}://{parsed.netloc}"
         # Credentials: an explicit Playwright storage_state file wins; otherwise
@@ -305,6 +321,10 @@ class ChromeRenderer:
         self._last_settle_polls = 0
         self._last_nav_attempts = 1
         self._last_state_read_error: str | None = None
+        self._dist_cache: dict[Path, bytes] = {}
+        self._route_calls = 0
+        self._route_bytes = 0
+        self._route_seconds = 0.0
 
     # =========================================================================
     # Browser contexts (viewer bundle + credentials attach here)
@@ -331,12 +351,36 @@ class ChromeRenderer:
         return self._storage_state
 
     def _serve_dist(self, route) -> None:
+        """Fulfil one viewer asset from disk.
+
+        Every call is a round trip Chrome -> driver -> this callback, on the
+        same connection the step loop uses, so the counters below are how the
+        cost of serving locally is measured (see `route_stats`).
+        """
+        t0 = time.perf_counter()
         f = dist_file(self.viewer_dist, route.request.url)
         if f is None:
             route.fulfill(status=404, body=b"not found")
             return
-        ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-        route.fulfill(status=200, body=f.read_bytes(), headers={"content-type": ctype})
+        body = self._dist_cache.get(f)
+        if body is None:
+            body = self._dist_cache[f] = f.read_bytes()
+        headers = {"content-type": mimetypes.guess_type(f.name)[0] or "application/octet-stream"}
+        # Webpack content-hashes every filename, so an asset can never change
+        # under a given URL; index.html is the one mutable name. Without this
+        # Chrome must re-request all of them on every navigation.
+        headers["cache-control"] = ("no-store" if f.name == "index.html"
+                                    else "public, max-age=31536000, immutable")
+        route.fulfill(status=200, body=body, headers=headers)
+        self._route_calls += 1
+        self._route_bytes += len(body)
+        self._route_seconds += time.perf_counter() - t0
+
+    @property
+    def route_stats(self) -> dict[str, float]:
+        """(calls, bytes, seconds) spent serving the viewer since open()."""
+        return {"calls": self._route_calls, "bytes": self._route_bytes,
+                "seconds": self._route_seconds}
 
     def _new_context(self):
         """A BrowserContext with the viewport, credentials and served bundle.
@@ -350,7 +394,7 @@ class ChromeRenderer:
         ctx = self.browser.new_context(
             viewport={"width": W, "height": H},
             **({"storage_state": state} if state else {}))
-        if self.viewer_dist is not None:
+        if self.viewer_dist is not None and self.viewer_transport == "route":
             ctx.route(f"{self._origin}/**", self._serve_dist)
         return ctx
 
