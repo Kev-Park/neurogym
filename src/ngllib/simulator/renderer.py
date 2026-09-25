@@ -89,8 +89,13 @@ from .render3d import MeshRenderer
 
 logger = logging.getLogger(__name__)
 
-PaneMode = Literal["atomic", "progressive", "concurrent", "random"]
-PANE_MODES = ("atomic", "progressive", "concurrent", "random")
+PaneMode = Literal["atomic", "progressive", "concurrent", "random", "fresh"]
+# "fresh" (zmax-left, 2026-09-25): NO staleness — every observe blocks on the
+# exact fine tiles AND on full-res (lod0) meshes for every visible segment, so
+# the frame is always the NG-settled state. Costs wall-time per step (warm move
+# 0.03-0.5s, cold 0.2-4s, mesh 0.7-3.8s); train it wide (high envs-per-runner,
+# extra fetch workers) so blocked env threads hide each other's waits.
+PANE_MODES = ("atomic", "progressive", "concurrent", "random", "fresh")
 
 
 class SimulatorRenderer:
@@ -403,10 +408,13 @@ class SimulatorRenderer:
                 st["position"][2]])
 
     def observe(self) -> tuple[dict[str, Any], np.ndarray]:
-        block = self._block_next
+        first = self._block_next
         self._block_next = False
-        if not block:
+        if not first:
             self._steps += 1
+        # "fresh" blocks EVERY observe on the exact tiles (and _render_right
+        # blocks on lod0 meshes), not just the first one after a reset.
+        block = first or self.pane_mode == "fresh"
         return copy.deepcopy(self._state), self._render(block_tiles=block)
 
     @property
@@ -806,8 +814,10 @@ class SimulatorRenderer:
     def _render_right(self, tiles: dict[str, Any]) -> np.ndarray:
         st = self._state
         ids = S.visible_segments(st["segments"])
-        # A segment selected mid-episode (double-click) has no mesh yet.
-        self._ensure_meshes(ids)
+        # A segment selected mid-episode (double-click) has no mesh yet. In
+        # "fresh" mode block until its FULL mesh is resident (no streaming
+        # window where a selected neuron renders nothing).
+        self._ensure_meshes(ids, block=self.pane_mode == "fresh")
         pos_nm = np.asarray(st["position"], dtype=np.float64) * self._voxel_nm
         plane = tiles["plane"]
         if plane is not None and tiles.get("ids") is not None:
