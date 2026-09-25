@@ -765,6 +765,12 @@ class SimulatorRenderer:
         goes straight to the full mesh: the first observation has to be
         complete, and Chrome has likewise settled before an episode starts.
         """
+        # meshblock (zmax-left): block only until SOMETHING is visible — the
+        # coarse mesh at ~0.3-0.5s — and refine async as usual. Blocking on the
+        # FULL lod0 (0.7-3.8s) for every select collapsed under the exploration
+        # select-storm (job 991740, same mechanism as the "fresh" tile collapse).
+        # `block` (resets, "fresh") keeps full-res semantics: settled = lod0.
+        coarse_block = self.pane_mode == "meshblock" and not block
         for rid in S.visible_segments(segments):
             if rid in self._mesh_futs or (self._renderer.has_mesh(rid)
                                           and rid not in self._mesh_fine):
@@ -781,9 +787,13 @@ class SimulatorRenderer:
                 logger.warning("mesh submit for %s failed (%s)", rid, e)
         for rid in list(self._mesh_futs):
             lod, fut = self._mesh_futs[rid]
-            if not (block or fut.done()):
+            # meshblock waits only for segments with NO mesh at all; in-flight
+            # lod0 refinements of already-visible segments stay asynchronous.
+            must_wait = block or (coarse_block
+                                  and not self._renderer.has_mesh(rid))
+            if not (must_wait or fut.done()):
                 continue
-            if not block and self._steps < self._mesh_due.get(rid, 0):
+            if not must_wait and self._steps < self._mesh_due.get(rid, 0):
                 continue      # landed early; hold it to the modelled lag
             del self._mesh_futs[rid]
             self._mesh_due.pop(rid, None)
@@ -792,7 +802,7 @@ class SimulatorRenderer:
                 logger.info("mesh %s lod%d on screen after %.2fs / %d steps",
                             rid, lod, time.monotonic() - t0[0], self._steps - t0[1])
             try:
-                v, vn, f = fut.result(timeout=240 if block else None)
+                v, vn, f = fut.result(timeout=240 if must_wait else None)
                 self._renderer.load_mesh(rid, v, f, normals=vn, replace=lod == 0)
             except Exception as e:  # noqa: BLE001
                 logger.warning("mesh fetch for segment %s failed (%s)", rid, e)
@@ -824,10 +834,11 @@ class SimulatorRenderer:
     def _render_right(self, tiles: dict[str, Any]) -> np.ndarray:
         st = self._state
         ids = S.visible_segments(st["segments"])
-        # A segment selected mid-episode (double-click) has no mesh yet. In
-        # "fresh"/"meshblock" modes block until its FULL mesh is resident (no
-        # streaming window where a selected neuron renders nothing).
-        self._ensure_meshes(ids, block=self.pane_mode in ("fresh", "meshblock"))
+        # A segment selected mid-episode (double-click) has no mesh yet.
+        # "fresh": block until the FULL mesh is resident (settled = lod0).
+        # "meshblock": _ensure_meshes waits only until the COARSE mesh is
+        # visible (never-invisible at ~0.3-0.5s), refining async as usual.
+        self._ensure_meshes(ids, block=self.pane_mode == "fresh")
         pos_nm = np.asarray(st["position"], dtype=np.float64) * self._voxel_nm
         plane = tiles["plane"]
         if plane is not None and tiles.get("ids") is not None:
