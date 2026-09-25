@@ -393,4 +393,9 @@ class Environment(gym.Env):
             "orientation": S.orientation_obs(st, self.orientation),
             "proj_scale": np.asarray([st["projectionScale"]], dtype=np.float32),
             "image": image,
+            # Visible selection set (zmax-left): reward/diagnostic hooks need to
+            # see selection changes (hop detection, SHOW_ALL). Downstream obs
+            # wrappers build their own dicts, so the extra key never reaches the
+            # policy's observation space.
+            "segments": tuple(sorted(S.visible_segments(st["segments"]))),
         }
