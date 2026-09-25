@@ -301,6 +301,10 @@ class Environment(gym.Env):
                 "proj_scale": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
                 "image": spaces.Box(
                     low=0, high=255, shape=self._renderer.layout.image_shape, dtype=np.uint8),
+                # Visible selection ids (zmax-left reward/diagnostic hooks).
+                # Variable-length tuple of root-id strings; policy-facing obs
+                # wrappers drop it, so no learner ever encodes it.
+                "segments": spaces.Sequence(spaces.Text(max_length=32)),
             }
         )
 
