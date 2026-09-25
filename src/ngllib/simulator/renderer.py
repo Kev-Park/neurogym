@@ -89,13 +89,22 @@ from .render3d import MeshRenderer
 
 logger = logging.getLogger(__name__)
 
-PaneMode = Literal["atomic", "progressive", "concurrent", "random", "fresh"]
+PaneMode = Literal["atomic", "progressive", "concurrent", "random", "fresh",
+                   "meshblock"]
 # "fresh" (zmax-left, 2026-09-25): NO staleness — every observe blocks on the
 # exact fine tiles AND on full-res (lod0) meshes for every visible segment, so
 # the frame is always the NG-settled state. Costs wall-time per step (warm move
 # 0.03-0.5s, cold 0.2-4s, mesh 0.7-3.8s); train it wide (high envs-per-runner,
 # extra fetch workers) so blocked env threads hide each other's waits.
-PANE_MODES = ("atomic", "progressive", "concurrent", "random", "fresh")
+# MEASURED (smoke 991695, 40x4x4GPU FW=3): ~7-18 sps — every move blocks on a
+# ~1s+ two-pane tile group and the fetch pool queues; impractical for training.
+#
+# "meshblock": the middle ground — tiles stay atomic (the validated, cheap
+# staleness) but meshes ALWAYS block at full res, so a selected neuron is never
+# invisible (kills the measured 200-300-step post-hop blindness — the
+# "prolonged degradation" mode — at a few 1-4s stalls per episode).
+PANE_MODES = ("atomic", "progressive", "concurrent", "random", "fresh",
+              "meshblock")
 
 
 class SimulatorRenderer:
@@ -713,7 +722,8 @@ class SimulatorRenderer:
                     self._adopt_group(ck, cfuts, cext, cstage, ct0)
                 self._coarse_pending = None
         if self._pending is None:
-            stage = "fine" if (block or mode in ("atomic", "random", "concurrent")) else "coarse"
+            stage = "fine" if (block or mode in ("atomic", "random", "concurrent",
+                                                 "meshblock")) else "coarse"
             self._submit_tile_fetch(stage)
             if mode == "concurrent" and not block:
                 st = self._state
@@ -815,9 +825,9 @@ class SimulatorRenderer:
         st = self._state
         ids = S.visible_segments(st["segments"])
         # A segment selected mid-episode (double-click) has no mesh yet. In
-        # "fresh" mode block until its FULL mesh is resident (no streaming
-        # window where a selected neuron renders nothing).
-        self._ensure_meshes(ids, block=self.pane_mode == "fresh")
+        # "fresh"/"meshblock" modes block until its FULL mesh is resident (no
+        # streaming window where a selected neuron renders nothing).
+        self._ensure_meshes(ids, block=self.pane_mode in ("fresh", "meshblock"))
         pos_nm = np.asarray(st["position"], dtype=np.float64) * self._voxel_nm
         plane = tiles["plane"]
         if plane is not None and tiles.get("ids") is not None:
