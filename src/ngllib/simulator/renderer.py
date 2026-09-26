@@ -258,6 +258,17 @@ class SimulatorRenderer:
         self._mesh_t0: dict[str, tuple] = {}
         # Segments showing a COARSE mesh, still owed the full-resolution one.
         self._mesh_fine: set[str] = set()
+        # Speculative candidate prefetch (zmax-left v3): coarse meshes for the
+        # largest on-slice 2D-pane segments, fetched BEFORE any selection so a
+        # hop's visual payoff isn't delayed by the fetch. Futures are claimed
+        # by _ensure_meshes when a candidate is actually selected. 0 = off
+        # (default); forced off when the dedicated mesh lane is off, where
+        # speculation would compete with tile fetches on the shared shards.
+        spec_k = int(os.environ.get("NGL_NATIVE_MESH_PREFETCH", "0"))
+        if int(os.environ.get("NGL_NATIVE_MESH_WORKERS", "2")) == 0:
+            spec_k = 0
+        self._spec_k = spec_k
+        self._spec_futs: dict[str, Any] = {}
         # Reset-ahead prefetch for the state the environment said comes next:
         # measured 38 s reset tail = mesh download/decode/normals + cold tiles,
         # all prefetchable during the current episode.
@@ -342,6 +353,9 @@ class SimulatorRenderer:
         for _lod, fut in self._mesh_futs.values():
             fut.cancel()
         self._mesh_futs.clear()
+        for fut in self._spec_futs.values():
+            fut.cancel()
+        self._spec_futs.clear()
         self._mesh_due.clear()
         self._mesh_t0.clear()
         self._mesh_fine.clear()
@@ -809,9 +823,14 @@ class SimulatorRenderer:
             # lod 0 when blocking (reset) or when this is the refinement
             # pass for a segment already showing its coarse level.
             lod = 0 if (block or rid in self._mesh_fine) else self.MESH_COARSE_LOD
+            # Claim a speculative slice-candidate fetch when one is already in
+            # flight (or done) for this segment at the level we want.
+            spec = (self._spec_futs.pop(rid, None)
+                    if lod == self.MESH_COARSE_LOD else None)
             try:
-                self._mesh_futs[rid] = (lod, self._mesh_pool().submit(
-                    worker_mesh, self.source, rid, lod))
+                fut = spec if spec is not None else self._mesh_pool().submit(
+                    worker_mesh, self.source, rid, lod)
+                self._mesh_futs[rid] = (lod, fut)
                 self._mesh_due[rid] = self._steps + self._mesh_lag
                 self._mesh_t0[rid] = (time.monotonic(), self._steps)
             except Exception as e:  # noqa: BLE001
@@ -894,9 +913,50 @@ class SimulatorRenderer:
 
     def _render(self, block_tiles: bool) -> np.ndarray:
         tiles = self._fetch_tiles(block=block_tiles)
+        self._prefetch_slice_candidates(tiles)
         panes = []
         if self.layout.left_pane:
             panes.append(self._render_left(tiles))
         if self.layout.right_pane:
             panes.append(self._render_right(tiles))
         return panes[0] if len(panes) == 1 else np.concatenate(panes, axis=1)
+
+    def _prefetch_slice_candidates(self, tiles: dict[str, Any]) -> None:
+        """Speculatively fetch coarse meshes for the largest segments on the
+        current 2D slice — the candidates a left-pane double-click can select.
+
+        Runs once per adopted tile set (memoized on the tiles dict), only when
+        no REAL selection fetch is pending (speculation never queues ahead of
+        one), and keeps at most a bounded set of unclaimed futures. Claimed by
+        _ensure_meshes on selection, so a hop pays no fetch latency when its
+        target was on-slice long enough for the speculation to land.
+        """
+        k = self._spec_k
+        if (not k or not tiles or tiles.get("spec_done")
+                or tiles.get("ids") is None or self._mesh_futs):
+            return
+        tiles["spec_done"] = True
+        ids_map = tiles["ids"]
+        uniq, counts = np.unique(ids_map, return_counts=True)
+        min_px = ids_map.size * 0.001
+        submitted = 0
+        for i in np.argsort(counts)[::-1]:
+            if counts[i] < min_px or int(uniq[i]) == 0:
+                continue
+            rid = str(int(uniq[i]))
+            if (rid in self._spec_futs or rid in self._mesh_futs
+                    or self._renderer.has_mesh(rid)):
+                continue
+            try:
+                self._spec_futs[rid] = self._mesh_pool().submit(
+                    worker_mesh, self.source, rid, self.MESH_COARSE_LOD)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("candidate prefetch submit failed (%s)", e)
+                return
+            submitted += 1
+            if submitted >= k:
+                break
+        # Evict oldest unclaimed speculation beyond the retention bound; a
+        # done future just holds decoded arrays until GC, cancel is a no-op.
+        while len(self._spec_futs) > 3 * k:
+            self._spec_futs.pop(next(iter(self._spec_futs))).cancel()
