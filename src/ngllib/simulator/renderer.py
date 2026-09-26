@@ -482,11 +482,17 @@ class SimulatorRenderer:
         one segment's own mesh), so shards only bound concurrency.
         """
         if cls._MESH_POOLS is None:
-            n = max(1, int(os.environ.get("NGL_NATIVE_MESH_WORKERS", "2")))
-            cls._MESH_POOLS = [
-                ProcessPoolExecutor(
-                    max_workers=1, mp_context=multiprocessing.get_context("spawn"))
-                for _ in range(n)]
+            n = int(os.environ.get("NGL_NATIVE_MESH_WORKERS", "2"))
+            if n <= 0:
+                # ablation control: route meshes through the tile shards
+                # exactly as before the lane existed
+                cls._MESH_POOLS = cls._pools()
+            else:
+                cls._MESH_POOLS = [
+                    ProcessPoolExecutor(
+                        max_workers=1,
+                        mp_context=multiprocessing.get_context("spawn"))
+                    for _ in range(n)]
         return cls._MESH_POOLS
 
     def _tile_pool(self) -> ProcessPoolExecutor:
