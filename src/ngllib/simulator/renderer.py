@@ -140,6 +140,7 @@ class SimulatorRenderer:
     # many threaded envs): GIL-isolates chunk download/decode. Spawn context --
     # fork would inherit CUDA/EGL state.
     _TILE_POOLS: list | None = None
+    _MESH_POOLS: list | None = None
     _POOL_SEQ: int = 0
 
     # Coarse level requested first; MeshStore.get walks down to whatever the
@@ -317,7 +318,7 @@ class SimulatorRenderer:
         try:
             rid = self._first_segment(state)
             mesh_fut = (None if rid is None or self._renderer.has_mesh(rid)
-                        else self._tile_pool().submit(worker_mesh, self.source, rid))
+                        else self._mesh_pool().submit(worker_mesh, self.source, rid))
             tiles = self._submit_tile_group(state["position"], state["crossSectionScale"])
         except Exception as e:
             logger.warning("reset-ahead prefetch submit failed (%s)", e)
@@ -468,8 +469,32 @@ class SimulatorRenderer:
                 for _ in range(n)]
         return cls._TILE_POOLS
 
+    @classmethod
+    def _mesh_pools(cls) -> list:
+        """Dedicated mesh fetch lane (zmax-left, 2026-09-25).
+
+        Under select-heavy tasks, mesh fetches queued behind tile/warm jobs on
+        the shared shards pushed mesh ARRIVAL from its intrinsic 0.3-3.8s to
+        10-100s (200-300 steps of an invisible selected neuron — measured in
+        jobs 991673/991186). A separate per-process lane keeps mesh latency at
+        fetch cost without blocking anything. Sized by NGL_NATIVE_MESH_WORKERS
+        (default 2); meshes have no chunk-LRU affinity concern (each fetch is
+        one segment's own mesh), so shards only bound concurrency.
+        """
+        if cls._MESH_POOLS is None:
+            n = max(1, int(os.environ.get("NGL_NATIVE_MESH_WORKERS", "2")))
+            cls._MESH_POOLS = [
+                ProcessPoolExecutor(
+                    max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+                for _ in range(n)]
+        return cls._MESH_POOLS
+
     def _tile_pool(self) -> ProcessPoolExecutor:
         pools = self._pools()
+        return pools[self._pool_shard % len(pools)]
+
+    def _mesh_pool(self) -> ProcessPoolExecutor:
+        pools = self._mesh_pools()
         return pools[self._pool_shard % len(pools)]
 
     # ------------------------------------------------------------------ picking
@@ -779,7 +804,7 @@ class SimulatorRenderer:
             # pass for a segment already showing its coarse level.
             lod = 0 if (block or rid in self._mesh_fine) else self.MESH_COARSE_LOD
             try:
-                self._mesh_futs[rid] = (lod, self._tile_pool().submit(
+                self._mesh_futs[rid] = (lod, self._mesh_pool().submit(
                     worker_mesh, self.source, rid, lod))
                 self._mesh_due[rid] = self._steps + self._mesh_lag
                 self._mesh_t0[rid] = (time.monotonic(), self._steps)
