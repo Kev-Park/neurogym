@@ -30,10 +30,12 @@ import copy
 import logging
 import multiprocessing
 import os
+import threading
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Literal
 
 import numpy as np
@@ -517,6 +519,34 @@ class SimulatorRenderer:
         pools = self._mesh_pools()
         return pools[self._pool_shard % len(pools)]
 
+    _POOL_HEAL_LOCK = threading.Lock()
+
+    @classmethod
+    def _heal_mesh_pools(cls, exc: BaseException) -> None:
+        """Rebuild the mesh lane after a worker OOM-kill breaks its pool.
+
+        A ProcessPoolExecutor whose child was killed abruptly is permanently
+        unusable (BrokenProcessPool on every submit) — observed 2026-09-27
+        (job 995571): one OOM-killed Draco decode turned a runner into a
+        meshless zombie spamming half a million submit warnings. Recreating
+        the pools makes worker death a hiccup instead of a fleet degradation.
+        Only the dedicated lane is rebuilt here; with MESH_WORKERS=0 the lane
+        aliases the tile shards, whose breakage fails resets loudly instead.
+        """
+        if not isinstance(exc, BrokenProcessPool):
+            return
+        with cls._POOL_HEAL_LOCK:
+            pools = cls._MESH_POOLS
+            if pools is None or pools is cls._TILE_POOLS:
+                return
+            cls._MESH_POOLS = None
+            for p in pools:
+                try:
+                    p.shutdown(wait=False, cancel_futures=True)
+                except Exception:  # noqa: BLE001
+                    pass
+            logger.warning("mesh pool broken by worker death; lane rebuilt")
+
     # ------------------------------------------------------------------ picking
 
     def _segment_under_2d(self, x_css: float, y_css: float):
@@ -835,6 +865,7 @@ class SimulatorRenderer:
                 self._mesh_t0[rid] = (time.monotonic(), self._steps)
             except Exception as e:  # noqa: BLE001
                 logger.warning("mesh submit for %s failed (%s)", rid, e)
+                self._heal_mesh_pools(e)
         for rid in list(self._mesh_futs):
             lod, fut = self._mesh_futs[rid]
             # meshblock waits only for segments with NO mesh at all; in-flight
@@ -952,6 +983,7 @@ class SimulatorRenderer:
                     worker_mesh, self.source, rid, self.MESH_COARSE_LOD)
             except Exception as e:  # noqa: BLE001
                 logger.warning("candidate prefetch submit failed (%s)", e)
+                self._heal_mesh_pools(e)
                 return
             submitted += 1
             if submitted >= k:
