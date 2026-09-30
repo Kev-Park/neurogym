@@ -54,7 +54,10 @@ def test_a_forked_child_would_serve_its_own(dist, monkeypatch):
     """The cache is keyed by PID: a process that inherits it must not hand
     Chrome a URL only its parent can answer."""
     first = viewer_server.serve(dist)
-    monkeypatch.setattr(viewer_server.os, "getpid", lambda: os.getpid() + 1)
+    # Capture the real pid BEFORE patching: `os` is the shared module object,
+    # so a lambda that calls os.getpid() would call itself.
+    child_pid = os.getpid() + 1
+    monkeypatch.setattr(viewer_server.os, "getpid", lambda: child_pid)
     second = viewer_server.serve(dist)
     assert second != first
     status, body, _ = get(second, "/index.html")
