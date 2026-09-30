@@ -271,6 +271,10 @@ class SimulatorRenderer:
             spec_k = 0
         self._spec_k = spec_k
         self._spec_futs: dict[str, Any] = {}
+        # Intrinsic per-mesh z extent (VOXEL units, from loaded vertices) for
+        # the zmax-left exploration reward. Cached across episodes: a root
+        # id's geometry never changes.
+        self._mesh_zmax: dict[str, float] = {}
         # Reset-ahead prefetch for the state the environment said comes next:
         # measured 38 s reset tail = mesh download/decode/normals + cold tiles,
         # all prefetchable during the current episode.
@@ -387,6 +391,7 @@ class SimulatorRenderer:
                 v, f = self._meshes.get(rid)
                 vn = None
             self._renderer.load_mesh(rid, v, f, normals=vn)
+            self._record_mesh_zmax(rid, v)
         # A reset state may already carry several selected segments; only
         # the first one has a prefetched mesh.
         self._ensure_meshes(st["segments"], block=True)
@@ -885,6 +890,7 @@ class SimulatorRenderer:
             try:
                 v, vn, f = fut.result(timeout=240 if must_wait else None)
                 self._renderer.load_mesh(rid, v, f, normals=vn, replace=lod == 0)
+                self._record_mesh_zmax(rid, v)
             except Exception as e:  # noqa: BLE001
                 logger.warning("mesh fetch for segment %s failed (%s)", rid, e)
                 continue
@@ -893,6 +899,21 @@ class SimulatorRenderer:
             else:
                 # Coarse level is on screen; queue the refinement.
                 self._mesh_fine.add(rid)
+
+    def _record_mesh_zmax(self, rid: str, vertices_nm) -> None:
+        """Cache the mesh's intrinsic z extent in VOXEL units (matching the
+        obs position). lod0 refinements overwrite the coarse estimate."""
+        try:
+            znm = float(np.asarray(vertices_nm)[:, 2].max())
+            vz = np.asarray(self._voxel_nm).reshape(-1)
+            self._mesh_zmax[str(rid)] = znm / float(vz[2] if vz.size >= 3 else vz[0])
+        except Exception:  # noqa: BLE001  advisory cache; never break a load
+            pass
+
+    def mesh_zmax(self, rid) -> float | None:
+        """Intrinsic z-max (voxel units) of a segment whose mesh has loaded,
+        else None. Backs the zmax-left exploration reward."""
+        return self._mesh_zmax.get(str(rid))
 
     # ------------------------------------------------------------------ frames
 

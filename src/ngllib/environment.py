@@ -305,6 +305,11 @@ class Environment(gym.Env):
                 # Variable-length tuple of root-id strings; policy-facing obs
                 # wrappers drop it, so no learner ever encodes it.
                 "segments": spaces.Sequence(spaces.Text(max_length=32)),
+                # Per-visible-segment intrinsic mesh z-max (voxel units),
+                # aligned 1:1 with "segments"; -1.0 = mesh not loaded yet /
+                # backend without geometry (Chrome). Reward-hook data only.
+                "segment_zmax": spaces.Sequence(
+                    spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32)),
             }
         )
 
@@ -391,6 +396,15 @@ class Environment(gym.Env):
         image_size = self._renderer.layout.image_size
         if image_size is not None and image.shape[:2] != (image_size[1], image_size[0]):
             image = np.asarray(Image.fromarray(image).resize(image_size))
+        segs = tuple(sorted(S.visible_segments(st["segments"])))
+        # Intrinsic mesh z-max per visible segment (zmax-left exploration
+        # reward); -1.0 while a mesh hasn't loaded or the backend has no
+        # geometry (Chrome).
+        zmax_of = getattr(self._renderer, "mesh_zmax", None)
+        seg_zmax = tuple(
+            np.float32(z if zmax_of is not None and (z := zmax_of(s)) is not None
+                       else -1.0)
+            for s in segs)
         return {
             "position": np.asarray(st["position"], dtype=np.float32),
             "xs_scale": np.asarray([st["crossSectionScale"]], dtype=np.float32),
@@ -401,5 +415,6 @@ class Environment(gym.Env):
             # see selection changes (hop detection, SHOW_ALL). Downstream obs
             # wrappers build their own dicts, so the extra key never reaches the
             # policy's observation space.
-            "segments": tuple(sorted(S.visible_segments(st["segments"]))),
+            "segments": segs,
+            "segment_zmax": seg_zmax,
         }
