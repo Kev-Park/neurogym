@@ -20,13 +20,16 @@ import atexit
 import functools
 import http.server
 import logging
+import os
 import socketserver
 import threading
 from pathlib import Path
 
+from .errors import RendererError
+
 logger = logging.getLogger(__name__)
 
-_SERVERS: dict[Path, str] = {}
+_SERVERS: dict[Path, tuple[int, str]] = {}   # dist -> (pid that serves it, origin)
 _LOCK = threading.Lock()
 
 
@@ -60,16 +63,25 @@ def serve(dist: Path) -> str:
     """
     dist = Path(dist).resolve()
     with _LOCK:
-        origin = _SERVERS.get(dist)
-        if origin is not None:
-            return origin
+        cached = _SERVERS.get(dist)
+        # The PID guard matters if this module is ever inherited across a fork:
+        # the child gets the cache but not the serving thread, so it would hand
+        # Chrome a URL only its parent can answer -- and the failure would be a
+        # hang, not an error. Env runners are spawned today, so this is a latch
+        # against a future topology rather than a live bug.
+        if cached is not None and cached[0] == os.getpid():
+            return cached[1]
         handler = functools.partial(_Handler, directory=str(dist))
-        httpd = _Server(("127.0.0.1", 0), handler)
+        try:
+            httpd = _Server(("127.0.0.1", 0), handler)
+        except OSError as e:
+            raise RendererError(
+                f"could not bind a loopback port to serve the viewer from {dist}: {e}") from e
         port = httpd.server_address[1]
         threading.Thread(target=httpd.serve_forever, name=f"ngl-viewer:{port}",
                          daemon=True).start()
         atexit.register(httpd.shutdown)
         origin = f"http://127.0.0.1:{port}"
-        _SERVERS[dist] = origin
+        _SERVERS[dist] = (os.getpid(), origin)
         logger.info("serving viewer %s at %s", dist, origin)
         return origin

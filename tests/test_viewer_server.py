@@ -1,5 +1,6 @@
 """The loopback viewer server: what it serves, and that it is shared."""
 
+import os
 import urllib.error
 import urllib.request
 
@@ -47,3 +48,29 @@ def test_missing_file_is_a_404(dist):
     with pytest.raises(urllib.error.HTTPError) as e:
         get(origin, "/nope.js")
     assert e.value.code == 404
+
+
+def test_a_forked_child_would_serve_its_own(dist, monkeypatch):
+    """The cache is keyed by PID: a process that inherits it must not hand
+    Chrome a URL only its parent can answer."""
+    first = viewer_server.serve(dist)
+    # Capture the real pid BEFORE patching: `os` is the shared module object,
+    # so a lambda that calls os.getpid() would call itself.
+    child_pid = os.getpid() + 1
+    monkeypatch.setattr(viewer_server.os, "getpid", lambda: child_pid)
+    second = viewer_server.serve(dist)
+    assert second != first
+    status, body, _ = get(second, "/index.html")
+    assert status == 200 and b"viewer" in body
+
+
+def test_bind_failure_names_the_cause(dist, monkeypatch):
+    from ngllib.errors import RendererError
+
+    def boom(*a, **k):
+        raise OSError(98, "Address already in use")
+
+    monkeypatch.setattr(viewer_server, "_Server", boom)
+    monkeypatch.setattr(viewer_server, "_SERVERS", {})
+    with pytest.raises(RendererError, match="could not bind a loopback port"):
+        viewer_server.serve(dist)
