@@ -169,6 +169,8 @@ class SimulatorRenderer:
         dataset: DatasetSpec | None = None,
         config_path: str | None = None,
         cave_secret: str | None = None,
+        click_grid: tuple[int, int] | None = None,
+        click_bounds: tuple[float, float, float, float] = (0, 23, 1800, 876),
     ):
         if pane_mode not in PANE_MODES:
             raise ValueError(f"`pane_mode` must be one of {PANE_MODES}; got {pane_mode!r}")
@@ -178,6 +180,15 @@ class SimulatorRenderer:
         self.layout.warn_if_uncalibrated("SimulatorRenderer")
         self.events = EventLog(path_template="")  # replaced by the environment
         self.pane_mode: str = pane_mode
+        # Opt-in discrete-action picking: search only the selected cell, never
+        # a radius that can reach into neighbouring cells. Legacy picking stays default.
+        self.click_grid = tuple(click_grid) if click_grid is not None else None
+        self.click_bounds = tuple(click_bounds)
+        if self.click_grid is not None:
+            rows, cols = self.click_grid
+            x0, y0, x1, y1 = self.click_bounds
+            if rows <= 0 or cols <= 0 or x1 <= x0 or y1 <= y0:
+                raise ValueError("click_grid and click_bounds must have positive extents")
 
         # Deployment identity: the same start URL Chrome navigates to. The
         # dataset is what the simulator reads; the URL's viewer state is the
@@ -554,10 +565,38 @@ class SimulatorRenderer:
 
     # ------------------------------------------------------------------ picking
 
+    def _cell_sample(self, valid, x_css, y_css, *, pane_x, toolbar):
+        """Nearest valid displayed pixel inside the clicked half-open cell."""
+        rows, cols = self.click_grid
+        x0, y0, x1, y1 = self.click_bounds
+        if not (x0 <= x_css < x1 and y0 <= y_css < y1):
+            return None
+        cw, ch = (x1 - x0) / cols, (y1 - y0) / rows
+        col, row = int((x_css - x0) / cw), int((y_css - y0) / ch)
+        scale = self.layout.capture_scale
+        # Pixel centres in the displayed composite, expressed in click CSS units.
+        xs = (np.arange(valid.shape[1]) + pane_x + 0.5) / scale
+        ys = (np.arange(valid.shape[0]) + toolbar + 0.5) / scale
+        in_x = (xs >= x0 + col * cw) & (xs < x0 + (col + 1) * cw)
+        in_y = (ys >= y0 + row * ch) & (ys < y0 + (row + 1) * ch)
+        yy, xx = np.nonzero(valid & in_y[:, None] & in_x[None, :])
+        if not len(xx):
+            return None
+        k = np.argmin((xs[xx] - x_css) ** 2 + (ys[yy] - y_css) ** 2)
+        return int(yy[k]), int(xx[k])
+
     def _segment_under_2d(self, x_css: float, y_css: float):
         """Segment id under a 2D-pane pixel via a point query on the
         segmentation volume, at the SAME mip the pane displays (label_tile
         uses extent/out_px) so a pick agrees with the tint that is drawn."""
+        if self.click_grid is not None:
+            # Use the adopted label map, including when it lags the camera:
+            # an unseen freshly fetched segment must not become a click target.
+            ids = self._tiles.get("ids") if self._tiles else None
+            if ids is None or self._tiles.get("em") is None:
+                return None
+            sample = self._cell_sample(ids != 0, x_css, y_css, pane_x=0, toolbar=TOOLBAR)
+            return int(ids[sample]) if sample is not None else None
         st = self._state
         xs = float(st["crossSectionScale"])
         world = [st["position"][0] + (x_css - PANEL_CX_CLICK) * xs,
@@ -591,9 +630,21 @@ class SimulatorRenderer:
         pos_nm = np.asarray(st["position"], dtype=np.float64) * self._voxel_nm
         zoom_nm = float(st["projectionScale"]) * SCALE_CAL_NM
         best, best_d = None, 0.9999
+        best_distance = float("inf")
         for rid in ids:
             depth, _, _ = self._renderer.pick_depth(
                 [rid], pos_nm, st["projectionOrientation"], zoom_nm)
+            if self.click_grid is not None:
+                sample = self._cell_sample(depth[:PANE_H_3D] < 0.9999, x_css, y_css,
+                                           pane_x=PANE, toolbar=TOOLBAR_3D)
+                if sample is not None:
+                    py, px = sample
+                    distance = ((px + PANE + 0.5 - x_css * self.layout.capture_scale) ** 2
+                                + (py + TOOLBAR_3D + 0.5 - y_css * self.layout.capture_scale) ** 2)
+                    d = float(depth[py, px])
+                    if (distance, d) < (best_distance, best_d):
+                        best, best_distance, best_d = rid, distance, d
+                continue
             # NG picks over a small radius; take the front-most hit nearby.
             y0, y1 = max(0, iy - 3), min(PANE_H_3D, iy + 4)
             x0, x1 = max(0, ix - 3), min(PANE, ix + 4)
@@ -644,7 +695,14 @@ class SimulatorRenderer:
             return None
         d = depth[iy, ix]
         px, py = ix, iy
-        if d >= 0.9999:
+        if self.click_grid is not None:
+            sample = self._cell_sample(depth[:PANE_H_3D] < 0.9999, x_css, y_css,
+                                       pane_x=PANE, toolbar=TOOLBAR_3D)
+            if sample is None:
+                return None
+            py, px = sample
+            d = depth[py, px]
+        elif d >= 0.9999:
             # NG issues the pick over a small radius; take the front-most hit
             # in a 3px window (matches the browser-validated harness).
             y0, y1 = max(0, iy - 3), min(PANE_H_3D, iy + 4)
