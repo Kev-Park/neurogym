@@ -17,6 +17,7 @@ def renderer():
                 "crossSectionScale": 1, "projectionOrientation": [0, 0, 0, 1],
                 "projectionScale": 1000}
     r._voxel_nm = np.ones(3)
+    r._canonical_nm = 1.0
     r._ensure_meshes = lambda ids: None
     return r
 
