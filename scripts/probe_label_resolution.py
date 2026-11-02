@@ -123,6 +123,8 @@ def compare(args):
     print("SUMMARY", json.dumps(summary), flush=True)
     assert summary["after"]["left"]["iou"] > summary["before"]["left"]["iou"] + 0.02
     assert summary["worst_iou_delta"] >= -0.03
+    assert summary["after"]["left"]["ssim"] >= summary["before"]["left"]["ssim"] - 0.005
+    assert summary["after"]["left"]["mad"] <= summary["before"]["left"]["mad"] + 0.5
     assert summary["after"]["right"]["ssim"] >= summary["before"]["right"]["ssim"] - 0.01
     print("LABEL-RESOLUTION-PASS", flush=True)
 

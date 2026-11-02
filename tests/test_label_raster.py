@@ -35,3 +35,15 @@ def test_both_worker_paths_request_css_labels(monkeypatch):
     np.testing.assert_array_equal(separate, em.unpack_ids(packed))
     assert separate.shape == (867, 900)
     assert separate[0, 0] == 720575940603464672
+
+
+def test_css_composition_preserves_untinted_em(monkeypatch):
+    monkeypatch.setattr(pane2d, "draw_crosshair", lambda rgb: None)
+    tile = np.random.default_rng(11).integers(0, 256, (500, 500), dtype=np.uint8)
+    capture = pane2d.resample_em(tile)
+    css = pane2d.resample_em(tile, pane2d.LABEL_SIZE)
+    expected = pane2d.compose_left_parts(capture, None, [])
+    # Both the EM-only preview and a fully loaded, untinted label map must
+    # retain the calibrated single-downsample EM pixels.
+    for ids in (None, np.zeros(css.shape, dtype=np.uint64)):
+        np.testing.assert_array_equal(pane2d.compose_left_parts(css, ids, []), expected)

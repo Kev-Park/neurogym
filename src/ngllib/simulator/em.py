@@ -352,7 +352,7 @@ def worker_em_plane(source, pos, xs_scale, max_px=1024):
     shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
     tile = em.tile(shifted, ext[0], ext[1], max_px, True)
     plane = em.tile(pos_nm, ext[0], ext[1], max_px, False)
-    return pane2d.resample_em(tile), plane
+    return pane2d.resample_em(tile, pane2d.LABEL_SIZE), plane
 
 
 def worker_ids(source, pos, xs_scale):
@@ -405,7 +405,7 @@ def worker_pane_parts(source, pos, xs_scale, max_px=1024,
     ids = (em.label_ids(shifted, ext[0], ext[1], pane2d.LABEL_SIZE)
            if with_label else None)
     plane = em.tile(pos_nm, ext[0], ext[1], max_px, False)
-    return pane2d.resample_em(tile), pack_ids(ids), plane
+    return pane2d.resample_em(tile, pane2d.LABEL_SIZE), pack_ids(ids), plane
 
 
 _WORKER_MESHES: dict = {}

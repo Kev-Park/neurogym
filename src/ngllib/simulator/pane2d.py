@@ -137,14 +137,14 @@ def shifted_fetch_center_nm(pos_nm: np.ndarray, ext: tuple[float, float]):
         LEFT_SHIFT_PX[0] * ext[1] / PANE_H, 0.0])
 
 
-def resample_em(tile) -> np.ndarray:
+def resample_em(tile, out_px=(PANE, PANE_H)) -> np.ndarray:
     """EM tile -> the pane's greyscale raster (PANE_H x PANE uint8).
 
     Calibrated chain: subpixel-phase tile -> GL-linear resample to the 900x867
     CSS pane -> Chrome's area-average capture downscale, then EM_GAIN.
     """
     big = Image.fromarray(tile).resize((900, 867), Image.BILINEAR)
-    img = np.asarray(big.resize((PANE, PANE_H), Image.BOX)).astype(np.float32)
+    img = np.asarray(big.resize(out_px, Image.BOX)).astype(np.float32)
     return np.clip(img * em_gain(), 0, 255).astype(np.uint8)
 
 
@@ -223,11 +223,11 @@ def compose_left_parts(em_gray, ids, visible) -> np.ndarray:
                 if m.any():
                     col = np.asarray(segment_color(rid)) * 255.0
                     rgb[m] = 0.5 * col[None, :] + 0.5 * rgb[m]
-        if rgb.shape[:2] != (PANE_H, PANE):
-            # Average rendered colours, never the uint64 root IDs. Sampling
-            # at capture resolution instead loses thin labels as xs zooms out.
-            rgb = np.asarray(Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8)).resize(
-                (PANE, PANE_H), Image.Resampling.BOX), dtype=np.float32).copy()
+    if rgb.shape[:2] != (PANE_H, PANE):
+        # Average rendered colours, never the uint64 root IDs. Sampling
+        # at capture resolution instead loses thin labels as xs zooms out.
+        rgb = np.asarray(Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8)).resize(
+            (PANE, PANE_H), Image.Resampling.BOX), dtype=np.float32).copy()
     draw_crosshair(rgb)
     canvas[TOOLBAR:] = np.clip(rgb, 0, 255).astype(np.uint8)
     return canvas
