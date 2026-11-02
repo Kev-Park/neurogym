@@ -330,7 +330,7 @@ def worker_warm(source, pos, xs_scale, factor=1.6, max_px=1024):
     try:
         em.tile(pos_nm, ext[0] * k, ext[1] * k, int(max_px * k), False)
         em.label_ids(pos_nm, ext[0] * k, ext[1] * k,
-                     (int(pane2d.PANE * k), int(pane2d.PANE_H * k)))
+                     tuple(int(n * k) for n in pane2d.LABEL_SIZE))
     except Exception:  # noqa: BLE001 - best effort; a miss just costs latency
         pass
     return True
@@ -369,7 +369,7 @@ def worker_ids(source, pos, xs_scale):
     ext = pane2d.pane_extents_nm(xs_scale, source.canonical_nm)
     shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
     return pack_ids(em.label_ids(shifted, ext[0], ext[1],
-                                 (pane2d.PANE, pane2d.PANE_H)))
+                                 pane2d.LABEL_SIZE))
 
 
 def worker_pane_parts(source, pos, xs_scale, max_px=1024,
@@ -402,7 +402,7 @@ def worker_pane_parts(source, pos, xs_scale, max_px=1024,
     ext = pane2d.pane_extents_nm(xs_scale, source.canonical_nm)
     shifted = pane2d.shifted_fetch_center_nm(pos_nm, ext)
     tile = em.tile(shifted, ext[0], ext[1], max_px, True)
-    ids = (em.label_ids(shifted, ext[0], ext[1], (pane2d.PANE, pane2d.PANE_H))
+    ids = (em.label_ids(shifted, ext[0], ext[1], pane2d.LABEL_SIZE)
            if with_label else None)
     plane = em.tile(pos_nm, ext[0], ext[1], max_px, False)
     return pane2d.resample_em(tile), pack_ids(ids), plane
