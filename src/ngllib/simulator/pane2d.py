@@ -94,6 +94,8 @@ PANE_H_3D = PANE - TOOLBAR_3D             # displayed rows of the 3D pane
 CSS_PANE = 900.0
 CSS_TOOLBAR = 33.0
 CSS_VIEW_H = 867.0
+# Labels are sampled before Chrome downsizes the CSS raster for capture.
+LABEL_SIZE = (int(CSS_PANE), int(CSS_VIEW_H))
 
 # Click geometry, measured off the live DOM (probe_select_parity.py --mode
 # rects, 2026-09-10). `mouse_xy` is relative to `.neuroglancer-layer-group-
@@ -135,14 +137,15 @@ def shifted_fetch_center_nm(pos_nm: np.ndarray, ext: tuple[float, float]):
         LEFT_SHIFT_PX[0] * ext[1] / PANE_H, 0.0])
 
 
-def resample_em(tile) -> np.ndarray:
-    """EM tile -> the pane's greyscale raster (PANE_H x PANE uint8).
+def resample_em(tile, out_px=(PANE, PANE_H)) -> np.ndarray:
+    """EM tile -> a greyscale CSS or capture raster (uint8).
 
     Calibrated chain: subpixel-phase tile -> GL-linear resample to the 900x867
     CSS pane -> Chrome's area-average capture downscale, then EM_GAIN.
+    Workers request LABEL_SIZE so composition downsizes EM and tint together.
     """
     big = Image.fromarray(tile).resize((900, 867), Image.BILINEAR)
-    img = np.asarray(big.resize((PANE, PANE_H), Image.BOX)).astype(np.float32)
+    img = np.asarray(big.resize(out_px, Image.BOX)).astype(np.float32)
     return np.clip(img * em_gain(), 0, 255).astype(np.uint8)
 
 
@@ -208,6 +211,10 @@ def compose_left_parts(em_gray, ids, visible) -> np.ndarray:
         return canvas
     rgb = np.repeat(np.asarray(em_gray, dtype=np.float32)[..., None], 3, axis=2)
     if ids is not None:
+        if ids.shape != rgb.shape[:2]:
+            gray = Image.fromarray(np.asarray(em_gray, dtype=np.uint8)).resize(
+                (ids.shape[1], ids.shape[0]), Image.Resampling.BILINEAR)
+            rgb = np.repeat(np.asarray(gray, dtype=np.float32)[..., None], 3, axis=2)
         vis = [int(v) for v in visible]
         if not vis:
             tint_all(rgb, ids)
@@ -217,6 +224,11 @@ def compose_left_parts(em_gray, ids, visible) -> np.ndarray:
                 if m.any():
                     col = np.asarray(segment_color(rid)) * 255.0
                     rgb[m] = 0.5 * col[None, :] + 0.5 * rgb[m]
+    if rgb.shape[:2] != (PANE_H, PANE):
+        # Average rendered colours, never the uint64 root IDs. Sampling
+        # at capture resolution instead loses thin labels as xs zooms out.
+        rgb = np.asarray(Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8)).resize(
+            (PANE, PANE_H), Image.Resampling.BOX), dtype=np.float32).copy()
     draw_crosshair(rgb)
     canvas[TOOLBAR:] = np.clip(rgb, 0, 255).astype(np.uint8)
     return canvas

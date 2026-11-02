@@ -468,7 +468,7 @@ class SimulatorRenderer:
 
     # ------------------------------------------------------------------ picking
 
-    def _cell_sample(self, valid, x_css, y_css, *, pane_x, toolbar):
+    def _cell_sample(self, valid, x_css, y_css, *, pane_x, toolbar, display_shape=None):
         """Nearest valid displayed pixel inside the clicked half-open cell."""
         rows, cols = self.click_grid
         x0, y0, x1, y1 = self.click_bounds
@@ -478,8 +478,9 @@ class SimulatorRenderer:
         col, row = int((x_css - x0) / cw), int((y_css - y0) / ch)
         scale = self.layout.capture_scale
         # Pixel centres in the displayed composite, expressed in click CSS units.
-        xs = (np.arange(valid.shape[1]) + pane_x + 0.5) / scale
-        ys = (np.arange(valid.shape[0]) + toolbar + 0.5) / scale
+        height, width = valid.shape if display_shape is None else display_shape
+        xs = ((np.arange(valid.shape[1]) + 0.5) * width / valid.shape[1] + pane_x) / scale
+        ys = ((np.arange(valid.shape[0]) + 0.5) * height / valid.shape[0] + toolbar) / scale
         in_x = (xs >= x0 + col * cw) & (xs < x0 + (col + 1) * cw)
         in_y = (ys >= y0 + row * ch) & (ys < y0 + (row + 1) * ch)
         yy, xx = np.nonzero(valid & in_y[:, None] & in_x[None, :])
@@ -498,7 +499,8 @@ class SimulatorRenderer:
             ids = self._tiles.get("ids") if self._tiles else None
             if ids is None or self._tiles.get("em") is None:
                 return None
-            sample = self._cell_sample(ids != 0, x_css, y_css, pane_x=0, toolbar=TOOLBAR)
+            sample = self._cell_sample(ids != 0, x_css, y_css, pane_x=0, toolbar=TOOLBAR,
+                                       display_shape=(PANE_H, PANE))
             return int(ids[sample]) if sample is not None else None
         st = self._state
         xs = float(st["crossSectionScale"])
@@ -507,7 +509,7 @@ class SimulatorRenderer:
                  st["position"][2]]
         # NG picks against the slice it RENDERS, which is the CSS-resolution
         # pane (900 px wide), not the downscaled capture -- so the pick mip is
-        # canonical*xs nm/px, one step finer than label_tile's capture-sized tile.
+        # canonical*xs nm/px, also used by the CSS-resolution displayed labels.
         res_nm = xs * self._canonical_nm
         return self._pick_em_tiles().segment_at(
             np.asarray(world, dtype=np.float64) * self._voxel_nm, res_nm)
