@@ -138,10 +138,11 @@ def shifted_fetch_center_nm(pos_nm: np.ndarray, ext: tuple[float, float]):
 
 
 def resample_em(tile, out_px=(PANE, PANE_H)) -> np.ndarray:
-    """EM tile -> the pane's greyscale raster (PANE_H x PANE uint8).
+    """EM tile -> a greyscale CSS or capture raster (uint8).
 
     Calibrated chain: subpixel-phase tile -> GL-linear resample to the 900x867
     CSS pane -> Chrome's area-average capture downscale, then EM_GAIN.
+    Workers request LABEL_SIZE so composition downsizes EM and tint together.
     """
     big = Image.fromarray(tile).resize((900, 867), Image.BILINEAR)
     img = np.asarray(big.resize(out_px, Image.BOX)).astype(np.float32)
