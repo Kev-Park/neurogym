@@ -1,3 +1,12 @@
+# Simulator mesh workers
+
+Meshes now always use a dedicated fetch pool, with two workers by default.
+`NGL_NATIVE_MESH_WORKERS` may select a positive worker count before the first
+renderer is constructed; `0` (sharing the tile queue) is no longer supported.
+Pools are shared by renderers in the same process, including threaded envs.
+Speculative candidate prefetch remains off unless `NGL_NATIVE_MESH_PREFETCH`
+is explicitly positive. Tile fetching retains its separate worker setting.
+
 # Simulator 2D label sampling within 0.3
 
 The simulator now samples segmentation at the browser's CSS resolution
