@@ -1,3 +1,18 @@
+# Assigned GPU selection
+
+CUDA assignments (numeric, reordered, or UUID) are resolved through
+`EGL_NV_device_cuda` once at startup, rather than assuming CUDA/EGL indices
+match. An unresolvable explicit assignment fails with an actionable error.
+`NGL_EGL_DEVICE` remains an explicit EGL-index override; an unset CUDA
+assignment retains the platform default. No device mapping runs per frame.
+
+# Viewer layer selection
+
+`DatasetSpec.from_state` accepts `image_layer` and `segmentation_layer` names.
+Ambiguous image/segmentation layers now require selection. `select_viewer_layers`
+produces the matching viewer state for Chrome. Multi-source and transformed
+selected layers are rejected rather than silently interpreted incorrectly.
+
 # Simulator mesh workers
 
 Meshes now always use a dedicated fetch pool, with two workers by default.

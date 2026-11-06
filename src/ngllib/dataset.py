@@ -200,6 +200,24 @@ def ngl_state_from_viewer(viewer_state: dict[str, Any]) -> dict[str, Any]:
     return st
 
 
+def select_viewer_layers(viewer_state, *, image_layer=None, segmentation_layer=None):
+    """Select an unambiguous image/segmentation pair for both renderers."""
+    selected = []
+    for kind, name in (("image", image_layer), ("segmentation", segmentation_layer)):
+        candidates = [layer for layer in viewer_state.get("layers", [])
+                      if layer.get("type") == kind and (name is None or layer.get("name") == name)]
+        if len(candidates) != 1:
+            raise ProviderError(
+                f"Expected one {kind} layer, found {len(candidates)} for selector {name!r}; "
+                f"set {'image_layer' if kind == 'image' else 'segmentation_layer'} explicitly")
+        selected.append(candidates[0])
+    out = copy.deepcopy(viewer_state)
+    out["layers"] = [copy.deepcopy(layer) for layer in viewer_state.get("layers", [])
+                     if layer.get("type") not in ("image", "segmentation")
+                     or any(layer is chosen for chosen in selected)]
+    return out
+
+
 @dataclass(frozen=True)
 class DatasetSpec:
     """What the start URL says about the data. Hashable, so fetch workers can
@@ -210,7 +228,10 @@ class DatasetSpec:
     voxel_nm: tuple[float, float, float]
 
     @classmethod
-    def from_state(cls, viewer_state: dict[str, Any]) -> "DatasetSpec":
+    def from_state(cls, viewer_state: dict[str, Any], *, image_layer=None,
+                   segmentation_layer=None) -> "DatasetSpec":
+        viewer_state = select_viewer_layers(viewer_state, image_layer=image_layer,
+                                          segmentation_layer=segmentation_layer)
         dims = viewer_state.get("dimensions", {})
         try:
             voxel = tuple(
@@ -221,9 +242,17 @@ class DatasetSpec:
             ) from e
         em = seg = None
         for layer in viewer_state.get("layers", []):
+            if layer.get("type") not in ("image", "segmentation"):
+                continue
+            if layer.get("transform"):
+                raise ProviderError("Transformed layers are not supported by the simulator")
             src = layer.get("source")
             if isinstance(src, dict):
+                if src.get("transform"):
+                    raise ProviderError("Transformed layer sources are not supported by the simulator")
                 src = src.get("url")
+            if isinstance(src, list):
+                raise ProviderError("Multiple sources within a layer are not supported by the simulator")
             if layer.get("type") == "image" and em is None:
                 em = src
             elif layer.get("type") == "segmentation" and seg is None:

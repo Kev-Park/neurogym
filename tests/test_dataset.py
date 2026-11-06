@@ -61,3 +61,20 @@ def test_dataset_requires_dimensions_and_both_layers():
 
 def test_dataset_is_hashable():
     {DatasetSpec.from_config(): 1}
+
+
+def test_multiple_layers_require_explicit_selection():
+    import copy
+    from ngllib.dataset import select_viewer_layers
+
+    _, state = split_state_url(default_start_url())
+    other = copy.deepcopy(next(layer for layer in state["layers"] if layer["type"] == "segmentation"))
+    other["name"] = "prediction"
+    other["source"] = "precomputed://https://example.org/prediction"
+    state["layers"].append(other)
+    with pytest.raises(ProviderError, match="segmentation_layer"):
+        DatasetSpec.from_state(state)
+    chosen = select_viewer_layers(state, segmentation_layer="prediction")
+    assert DatasetSpec.from_state(chosen).seg_url == other["source"]
+    assert len([layer for layer in chosen["layers"] if layer["type"] == "segmentation"]) == 1
+    assert len(state["layers"]) > len(chosen["layers"])
