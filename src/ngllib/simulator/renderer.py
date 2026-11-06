@@ -275,11 +275,10 @@ class SimulatorRenderer:
         # largest on-slice 2D-pane segments, fetched BEFORE any selection so a
         # hop's visual payoff isn't delayed by the fetch. Futures are claimed
         # by _ensure_meshes when a candidate is actually selected. 0 = off
-        # (default); forced off when the dedicated mesh lane is off, where
-        # speculation would compete with tile fetches on the shared shards.
+        # (default). Mesh fetches always use their own worker pool.
         spec_k = int(os.environ.get("NGL_NATIVE_MESH_PREFETCH", "0"))
-        if int(os.environ.get("NGL_NATIVE_MESH_WORKERS", "2")) == 0:
-            spec_k = 0
+        if int(os.environ.get("NGL_NATIVE_MESH_WORKERS", "2")) < 1:
+            raise ValueError("NGL_NATIVE_MESH_WORKERS must be at least 1; meshes use a dedicated pool")
         self._spec_k = spec_k
         self._spec_futs: dict[str, Any] = {}
         # Intrinsic per-mesh z extent (VOXEL units, from loaded vertices) for
@@ -515,16 +514,13 @@ class SimulatorRenderer:
         """
         if cls._MESH_POOLS is None:
             n = int(os.environ.get("NGL_NATIVE_MESH_WORKERS", "2"))
-            if n <= 0:
-                # ablation control: route meshes through the tile shards
-                # exactly as before the lane existed
-                cls._MESH_POOLS = cls._pools()
-            else:
-                cls._MESH_POOLS = [
-                    ProcessPoolExecutor(
-                        max_workers=1,
-                        mp_context=multiprocessing.get_context("spawn"))
-                    for _ in range(n)]
+            if n < 1:
+                raise ValueError("NGL_NATIVE_MESH_WORKERS must be at least 1")
+            cls._MESH_POOLS = [
+                ProcessPoolExecutor(
+                    max_workers=1,
+                    mp_context=multiprocessing.get_context("spawn"))
+                for _ in range(n)]
         return cls._MESH_POOLS
 
     def _tile_pool(self) -> ProcessPoolExecutor:
@@ -546,14 +542,13 @@ class SimulatorRenderer:
         (job 995571): one OOM-killed Draco decode turned a runner into a
         meshless zombie spamming half a million submit warnings. Recreating
         the pools makes worker death a hiccup instead of a fleet degradation.
-        Only the dedicated lane is rebuilt here; with MESH_WORKERS=0 the lane
-        aliases the tile shards, whose breakage fails resets loudly instead.
+        Tile workers are independent and are not replaced by this recovery.
         """
         if not isinstance(exc, BrokenProcessPool):
             return
         with cls._POOL_HEAL_LOCK:
             pools = cls._MESH_POOLS
-            if pools is None or pools is cls._TILE_POOLS:
+            if pools is None:
                 return
             cls._MESH_POOLS = None
             for p in pools:
