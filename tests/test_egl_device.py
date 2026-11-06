@@ -1,33 +1,32 @@
-"""MeshRenderer picks the EGL device of the GPU this process was assigned.
-
-EGL enumerates physical devices and ignores CUDA_VISIBLE_DEVICES, so without
-an explicit device_index every runner's GL context lands on physical GPU0 no
-matter where Ray placed it (measured 2026-10-01: 8-GPU split, GPU0 9.8 GB vs
-1.7 GB elsewhere). Pure-logic tests of the mapping; no GL context is created.
-"""
-
+from ngllib.simulator import egl_device
 from ngllib.simulator.render3d import MeshRenderer
+import pytest
 
 
-def test_follows_first_cuda_visible_device(monkeypatch):
+def test_assignment_uses_driver_mapping_including_uuid(monkeypatch):
     monkeypatch.delenv("NGL_EGL_DEVICE", raising=False)
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
-    assert MeshRenderer._egl_device_kw() == {"device_index": 2}
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5,6")
-    assert MeshRenderer._egl_device_kw() == {"device_index": 5}
+    seen = []
+    monkeypatch.setattr(egl_device, "_assigned_egl_index", lambda value: seen.append(value) or 4)
+    for value in ("2", "5,2", "GPU-abcd"):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", value)
+        assert MeshRenderer._egl_device_kw() == {"device_index": 4}
+    assert seen == ["2", "5,2", "GPU-abcd"]
 
 
 def test_explicit_override_wins(monkeypatch):
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abcd")
     monkeypatch.setenv("NGL_EGL_DEVICE", "7")
     assert MeshRenderer._egl_device_kw() == {"device_index": 7}
+    monkeypatch.setenv("NGL_EGL_DEVICE", "bad")
+    with pytest.raises(ValueError):
+        MeshRenderer._egl_device_kw()
 
 
-def test_falls_back_to_default_when_not_an_index(monkeypatch):
+def test_no_assignment_and_empty_assignment_are_distinct(monkeypatch):
     monkeypatch.delenv("NGL_EGL_DEVICE", raising=False)
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assert MeshRenderer._egl_device_kw() == {}
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    assert MeshRenderer._egl_device_kw() == {}
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-0a1b2c3d")
-    assert MeshRenderer._egl_device_kw() == {}
+    for value in ("", "-1"):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", value)
+        with pytest.raises(RuntimeError, match="assigns no GPU"):
+            MeshRenderer._egl_device_kw()

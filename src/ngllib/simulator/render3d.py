@@ -58,12 +58,9 @@ class MeshRenderer:
 
     @staticmethod
     def _egl_device_kw() -> dict:
-        """{'device_index': N} for the GPU this process was assigned, else {}."""
-        raw = os.environ.get("NGL_EGL_DEVICE") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        first = raw.split(",")[0].strip()
-        if not first.isdigit():
-            return {}
-        return {"device_index": int(first)}
+        from .egl_device import device_kwargs
+
+        return device_kwargs()
 
     def __init__(self, width: int, height: int,
                  mesh_budget_bytes: int | None = None):
@@ -71,16 +68,8 @@ class MeshRenderer:
 
         self._moderngl = moderngl
         self.width, self.height = width, height
-        # EGL enumerates PHYSICAL devices and ignores CUDA_VISIBLE_DEVICES, so
-        # the default device_index=0 put EVERY runner's GL context on physical
-        # GPU0 even when Ray had spread the runners (and their DINO/CUDA
-        # contexts) across GPUs: measured 2026-10-01 on an 8-GPU split, GPU0
-        # 9.8 GB vs 1.7 GB on the others, and the render pipeline serialized
-        # through GPU0's time-sliced GL contexts. Follow the worker's assigned
-        # GPU instead: Ray sets CUDA_VISIBLE_DEVICES to the physical index it
-        # assigned, which matches EGL's device order on the NVIDIA driver.
-        # NGL_EGL_DEVICE overrides; a non-integer id (GPU-<uuid>) or an old
-        # moderngl without device_index falls back to the old behaviour.
+        # Resolve assignments through EGL/CUDA mapping rather than assuming
+        # enumeration indices match. This also accepts CUDA UUID assignments.
         self.ctx = moderngl.create_context(
             standalone=True, backend="egl", **self._egl_device_kw())
         self.ctx.enable(moderngl.DEPTH_TEST)
