@@ -102,9 +102,8 @@ PaneMode = Literal["atomic", "progressive", "concurrent", "random", "fresh",
 # ~1s+ two-pane tile group and the fetch pool queues; impractical for training.
 #
 # "meshblock": the middle ground — tiles stay atomic (the validated, cheap
-# staleness) but meshes ALWAYS block at full res, so a selected neuron is never
-# invisible (kills the measured 200-300-step post-hop blindness — the
-# "prolonged degradation" mode — at a few 1-4s stalls per episode).
+# staleness) but waits for a COARSE mesh for newly selected neurons. Fine
+# refinement remains asynchronous, avoiding prolonged post-selection blindness.
 PANE_MODES = ("atomic", "progressive", "concurrent", "random", "fresh",
               "meshblock")
 
