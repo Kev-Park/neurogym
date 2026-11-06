@@ -1,3 +1,17 @@
+# Simulator 2D label sampling within 0.3
+
+The simulator now samples segmentation at the browser's CSS resolution
+(900 × 867 at the calibrated layout), composes the EM and label colours there,
+then downsamples to the captured pane. Previously it selected a coarser mip
+using the 450-pixel capture width and coloured labels after capture downsampling.
+Root IDs remain integer nearest-neighbour samples; only rendered colours are
+averaged.
+
+This deliberately changes simulator image observations, especially when zoomed
+out. Observation shapes, checkpoint shapes, and action/state contracts are
+unchanged. Label tiles contain about four times as many samples; repeated
+renders still reuse the composed pane cache.
+
 # Migrating from 0.2 → 0.3 (the renderer seam)
 
 0.3 splits `Environment` into the env contract and a pluggable `Renderer`.

@@ -46,6 +46,18 @@ def test_2d_nearest_displayed_label_and_missing_tiles():
     assert r._segment_under_2d(140.625, 156.28125) is None
 
 
+def test_css_resolution_labels_stay_in_the_clicked_cell():
+    r = renderer()
+    ids = np.zeros((867, 900), dtype=np.uint64)
+    # These label texels map to the same cell as the capture-sized test above.
+    ids[98:100, 114:116] = 720575940603464672
+    ids[122:124, 170:172] = 8  # adjacent cell
+    r._tiles = {"ids": ids, "em": np.zeros((433, PANE), dtype=np.uint8)}
+    assert r._segment_under_2d(140.625, 156.28125) == 720575940603464672
+    ids[98:100, 114:116] = 0
+    assert r._segment_under_2d(140.625, 156.28125) is None
+
+
 def test_3d_selection_and_movement_rescue_same_cell_only():
     r = renderer()
     depth = np.ones((433, PANE))

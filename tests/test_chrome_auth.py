@@ -5,11 +5,13 @@ Token resolution itself lives in ngllib.auth and is tested in test_auth.py.
 
 import json
 
+import json as _json
+
 from ngllib.chrome import (
     MIDDLEAUTH_STORAGE_KEY,
     cave_storage_state,
-    dist_file,
     middleauth_hosts,
+    storage_state_for_origin,
 )
 
 APP = "https://prodv1.flywire-daf.com"
@@ -41,16 +43,17 @@ def test_cave_storage_state_shape():
         "tokenType": "Bearer", "accessToken": "tok", "url": LOGIN, "appUrls": [APP]}
 
 
-def test_dist_file_resolves_and_defaults_to_index(tmp_path):
-    (tmp_path / "index.html").write_text("<html>")
-    (tmp_path / "main.js").write_text("//")
-    assert dist_file(tmp_path, "https://ngl.local/") == (tmp_path / "index.html").resolve()
-    assert dist_file(tmp_path, "https://ngl.local/main.js") == (tmp_path / "main.js").resolve()
-    # the state lives in the fragment, which never reaches the server
-    assert dist_file(tmp_path, 'https://ngl.local/#!{"a":1}') == (tmp_path / "index.html").resolve()
-
-
-def test_dist_file_rejects_missing_and_escaping_paths(tmp_path):
-    (tmp_path / "index.html").write_text("<html>")
-    assert dist_file(tmp_path, "https://ngl.local/nope.js") is None
-    assert dist_file(tmp_path, "https://ngl.local/../../etc/passwd") is None
+def test_storage_state_file_is_rekeyed_to_the_live_origin(tmp_path):
+    """The viewer is served from a loopback port that differs per process, and
+    Playwright keys localStorage by origin -- so a credential file captured once
+    has to be re-keyed on load or it silently does not apply."""
+    f = tmp_path / "state.json"
+    f.write_text(_json.dumps({
+        "cookies": [{"name": "s", "domain": ".flywire-daf.com", "value": "x"}],
+        "origins": [{"origin": "https://ngl.local",
+                     "localStorage": [{"name": "auth_token_v2_x", "value": "tok"}]}],
+    }))
+    out = storage_state_for_origin(str(f), "http://127.0.0.1:54321")
+    assert out["origins"][0]["origin"] == "http://127.0.0.1:54321"
+    assert out["origins"][0]["localStorage"][0]["value"] == "tok"   # entries kept
+    assert out["cookies"][0]["domain"] == ".flywire-daf.com"        # cookies untouched
