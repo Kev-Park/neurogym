@@ -15,10 +15,13 @@ and `ngllib.simulator.SimulatorRenderer` (CloudVolume + moderngl/EGL).
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
+import inspect
 import logging
 import os
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
+from types import MappingProxyType
 
 import gymnasium as gym
 import numpy as np
@@ -36,6 +39,22 @@ logger = logging.getLogger(__name__)
 # Public type aliases for the factory signatures.
 RewardFactory = Callable[[dict[str, Any]], Callable[..., float]]
 TerminationFactory = Callable[[dict[str, Any]], Callable[..., bool]]
+TaskMetadataProvider = Callable[[Renderer, dict[str, Any]], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class TransitionContext:
+    """Task-only transition metadata; never part of the observation space."""
+
+    previous_metadata: Mapping[str, Any]
+    current_metadata: Mapping[str, Any]
+
+
+def _accepts_context(fn):
+    try:
+        return "context" in inspect.signature(fn).parameters
+    except (ValueError, TypeError):
+        return False
 
 
 def _noop_reward_factory(task_info: dict[str, Any]):
@@ -77,6 +96,7 @@ class Environment(gym.Env):
         reset_state_provider: StateProvider | None = None,
         reward_factory: RewardFactory | None = None,
         termination_factory: TerminationFactory | None = None,
+        task_metadata_provider: TaskMetadataProvider | None = None,
         reset_ahead: bool = False,
         reset_ahead_after_steps: int | None = None,
         mask_ui: bool | None = None,
@@ -109,6 +129,8 @@ class Environment(gym.Env):
         self._reset_state_provider = reset_state_provider
         self._reward_factory = reward_factory or _noop_reward_factory
         self._termination_factory = termination_factory or _noop_termination_factory
+        self._task_metadata_provider = task_metadata_provider
+        self._task_metadata: dict[str, Any] = {}
 
         self.observation_space = self._build_observation_space()
         self.action_space = self._build_action_space()
@@ -169,6 +191,8 @@ class Environment(gym.Env):
         try:
             self._reward_fn = self._reward_factory(task_info)
             self._terminated_fn = self._termination_factory(task_info)
+            self._reward_context = _accepts_context(self._reward_fn)
+            self._termination_context = _accepts_context(self._terminated_fn)
         except Exception as e:
             raise ProviderError(f"factory raised at reset: {e}") from e
         self._task_info = task_info
@@ -194,6 +218,7 @@ class Environment(gym.Env):
         obs = self._make_obs(st, image)
         self._state = st
         self._prev_obs = obs
+        self._task_metadata = self._make_task_metadata(st)
 
         self._events.emit(
             "reset", total_ms=(time.monotonic() - t0) * 1000.0,
@@ -212,7 +237,8 @@ class Environment(gym.Env):
 
         if self._warm_after <= 0:
             self._maybe_warm_next()
-        return obs, {"task_info": task_info, "json_state": copy.deepcopy(st), "step": 0}
+        return obs, {"task_info": task_info, "json_state": copy.deepcopy(st), "step": 0,
+                     "task_metadata": self.task_metadata}
 
     def step(self, action):
         t_step = time.monotonic()
@@ -239,22 +265,31 @@ class Environment(gym.Env):
             self._last_step_glitched = True
             raise
         obs = self._make_obs(st, image)
+        task_metadata = self._make_task_metadata(st)
+        context = TransitionContext(MappingProxyType(self._task_metadata),
+                                    MappingProxyType(task_metadata))
 
         # Termination runs first so the reward fn can read `terminated` for terminal bonuses.
         try:
-            terminated = bool(self._terminated_fn(obs, action, self._prev_obs))
+            terminated = bool(self._terminated_fn(
+                obs, action, self._prev_obs,
+                **({"context": context} if self._termination_context else {})))
         except Exception as e:
             raise ProviderError(f"termination_function raised: {e}") from e
         try:
-            reward = float(self._reward_fn(obs, action, self._prev_obs, terminated))
+            reward = float(self._reward_fn(
+                obs, action, self._prev_obs, terminated,
+                **({"context": context} if self._reward_context else {})))
         except Exception as e:
             raise ProviderError(f"reward_function raised: {e}") from e
 
         truncated = False  # TimeLimit wrapper handles step-count truncation.
-        info = {"task_info": self._task_info, "json_state": copy.deepcopy(st)}
+        info = {"task_info": self._task_info, "json_state": copy.deepcopy(st),
+                "task_metadata": copy.deepcopy(task_metadata)}
 
         self._state = st
         self._prev_obs = obs
+        self._task_metadata = task_metadata
         self._ep_steps += 1
         self._ep_terminated = terminated
         if self._ep_steps >= self._warm_after:
@@ -273,6 +308,16 @@ class Environment(gym.Env):
         self._next = None
         self._renderer.close()
         self._opened = False
+
+    @property
+    def task_metadata(self) -> dict[str, Any]:
+        """Current task-only metadata snapshot, also returned in `info`."""
+        return copy.deepcopy(self._task_metadata)
+
+    def _make_task_metadata(self, st):
+        if self._task_metadata_provider is None:
+            return {}
+        return copy.deepcopy(dict(self._task_metadata_provider(self._renderer, st)))
 
     # =========================================================================
     # Internal: spaces
@@ -301,15 +346,6 @@ class Environment(gym.Env):
                 "proj_scale": spaces.Box(low=0.0, high=np.inf, shape=(1,), dtype=np.float32),
                 "image": spaces.Box(
                     low=0, high=255, shape=self._renderer.layout.image_shape, dtype=np.uint8),
-                # Visible selection ids (zmax-left reward/diagnostic hooks).
-                # Variable-length tuple of root-id strings; policy-facing obs
-                # wrappers drop it, so no learner ever encodes it.
-                "segments": spaces.Sequence(spaces.Text(max_length=32)),
-                # Per-visible-segment intrinsic mesh z-max (voxel units),
-                # aligned 1:1 with "segments"; -1.0 = mesh not loaded yet /
-                # backend without geometry (Chrome). Reward-hook data only.
-                "segment_zmax": spaces.Sequence(
-                    spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float32)),
             }
         )
 
@@ -396,25 +432,10 @@ class Environment(gym.Env):
         image_size = self._renderer.layout.image_size
         if image_size is not None and image.shape[:2] != (image_size[1], image_size[0]):
             image = np.asarray(Image.fromarray(image).resize(image_size))
-        segs = tuple(sorted(S.visible_segments(st["segments"])))
-        # Intrinsic mesh z-max per visible segment (zmax-left exploration
-        # reward); -1.0 while a mesh hasn't loaded or the backend has no
-        # geometry (Chrome).
-        zmax_of = getattr(self._renderer, "mesh_zmax", None)
-        seg_zmax = tuple(
-            np.float32(z if zmax_of is not None and (z := zmax_of(s)) is not None
-                       else -1.0)
-            for s in segs)
         return {
             "position": np.asarray(st["position"], dtype=np.float32),
             "xs_scale": np.asarray([st["crossSectionScale"]], dtype=np.float32),
             "orientation": S.orientation_obs(st, self.orientation),
             "proj_scale": np.asarray([st["projectionScale"]], dtype=np.float32),
             "image": image,
-            # Visible selection set (zmax-left): reward/diagnostic hooks need to
-            # see selection changes (hop detection, SHOW_ALL). Downstream obs
-            # wrappers build their own dicts, so the extra key never reaches the
-            # policy's observation space.
-            "segments": segs,
-            "segment_zmax": seg_zmax,
         }

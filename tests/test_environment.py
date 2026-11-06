@@ -42,6 +42,30 @@ def test_backend_must_be_a_renderer():
         Environment(backend=object())
 
 
+def test_task_metadata_reaches_hooks_and_info_but_never_observations(fake_renderer):
+    captured = []
+
+    def reward_factory(task_info):
+        def reward(obs, action, prev_obs, terminated, *, context):
+            assert "segments" not in obs and "segment_zmax" not in prev_obs
+            captured.append(context)
+            return len(context.current_metadata["segments"]) - len(context.previous_metadata["segments"])
+        return reward
+
+    env = Environment(backend=fake_renderer(), reward_factory=reward_factory,
+                      task_metadata_provider=lambda renderer, state: {"segments": tuple(state["segments"])})
+    obs, info = env.reset()
+    assert set(obs) == set(env.observation_space.spaces)
+    assert "segments" not in obs and "segment_zmax" not in obs
+    assert info["task_metadata"]["segments"] == ("42",)
+    info["task_metadata"]["segments"] = ()
+    obs, reward, _, _, info = env.step(_click(2, 5, 5))
+    assert reward == 1 and captured[0].previous_metadata["segments"] == ("42",)
+    assert info["task_metadata"]["segments"] == ("42", "7")
+    with pytest.raises(TypeError):
+        captured[0].current_metadata["segments"] = ()
+
+
 def test_shipped_renderers_satisfy_the_protocol():
     """Constructing either needs neither a browser nor GL."""
     assert isinstance(ChromeRenderer(), Renderer)

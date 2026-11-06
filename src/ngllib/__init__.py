@@ -4,7 +4,7 @@ from . import distributed
 from .chrome import ChromeRenderer
 from .dataset import DatasetSpec
 from .distributed.remote import RemoteEnv
-from .environment import Environment, RewardFactory, TerminationFactory
+from .environment import Environment, RewardFactory, TerminationFactory, TransitionContext, TaskMetadataProvider
 from .errors import (
     BrowserError,
     ConnectionLost,
@@ -31,6 +31,8 @@ __all__ = [
     "NglState",
     "RewardFactory",
     "TerminationFactory",
+    "TransitionContext",
+    "TaskMetadataProvider",
     "NgllibError",
     "RendererError",
     "BrowserError",

@@ -1,3 +1,15 @@
+# Task metadata is separate from observations
+
+`segments` and `segment_zmax` are removed from observations and their Gym
+space. A task can opt into `task_metadata_provider(renderer, state)`, returning
+a metadata snapshot. Reward and termination callables can declare a keyword
+`context` parameter to receive `TransitionContext.previous_metadata` and
+`current_metadata`. Existing hook signatures remain valid.
+
+Snapshots are also returned in `info["task_metadata"]` and through
+`env.task_metadata` for diagnostics. No geometry is queried by the default
+environment. Tasks choose which backend capabilities and units they require.
+
 # Assigned GPU selection
 
 CUDA assignments (numeric, reordered, or UUID) are resolved through
