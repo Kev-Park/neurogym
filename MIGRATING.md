@@ -202,7 +202,7 @@ ambiguity. The relevant parameter fields per type are documented in
 `Environment._apply_actions`.
 
 If your existing code emits the 17-vec flat list, write a small `ActionWrapper`
-that decodes the flat list into the Dict; see `neurogym-agent/envs/action_translator.py`
+that decodes the flat list into the Dict; see `ngllib-agent/envs/action_translator.py`
 for a reference example.
 
 ## Reward & termination

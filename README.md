@@ -29,17 +29,19 @@ Other notable work-in-progress features include:
 
 ### Installation
 
-1. Clone the repo using:
+With Python 3.12 and uv installed:
 
-  `git clone [https://github.com/seung-lab/ngl_bench.git](https://github.com/seung-lab/ngl_bench.git)`[.](https://github.com/seung-lab/ngl_bench.git)
-2. Change directory to the repository root:  
-`cd ngl_bench`
-3. Install `ngllib`:  
-`pip install -e .`
-4. Install Chromium via Playwright:  
-`playwright install chromium`
+```bash
+git clone https://github.com/Kev-Park/ngllib.git
+cd ngllib
+uv venv --python 3.12
+uv pip install -e .
+uv run --no-sync playwright install chromium
+```
 
-Please note `ngllib` requires Python 3.12 or newer.
+For training, clone `ngllib-agent` beside this directory and follow its
+[installation instructions](https://github.com/Kev-Park/ngllib-agent#installation).
+The Python import remains `ngllib`.
 
 ### Quickstart
 

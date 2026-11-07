@@ -5,7 +5,7 @@ Replaces the Playwright+Chrome render path with direct data access
 GPU rendering (moderngl + EGL). Visual parity targets the exact Neuroglancer
 semantics ported in `colors` (segment colour hash) and `camera` (projection-
 pane camera model), validated pixel-level against Chrome captures of
-identical states (neurogym-agent `native/` probes).
+identical states (ngllib-agent `native/` probes).
 
 `SimulatorRenderer` is the `ngllib.Environment` backend; the heavy imports
 (moderngl, cloud-volume) happen when it is opened, not here.

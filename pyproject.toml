@@ -38,8 +38,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Kev-Park/neurogym"
-Repository = "https://github.com/Kev-Park/neurogym"
+Homepage = "https://github.com/Kev-Park/ngllib"
+Repository = "https://github.com/Kev-Park/ngllib"
 
 [tool.setuptools.packages.find]
 where = ["src"]

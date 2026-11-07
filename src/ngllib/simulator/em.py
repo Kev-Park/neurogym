@@ -1,6 +1,6 @@
 """CloudVolume access for the simulator: EM z-slice tiles, label masks, meshes.
 
-Promoted from the parity spike harness (neurogym-agent native/render_pairs.py)
+Promoted from the parity spike harness (ngllib-agent native/render_pairs.py)
 after the 2D-pane SSIM 0.898 / pixel-exact-registration result — the tile and
 filter chains here are calibrated against browser captures; change them only
 with a re-run of the parity harness.
